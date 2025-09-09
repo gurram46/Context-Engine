@@ -17,9 +17,14 @@ def save(note):
     # Ensure session file exists
     config.session_file.touch()
     
+    # Sanitize and limit note size
+    from ..core.utils import sanitize_note_input
+    max_len = int(config.get("note_max_length", 2000))
+    safe_note = sanitize_note_input(note, max_len=max_len)
+    
     # Append note with timestamp
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    formatted_note = f"\n### [{timestamp}]\n{note}\n"
+    formatted_note = f"\n### [{timestamp}]\n{safe_note}\n"
     
     with open(config.session_file, 'a', encoding='utf-8') as f:
         f.write(formatted_note)

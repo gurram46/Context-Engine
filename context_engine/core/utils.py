@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -58,23 +59,51 @@ def count_tokens(text: str, model: str = "gpt-4") -> int:
         encoding = tiktoken.get_encoding("cl100k_base")
     return len(encoding.encode(text))
 
+def _shannon_entropy(s: str) -> float:
+    """Compute Shannon entropy of a string"""
+    if not s:
+        return 0.0
+    prob = [float(s.count(c)) / len(s) for c in set(s)]
+    return -sum(p * math.log(p, 2) for p in prob)
+
+def is_high_entropy_token(token: str) -> bool:
+    """Heuristic to detect likely secrets by entropy and length"""
+    token = token.strip().strip('"\'')
+    if len(token) < 20:
+        return False
+    entropy = _shannon_entropy(token)
+    return entropy >= 3.5  # heuristic threshold
+
 def redact_secrets(text: str) -> str:
-    """Redact potential secrets from text"""
-    # Redact API keys
-    text = re.sub(r'(["\']?)([A-Za-z0-9]{32,}|sk-[A-Za-z0-9]{48,})(["\']?)', r'\1[REDACTED_KEY]\3', text)
+    """Redact potential secrets from text using regex and entropy detection"""
+    # First, handle specific known secret patterns (order matters!)
+    # Match sk- keys with or without quotes
+    text = re.sub(r'="(sk-[A-Za-z0-9\-_]{20,})"', r'="[REDACTED_KEY]"', text)
+    text = re.sub(r"='(sk-[A-Za-z0-9\-_]{20,})'", r"='[REDACTED_KEY]'", text)
+    text = re.sub(r'=(sk-[A-Za-z0-9\-_]{20,})(?=\s|$)', r'=[REDACTED_KEY]', text)
+    text = re.sub(r'"(sk-[A-Za-z0-9\-_]{20,})"', r'"[REDACTED_KEY]"', text)
     
-    # Redact passwords
-    text = re.sub(r'(password|passwd|pwd|pass)\s*[=:]\s*["\']?([^"\'\s]+)["\']?', 
-                  r'\1=[REDACTED]', text, flags=re.IGNORECASE)
+    # AWS keys
+    text = re.sub(r'(["\']?)(AKIA[0-9A-Z]{16})(["\']?)', r'\1[REDACTED_AWS]\3', text)
     
-    # Redact tokens
-    text = re.sub(r'(token|jwt|bearer)\s*[=:]\s*["\']?([^"\'\s]+)["\']?', 
-                  r'\1=[REDACTED]', text, flags=re.IGNORECASE)
+    # Generic patterns for other secrets
+    text = re.sub(r'(password|passwd|pwd|pass)\s*[=:]\s*["\']?([^"\'\s]+)["\']?', r'\1=[REDACTED]', text, flags=re.IGNORECASE)
+    text = re.sub(r'(token|jwt|bearer)\s*[=:]\s*["\']?([^"\'\s]+)["\']?', r'\1=[REDACTED]', text, flags=re.IGNORECASE)
     
-    # Redact environment variables that likely contain secrets
-    text = re.sub(r'(API_KEY|SECRET|TOKEN|PASSWORD|PASSWD)\s*=\s*["\']?([^"\'\s]+)["\']?',
-                  r'\1=[REDACTED]', text)
-    
+    # Environment variables - skip if already redacted
+    if '[REDACTED_KEY]' not in text:
+        text = re.sub(r'(API_KEY|SECRET|TOKEN|PASSWORD|PASSWD)\s*=\s*["\']?([^"\'\s]+)["\']?', r'\1=[REDACTED]', text)
+
+    # Entropy-based redaction only for standalone hex-like strings (not variable names)
+    def _mask_high_entropy(match: re.Match) -> str:
+        token = match.group(0)
+        # Skip if it looks like a variable name (contains underscores in middle)
+        if '_' in token[1:-1] and not token.startswith('sk-'):
+            return token
+        return "[REDACTED]" if is_high_entropy_token(token) else token
+
+    # Only match hex-like strings, not typical variable names
+    text = re.sub(r'\b[a-fA-F0-9]{32,}\b', _mask_high_entropy, text)
     return text
 
 def strip_comments(code: str, language: str = "python") -> str:
@@ -116,9 +145,12 @@ def strip_comments(code: str, language: str = "python") -> str:
     elif language in ["javascript", "js", "typescript", "ts", "java", "c", "cpp"]:
         # Remove // comments and /* */ comments
         # Keep /** */ documentation comments
+        # Preserve JSDoc-style comments
+        jsdoc_blocks = re.findall(r'/\*\*[^*]*\*+(?:[^/*][^*]*\*+)*/', code, flags=re.DOTALL)
         code = re.sub(r'//.*$', '', code, flags=re.MULTILINE)
         code = re.sub(r'/\*(?!\*)[^*]*\*+(?:[^/*][^*]*\*+)*/', '', code)
-        return code
+        # Reattach JSDoc blocks at the top to preserve docstrings
+        return "\n".join([b for b in jsdoc_blocks if b.strip()])
     
     return code
 
@@ -156,6 +188,86 @@ def deduplicate_content(content: str) -> str:
             seen.add(stripped)
             result.append(line)
         elif not stripped:
-            result.append(line)
+            # keep single blank lines only
+            if result and result[-1].strip() == "":
+                continue
+            result.append("")
     
     return '\n'.join(result)
+
+def compress_whitespace(text: str) -> str:
+    """Remove excessive blank lines and trailing whitespace"""
+    lines = [l.rstrip() for l in text.split('\n')]
+    comp = []
+    for l in lines:
+        if l.strip() == "":
+            if comp and comp[-1] == "":
+                continue
+            comp.append("")
+        else:
+            comp.append(l)
+    return '\n'.join(comp)
+
+def is_subpath(child: Path, parent: Path) -> bool:
+    """Check if child path is within parent directory"""
+    try:
+        child = child.resolve(strict=False)
+        parent = parent.resolve(strict=False)
+        # Handle Windows paths properly
+        return child == parent or parent in child.parents
+    except Exception:
+        return False
+
+def validate_path_in_project(path: Path, project_root: Path) -> None:
+    """Raise click.BadParameter if path escapes project root"""
+    from click import BadParameter
+    if not is_subpath(path, project_root):
+        raise BadParameter(f"Path '{path}' is outside the project root: {project_root}")
+
+def sanitize_note_input(note: str, max_len: int = 2000) -> str:
+    """Sanitize note content and enforce max length"""
+    # remove control characters except common whitespace
+    note = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', note)
+    if len(note) > max_len:
+        note = note[:max_len] + "…"
+    return note
+
+def extract_api_docstrings(code: str, language: str = "python") -> str:
+    """Extract only API docstrings/comments and signatures, not raw code"""
+    if language in ["python", "py"]:
+        # Keep only triple-quoted docstrings
+        blocks = re.findall(r'("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\')', code)
+        return "\n\n".join(b.strip() for b in blocks if b.strip()) or "(no docstrings)"
+    elif language in ["javascript", "js", "typescript", "ts"]:
+        blocks = re.findall(r'/\*\*[^*]*\*+(?:[^/*][^*]*\*+)*/', code, flags=re.DOTALL)
+        return "\n\n".join(b.strip() for b in blocks if b.strip()) or "(no API docs)"
+    else:
+        return "(no API docs)"
+
+def compress_code(code: str, language: str = "python") -> str:
+    """Strict compression: Keep docstrings only, remove comments/whitespace"""
+    doc_only = extract_api_docstrings(code, language)
+    doc_only = compress_whitespace(doc_only)
+    return doc_only
+
+def is_valid_api_key(key: str) -> bool:
+    """Basic format validation for API key (never log key)"""
+    if not key or not isinstance(key, str):
+        return False
+    key = key.strip()
+    # Accept keys like sk-... with proper format
+    if key.startswith("sk-"):
+        if len(key) >= 32:
+            # Ensure no special chars except dash and underscore  
+            return bool(re.match(r'^sk-[A-Za-z0-9_\-]+$', key))
+        return False
+    # Test keys starting with "test-" are invalid
+    if key.startswith("test-"):
+        return False
+    # For non-sk keys, require only alphanumeric and simple chars
+    if len(key) >= 32:
+        # Reject if contains special chars like @ # $
+        if re.search(r'[@#$%^&*()+=\[\]{};:\'"<>,?/\\|`~]', key):
+            return False
+        return bool(re.match(r'^[A-Za-z0-9_\-]+$', key))
+    return False

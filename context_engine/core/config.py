@@ -18,13 +18,21 @@ class Config:
             "strip_comments": True,
             "keep_docstrings": True,
             "summarize_configs": True,
-            "deduplicate": True
+            "deduplicate": True,
+            "remove_blank_lines": True
         },
-        "linked_repos": []
+        "linked_repos": [],
+        # Security-related defaults
+        "allowed_extensions": [
+            ".md", ".json", ".yml", ".yaml", ".toml", ".ini", ".env",
+            ".py", ".js", ".ts", ".java", ".c", ".cpp"
+        ],
+        "max_file_size_kb": 1024,
+        "note_max_length": 2000
     }
     
     def __init__(self, project_root: Optional[Path] = None):
-        self.project_root = project_root or Path.cwd()
+        self.project_root = project_root or Path.cwd().resolve()
         self.context_dir = self.project_root / ".context"
         self.config_file = self.context_dir / "config.json"
         self._config = self.DEFAULT_CONFIG.copy()

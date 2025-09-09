@@ -16,13 +16,27 @@ def baseline():
 @click.argument('files', nargs=-1, required=True, type=click.Path(exists=True))
 def add(files):
     """Add files to baseline"""
+    import click as _click
     config = Config()
     config.baseline_dir.mkdir(parents=True, exist_ok=True)
     
     hashes = load_hashes(config.hashes_file)
     
+    allowed_exts = set(config.get("allowed_extensions", []))
+    size_limit = int(config.get("max_file_size_kb", 1024)) * 1024
+    
     for file_path in files:
-        source = Path(file_path)
+        source = Path(file_path).resolve()
+        # Security: path traversal prevention
+        from ..core.utils import validate_path_in_project
+        validate_path_in_project(source, config.project_root)
+        
+        # Validate file type and size
+        if source.suffix.lower() not in allowed_exts:
+            raise _click.BadParameter(f"Disallowed file type: {source.suffix}")
+        if source.stat().st_size > size_limit:
+            raise _click.BadParameter(f"File too large (> {size_limit//1024} KB): {source.name}")
+        
         dest = config.baseline_dir / source.name
         
         # Copy file to baseline
