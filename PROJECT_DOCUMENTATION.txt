@@ -1,0 +1,1275 @@
+# CONTEXT ENGINE TECHNICAL DOCUMENTATION
+
+## 1. PROJECT OVERVIEW AND ARCHITECTURE
+
+### 1.1 Project Purpose
+Context Engine is a sophisticated tool that creates a "local brain" for development projects, enabling AI tools to understand codebases better through intelligent indexing, semantic search, and session management. It bridges the gap between codebases and AI tools, providing the context necessary for AI assistants to provide more accurate and helpful responses.
+
+### 1.2 Core Architecture
+
+#### 1.2.1 Main Components
+1. **CLI Interface**: Cross-platform command-line interface (Node.js wrapper for Python)
+2. **Configuration System**: YAML-based configuration management
+3. **File Indexer**: SHA256-based incremental file indexing with chunking
+4. **Embeddings Store**: Local vector embeddings using sentence-transformers and FAISS
+5. **Session Manager**: AI tool session lifecycle management
+6. **Auto Capture**: Automatic development server log monitoring
+7. **Log Parsers**: Specialized parsers for Python, Java, and JavaScript errors
+8. **Summarizer**: Template-based file analysis and summarization
+
+#### 1.2.2 Directory Structure
+```
+context_engine/
+├── config/              # Configuration files
+├── embeddings_db/       # Vector embeddings and FAISS index
+├── summaries/           # Generated file summaries
+├── logs/               # Captured logs and parsed errors
+├── sessions/            # Session data
+team_context/             # Shared team knowledge
+.context_payload/         # Session payloads for AI tools
+```
+
+### 1.3 Key Features
+
+#### 1.3.1 Intelligent Code Understanding
+- Incremental File Indexing: Uses SHA256 hashes to detect file changes and only reindex when necessary
+- Semantic Search: Vector embeddings with sentence-transformers for contextual code search
+- Template-based Summaries: Automated file summaries with AST parsing for Python and regex for other languages
+- Multi-language Support: Works with Python, JavaScript, TypeScript, Java, and more
+
+#### 1.3.2 Git Integration
+- Merge Conflict Detection: Automatically identifies and reports merge conflicts
+- Change Tracking: Monitors Git changes and updates index accordingly
+- Pre-push Hooks: Ensures shared context is exported before pushing
+
+#### 1.3.3 AI Tool Sessions
+- Session Management: Start/stop sessions with scoped file tracking
+- Context Injection: Add specific files to session context
+- Auto-Capture: Automatically monitor and capture dev server logs
+- Intelligent Log Parsing: Parse errors with structured output
+- Payload Generation: Create structured context for AI tools
+
+#### 1.3.4 Team Collaboration
+- Shared Digests: Export and share project context with team members
+- Conflict Resolution: Smart merging of team context updates
+- Project Readiness Checklist: Automated checks for documentation
+
+### 1.4 Technical Implementation
+
+#### 1.4.1 Core Technologies
+- Python: Primary implementation language
+- sentence-transformers: Local embedding generation
+- FAISS: Vector similarity search
+- PyYAML: Configuration management
+- GitPython: Git integration
+- psutil: Process monitoring for auto-capture
+
+#### 1.4.2 Command Structure
+The CLI provides comprehensive commands for all major features:
+- `init` - Initialize Context Engine in project
+- `reindex` - Index project files (incremental or full)
+- `search` - Semantic search through codebase
+- `start-session`/`stop-session` - Session lifecycle management
+- `set-scope` - Define session scope
+- `checklist` - Project documentation verification
+- `export`/`pull-digest` - Team collaboration features
+
+#### 1.4.3 Data Flow
+1. Initialization: `context-engine init` creates directory structure and default config
+2. Indexing: Files are indexed with SHA256 tracking, chunked, and stored with metadata
+3. Embedding: Content is converted to vector embeddings using local sentence-transformers
+4. Session: Users start sessions, set scope, and inject context
+5. Capture: Development server logs are automatically captured and parsed
+6. Payload: Structured context is generated for AI tools
+7. Sharing: Team context can be exported and shared
+
+## 2. CORE CONFIGURATION SYSTEMS
+
+### 2.1 Configuration Classes
+
+#### 2.1.1 ProjectConfig (context_engine/core/config.py)
+```python
+@dataclass
+class ProjectConfig:
+    """Project-specific configuration."""
+    name: str = "my-project"
+    description: str = ""
+    modules: List[str] = None
+```
+
+**Purpose**: Stores project-level configuration settings.
+
+**Attributes**:
+- `name` (str): Project name, defaults to "my-project"
+- `description` (str): Project description
+- `modules` (List[str]): List of project modules
+
+#### 2.1.2 EmbeddingConfig (context_engine/core/config.py)
+```python
+@dataclass
+class EmbeddingConfig:
+    """Embedding provider configuration."""
+    provider: str = "local"  # local, openai, openrouter
+    model: str = "all-MiniLM-L6-v2"
+    chunk_size: int = 1000
+    chunk_overlap: int = 150
+    api_key_env: Optional[str] = None
+```
+
+**Purpose**: Configuration for embedding generation and chunking.
+
+**Attributes**:
+- `provider` (str): Embedding provider (local, openai, openrouter)
+- `model` (str): Model name for embedding generation
+- `chunk_size` (int): Size of text chunks for indexing
+- `chunk_overlap` (int): Overlap between chunks
+- `api_key_env` (Optional[str]): Environment variable for API key
+
+#### 2.1.3 IndexingConfig (context_engine/core/config.py)
+```python
+@dataclass
+class IndexingConfig:
+    """Indexing configuration."""
+    ignore_patterns: List[str] = None
+    redact_patterns: List[str] = None
+    max_file_size_mb: int = 10
+```
+
+**Purpose**: Configuration for file indexing and content processing.
+
+**Attributes**:
+- `ignore_patterns` (List[str]): File/directory patterns to ignore
+- `redact_patterns` (List[str]): Regex patterns for secret redaction
+- `max_file_size_mb` (int): Maximum file size to process
+
+#### 2.1.4 SharedContextConfig (context_engine/core/config.py)
+```python
+@dataclass
+class SharedContextConfig:
+    """Shared context repository configuration."""
+    enabled: bool = False
+    repo_url: Optional[str] = None
+    branch: str = "main"
+    auto_push: bool = False
+```
+
+**Purpose**: Configuration for team collaboration features.
+
+**Attributes**:
+- `enabled` (bool): Whether shared context is enabled
+- `repo_url` (Optional[str]): URL for shared context repository
+- `branch` (str): Branch for shared context
+- `auto_push` (bool): Whether to automatically push changes
+
+#### 2.1.5 ContextConfig (context_engine/core/config.py)
+```python
+@dataclass
+class ContextConfig:
+    """Main configuration class."""
+    project: ProjectConfig
+    embedding: EmbeddingConfig
+    indexing: IndexingConfig
+    shared_context: SharedContextConfig
+    project_root: Optional[Path] = None
+```
+
+**Purpose**: Main configuration class that aggregates all configuration components.
+
+**Attributes**:
+- `project` (ProjectConfig): Project configuration
+- `embedding` (EmbeddingConfig): Embedding configuration
+- `indexing` (IndexingConfig): Indexing configuration
+- `shared_context` (SharedContextConfig): Shared context configuration
+- `project_root` (Optional[Path]): Root path of the project
+
+**Methods**:
+- `default()`: Create default configuration
+- `load_from_file(config_path: Path)`: Load configuration from YAML file
+- `save_to_file(config_path: Path)`: Save configuration to YAML file
+- `load_or_create(project_root: Optional[Path] = None)`: Load existing config or create default one
+
+### 2.2 Configuration File Structure
+The configuration is stored in `context_engine/config/context.yml`:
+```yaml
+project:
+  name: "my-project"
+  description: ""
+  modules: []
+embedding:
+  provider: "local"
+  model: "all-MiniLM-L6-v2"
+  chunk_size: 1000
+  chunk_overlap: 150
+  api_key_env: null
+indexing:
+  ignore_patterns: [".git/*", "node_modules/*", ...]
+  redact_patterns: ["(?i)(api[_-]?key|secret|password|token|auth)...", ...]
+  max_file_size_mb: 10
+shared_context:
+  enabled: false
+  repo_url: null
+  branch: "main"
+  auto_push: false
+```
+
+## 3. MAIN APPLICATION ENTRY POINTS
+
+### 3.1 CLI Entry Point (context_engine/scripts/cli.py)
+
+#### 3.1.1 Main Function
+```python
+def main():
+    """Main CLI entry point."""
+    parser = create_parser()
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return 1
+    
+    try:
+        # Route to appropriate command handler
+        if args.command == 'init':
+            return init_command(args)
+        elif args.command == 'reindex':
+            return reindex_command(args)
+        # ... other command routing
+```
+
+**Purpose**: Main entry point for the Context Engine CLI application.
+
+**Implementation Details**:
+1. Creates argument parser with all available commands
+2. Parses command line arguments
+3. Routes to appropriate command handler based on the command
+4. Handles exceptions and returns appropriate exit codes
+
+#### 3.1.2 Argument Parser Creation
+```python
+def create_parser():
+    """Create the main argument parser."""
+    parser = argparse.ArgumentParser(
+        prog='context-engine',
+        description='Context Engine - A local project brain for dev teams'
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+```
+
+**Purpose**: Creates the main argument parser with subparsers for each command.
+
+**Supported Commands**:
+- `init`: Initialize context engine in current directory
+- `reindex`: Reindex project files
+- `sync`: Sync changes and update index
+- `search`: Search indexed content
+- `start-session`: Start a new session
+- `stop-session`: Stop current session
+- `inject`: Rebuild session payload
+- `capture`: Capture command output
+- `export`: Export shared digest
+- `pull-digest`: Pull digest from shared repo
+- `set-scope`: Set active scope
+- `suggest-merge`: Suggest merge resolution
+- `status`: Show context engine status
+- `checklist`: Check for project documentation
+- `add-docs`: Add documentation files to context
+- `enhanced-summarize`: Enhanced file summarization using LangChain methods
+- `project-overview`: Generate comprehensive project overview
+- `langchain-process`: Process content using LangChain methods
+- `smart-select`: Smart file selection using LangChain
+
+### 3.2 Python Module Entry Point
+The application can also be run as a Python module:
+```bash
+python -m context_engine.scripts.cli <command> [options]
+```
+
+## 4. MAJOR FEATURE SYSTEMS
+
+### 4.1 File Indexing System
+
+#### 4.1.1 FileIndexer Class (context_engine/scripts/embedder.py)
+```python
+class FileIndexer:
+    """Handles file indexing with SHA256 tracking and chunking."""
+    
+    def __init__(self, config: ContextConfig, project_root: Optional[Path] = None):
+        self.config = config
+        self.project_root = project_root or Path.cwd()
+        self.embeddings_db_dir = self.project_root / "context_engine" / "embeddings_db"
+        self.sync_file = self.project_root / "context_engine" / "sync.json"
+```
+
+**Purpose**: Handles file indexing with SHA256 tracking and intelligent chunking.
+
+**Attributes**:
+- `config` (ContextConfig): Configuration object
+- `project_root` (Path): Root directory of the project
+- `embeddings_db_dir` (Path): Directory for storing embeddings
+- `sync_file` (Path): File for tracking synchronization state
+
+**Methods**:
+- `_should_ignore_file(file_path: Path)`: Check if file should be ignored
+- `_is_text_file(file_path: Path)`: Check if file is a text file
+- `_compute_file_hash(file_path: Path)`: Compute SHA256 hash of file content
+- `_read_file_content(file_path: Path)`: Read file content with encoding detection
+- `_redact_secrets(content: str)`: Redact secrets from content
+- `_chunk_content(content: str, file_path: Path)`: Split content into chunks
+- `_save_chunks(chunks: List[Dict[str, Any]], file_path: Path)`: Save chunks to embeddings database
+- `_load_sync_data()`: Load sync data from sync.json
+- `_save_sync_data(sync_data: Dict[str, Any])`: Save sync data to sync.json
+- `get_all_files()`: Get all files in the project that should be indexed
+- `get_changed_files()`: Get files that have changed since last sync
+- `index_file(file_path: Path)`: Index a single file
+- `reindex_all()`: Reindex all files in the project
+- `reindex_incremental()`: Reindex only changed files
+
+#### 4.1.2 Chunking Algorithm
+The chunking algorithm intelligently splits content:
+1. Splits content into chunks of configurable size (default 1000 characters)
+2. Maintains configurable overlap between chunks (default 150 characters)
+3. Attempts to break at word boundaries (newlines, periods, etc.)
+4. Stores metadata including file path, chunk index, character positions, and file hash
+
+### 4.2 Embeddings Store System
+
+#### 4.2.1 EmbeddingsStore Class (context_engine/scripts/embeddings_store.py)
+```python
+class EmbeddingsStore:
+    """Handles embeddings generation and vector similarity search."""
+    
+    def __init__(self, config: ContextConfig, project_root: Optional[Path] = None):
+        self.config = config
+        self.project_root = project_root or Path.cwd()
+        self.embeddings_db_dir = self.project_root / "context_engine" / "embeddings_db"
+        self.vector_store_path = self.embeddings_db_dir / "vector_store.faiss"
+        self.metadata_path = self.embeddings_db_dir / "metadata.json"
+```
+
+**Purpose**: Manages embeddings generation and vector similarity search using FAISS.
+
+**Attributes**:
+- `config` (ContextConfig): Configuration object
+- `project_root` (Path): Root directory of the project
+- `embeddings_db_dir` (Path): Directory for storing embeddings
+- `vector_store_path` (Path): Path to FAISS vector store
+- `metadata_path` (Path): Path to metadata file
+
+**Methods**:
+- `_initialize_model()`: Initialize the embedding model
+- `_load_or_create_index()`: Load existing FAISS index or create a new one
+- `_create_new_index()`: Create a new FAISS index
+- `_save_index()`: Save the FAISS index and metadata
+- `generate_embeddings(texts: List[str])`: Generate embeddings for a list of texts
+- `add_embeddings(texts: List[str], metadata_list: List[Dict[str, Any]])`: Add embeddings to the vector store
+- `similarity_search(query: str, k: int = 5)`: Search for similar chunks using vector similarity
+- `rebuild_index_from_chunks()`: Rebuild the vector index from all chunk files
+- `get_stats()`: Get statistics about the vector store
+
+### 4.3 Session Management System
+
+#### 4.3.1 SessionManager Class (context_engine/scripts/session.py)
+```python
+class SessionManager:
+    """Manages AI tool sessions and payload generation."""
+    
+    def __init__(self, config: ContextConfig, project_root: Optional[Path] = None):
+        self.config = config
+        self.project_root = project_root or Path.cwd()
+        self.sessions_dir = self.project_root / "context_engine" / "sessions"
+        self.payload_dir = self.project_root / ".context_payload"
+        self.active_session_file = self.sessions_dir / "active_session.json"
+```
+
+**Purpose**: Manages AI tool sessions and payload generation for context transfer.
+
+**Attributes**:
+- `config` (ContextConfig): Configuration object
+- `project_root` (Path): Root directory of the project
+- `sessions_dir` (Path): Directory for storing session data
+- `payload_dir` (Path): Directory for storing payload files
+- `active_session_file` (Path): File tracking the active session
+
+**Methods**:
+- `_load_active_session()`: Load the currently active session
+- `_save_active_session()`: Save the current active session
+- `start_session(session_name: Optional[str] = None, description: Optional[str] = None)`: Start a new AI tool session
+- `stop_session()`: Stop the current session
+- `_create_handoff_notes()`: Create agent handoff notes for the current session
+- `_load_previous_handoff_notes()`: Load the most recent handoff notes if available
+- `set_scope(paths: List[str], append: bool = False)`: Set the scope for the current session
+- `inject_file(file_path: str, content: Optional[str] = None)`: Inject a file into the current session
+- `capture_log(log_content: str, log_type: str = 'runtime', source: Optional[str] = None)`: Capture log content for the current session
+- `_get_relevant_chunks(query: Optional[str] = None, max_chunks: int = 50)`: Get relevant code chunks for the session payload
+- `generate_payload(query: Optional[str] = None, include_summaries: bool = True, include_logs: bool = True, max_chunks: int = 50)`: Generate AI tool payload for the current session
+- `save_payload(payload: Dict[str, Any], filename: Optional[str] = None)`: Save payload to file
+- `get_session_status()`: Get current session status
+- `list_sessions()`: List all sessions
+
+### 4.4 Auto Capture System
+
+#### 4.4.1 AutoCapture Class (context_engine/scripts/auto_capture.py)
+```python
+class AutoCapture:
+    """Automatically capture logs from development servers and processes."""
+    
+    def __init__(self, config: ContextConfig, project_root: Optional[Path] = None):
+        self.config = config
+        self.project_root = project_root or Path.cwd()
+        self.logs_dir = self.project_root / "context_engine" / "logs"
+        self.errors_dir = self.logs_dir / "errors"
+```
+
+**Purpose**: Automatically captures logs from development servers and processes.
+
+**Attributes**:
+- `config` (ContextConfig): Configuration object
+- `project_root` (Path): Root directory of the project
+- `logs_dir` (Path): Directory for storing captured logs
+- `errors_dir` (Path): Directory for storing parsed errors
+
+**Methods**:
+- `start_monitoring()`: Start monitoring for development server processes
+- `stop_monitoring()`: Stop monitoring and all active captures
+- `_monitor_processes()`: Monitor system processes for development servers
+- `_match_dev_server(cmdline: List[str], cwd: str)`: Check if command line matches a development server pattern
+- `_matches_pattern(cmdline: List[str], pattern: List[str])`: Check if cmdline matches the given pattern
+- `_is_in_project_directory(cwd: str)`: Check if the process is running in or under the project directory
+- `_start_capture(pid: int, server_info: Dict, process: psutil.Process)`: Start capturing logs for a process
+- `_stop_capture(pid: int)`: Stop capturing logs for a process
+- `_capture_process_output(pid: int, capture_info: Dict)`: Capture output from a specific process
+- `get_active_captures()`: Get list of currently active captures
+- `save_capture_state()`: Save current capture state to file
+- `_parse_and_save_errors(content: str, output_file: Path, capture_info: Dict)`: Parse captured content for errors and save results
+- `get_parsed_errors()`: Get all parsed errors from captured logs
+
+### 4.5 Log Parsing System
+
+#### 4.5.1 Parser Architecture
+The log parsing system uses a factory pattern with specialized parsers:
+
+1. **BaseParser** (context_engine/parsers/base_parser.py): Abstract base class for all parsers
+2. **ParserFactory** (context_engine/parsers/parser_factory.py): Factory for creating appropriate parsers
+3. **PythonParser** (context_engine/parsers/python_parser.py): Parser for Python logs and tracebacks
+4. **JavaParser** (context_engine/parsers/java_parser.py): Parser for Java logs and exceptions
+5. **JSParser** (context_engine/parsers/js_parser.py): Parser for JavaScript/Node.js logs
+6. **GenericParser** (context_engine/parsers/generic_parser.py): Generic parser for unknown log formats
+
+#### 4.5.2 BaseParser Class
+```python
+class BaseParser(ABC):
+    """Abstract base class for log parsers."""
+    
+    def __init__(self, parser_type: str):
+        self.parser_type = parser_type
+        self.supported_extensions = []
+        self.error_patterns = []
+```
+
+**Purpose**: Abstract base class that defines the interface for all log parsers.
+
+**Methods**:
+- `parse_log_content(content: str, source_file: Optional[Path] = None)`: Parse log content and extract structured error information
+- `can_parse(content: str, file_extension: Optional[str] = None)`: Check if this parser can handle the given content
+- `create_error_entry(...)`: Create a standardized error entry
+- `extract_file_and_line(text: str)`: Extract file path and line number from text
+- `clean_message(message: str)`: Clean and normalize error message
+- `save_parsed_errors(errors: List[Dict], output_file: Path)`: Save parsed errors to JSON file
+
+#### 4.5.3 ParserFactory Class
+```python
+class ParserFactory:
+    """Factory class for creating appropriate log parsers."""
+    
+    def __init__(self):
+        # Register available parsers in priority order
+        self.parsers: List[Type[BaseParser]] = [
+            PythonParser,
+            JavaParser,
+            JSParser,
+            GenericParser,  # Always last as fallback
+        ]
+```
+
+**Purpose**: Factory class that creates the appropriate parser for given content.
+
+**Methods**:
+- `get_parser(content: str, file_path: Optional[Path] = None)`: Get the most appropriate parser for the given content
+- `get_parser_by_type(parser_type: str)`: Get a specific parser by type
+- `parse_log_file(file_path: Path, parser_type: Optional[str] = None)`: Parse a log file using the appropriate parser
+- `parse_log_content(content: str, source_file: Optional[Path] = None, parser_type: Optional[str] = None)`: Parse log content using the appropriate parser
+- `get_available_parsers()`: Get list of available parser types
+- `get_parser_info(parser_type: str)`: Get information about a specific parser
+- `clear_cache()`: Clear the parser instance cache
+
+### 4.6 File Summarization System
+
+#### 4.6.1 FileSummarizer Class (context_engine/scripts/summarizer.py)
+```python
+class FileSummarizer:
+    """Handles file summarization with template-based approach."""
+    
+    def __init__(self, config: ContextConfig, project_root: Optional[Path] = None):
+        self.config = config
+        self.project_root = project_root or Path.cwd()
+        self.summaries_dir = self.project_root / "context_engine" / "summaries"
+```
+
+**Purpose**: Generates structured summaries of files using template-based approach with language-specific analysis.
+
+**Attributes**:
+- `config` (ContextConfig): Configuration object
+- `project_root` (Path): Root directory of the project
+- `summaries_dir` (Path): Directory for storing file summaries
+
+**Methods**:
+- `_get_summary_template()`: Get the standard summary template
+- `_analyze_python_file(content: str, file_path: Path)`: Analyze Python file using AST parsing
+- `_analyze_javascript_file(content: str, file_path: Path)`: Analyze JavaScript/TypeScript file using regex patterns
+- `_analyze_java_file(content: str, file_path: Path)`: Analyze Java file using regex patterns
+- `_fallback_analysis(content: str, file_path: Path)`: Fallback analysis for unknown file types
+- `analyze_file(file_path: Path, content: str)`: Analyze a file and extract structured information
+- `generate_summary(file_path: Path, content: str, recent_changes: str = "")`: Generate a summary for a file
+- `save_summary(file_path: Path, summary: str)`: Save summary to file
+- `summarize_file(file_path: Path, content: str, recent_changes: str = "")`: Generate and save summary for a file
+
+### 4.7 Project Checklist System
+
+#### 4.7.1 Checklist Command (context_engine/commands/checklist.py)
+```python
+def checklist_command(args) -> int:
+    """Execute checklist command to check for project documentation."""
+    # Define checklist items with their patterns
+    checklist_items = [
+        {
+            'name': 'ADRs (Architectural Decision Records)',
+            'patterns': ['**/adr/**/*.md', '**/adrs/**/*.md', '**/decisions/**/*.md', '**/*adr*.md'],
+            'description': 'Documents architectural decisions and their rationale'
+        },
+        # ... other checklist items
+    ]
+```
+
+**Purpose**: Verifies project documentation completeness using file pattern matching.
+
+**Checklist Items**:
+1. **ADRs (Architectural Decision Records)**: Documents architectural decisions and their rationale
+2. **Architecture Documentation**: High-level system architecture and design documents
+3. **User Flows**: User journey and workflow documentation
+4. **API Specifications**: API documentation and specifications
+5. **Team Roles Documentation**: Team structure, roles, and responsibilities
+
+**Methods**:
+- `find_files_by_patterns(root_path: Path, patterns: List[str])`: Find files matching any of the given glob patterns
+- `_should_ignore_file(file_path: Path)`: Check if file should be ignored based on common ignore patterns
+
+## 5. INTEGRATION COMPONENTS
+
+### 5.1 LangChain Integration
+
+#### 5.1.1 EnhancedSummarizer Class (context_engine/langchain/enhanced_summarizer.py)
+```python
+class EnhancedSummarizer(FileSummarizer):
+    """Enhanced file summarizer with LangChain integration."""
+    
+    def __init__(self, config: ContextConfig):
+        super().__init__(config)
+        self.langchain_processor = LangChainProcessor(config)
+        self.enhancement_modes = {
+            'structured': self._structured_enhancement,
+            'compressed': self._compressed_enhancement,
+            'isolated': self._isolated_enhancement,
+            'comprehensive': self._comprehensive_enhancement
+        }
+```
+
+**Purpose**: Extends the base FileSummarizer with LangChain processing capabilities.
+
+**Attributes**:
+- `langchain_processor` (LangChainProcessor): LangChain processor instance
+- `enhancement_modes` (Dict[str, Callable]): Mapping of enhancement modes to functions
+
+**Methods**:
+- `enhanced_summarize_file(file_path: Path, mode: str = 'structured', **kwargs)`: Summarize file with LangChain enhancements
+- `_structured_enhancement(...)`: Apply structured writing enhancement to base summary
+- `_compressed_enhancement(...)`: Apply compression to create concise summary
+- `_isolated_enhancement(...)`: Apply isolation to extract specific patterns
+- `_comprehensive_enhancement(...)`: Apply multiple LangChain methods for comprehensive analysis
+- `batch_enhanced_summarize(file_paths: List[Path], mode: str = 'structured', **kwargs)`: Perform enhanced summarization on multiple files
+- `smart_select_files(directory: Path, criteria: Dict[str, Any], limit: int = 10)`: Use LangChain Select method to intelligently choose files for summarization
+- `generate_project_overview(project_path: Path, max_files: int = 20)`: Generate a comprehensive project overview using LangChain methods
+
+### 5.2 NPM Wrapper (bin/context-engine.js)
+
+#### 5.2.1 ContextEngineCLI Class
+```javascript
+class ContextEngineCLI {
+    constructor() {
+        this.projectRoot = path.resolve(__dirname, '..');
+        this.pythonScript = path.join(this.projectRoot, 'context_engine', 'scripts', 'cli.py');
+        this.pythonExecutable = this.findPythonExecutable();
+    }
+```
+
+**Purpose**: Cross-platform CLI wrapper that provides a unified interface to the Python CLI.
+
+**Attributes**:
+- `projectRoot` (string): Root directory of the project
+- `pythonScript` (string): Path to the Python CLI script
+- `pythonExecutable` (string): Path to the Python executable
+
+**Methods**:
+- `findPythonExecutable()`: Find the appropriate Python executable
+- `checkDependencies()`: Check if Python dependencies are installed
+- `installDependencies()`: Install Python dependencies
+- `run(args)`: Execute the Python CLI with provided arguments
+- `showHelp()`: Show help information
+
+## 6. COMPLETE TEST SUITE ANALYSIS
+
+### 6.1 Test Structure
+The test suite follows a standard Python unittest structure with the following test files:
+
+1. **test_checklist.py**: Tests for checklist command functionality
+2. **test_auto_capture.py**: Tests for auto-capture functionality
+3. **test_handoff_notes.py**: Tests for handoff notes functionality
+4. **run_tests.py**: Test runner with various options
+
+### 6.2 Test Classes and Methods
+
+#### 6.2.1 TestChecklistCommand (tests/test_checklist.py)
+```python
+class TestChecklistCommand(unittest.TestCase):
+    """Test cases for checklist command."""
+    
+    def setUp(self):
+        """Set up test environment."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.project_path = Path(self.temp_dir)
+        
+    def tearDown(self):
+        """Clean up test environment."""
+        import shutil
+        shutil.rmtree(self.temp_dir)
+```
+
+**Test Methods**:
+- `test_checklist_all_present()`: Test checklist when all documentation is present
+- `test_checklist_missing_docs()`: Test checklist when documentation is missing
+- `test_checklist_json_output()`: Test checklist with JSON output format
+- `test_checklist_output_file()`: Test checklist with output to file
+- `test_checklist_patterns()`: Test that checklist patterns correctly identify files
+
+#### 6.2.2 TestAutoCapture (tests/test_auto_capture.py)
+```python
+class TestAutoCapture(unittest.TestCase):
+    """Test cases for auto-capture functionality."""
+    
+    def setUp(self):
+        """Set up test environment."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.project_path = Path(self.temp_dir)
+        
+    def tearDown(self):
+        """Clean up test environment."""
+        import shutil
+        shutil.rmtree(self.temp_dir)
+```
+
+**Test Methods**:
+- `test_auto_capture_initialization()`: Test AutoCapture initialization
+- `test_start_capture_process()`: Test starting a capture process
+- `test_capture_output_parsing()`: Test output parsing and log storage
+- `test_get_parsed_errors()`: Test retrieving parsed errors
+- `test_list_active_sessions()`: Test listing active capture sessions
+- `test_stop_capture()`: Test stopping a capture session
+- `test_server_type_detection()`: Test automatic server type detection
+- `test_log_rotation()`: Test log file rotation functionality
+- `test_error_handling_invalid_command()`: Test error handling for invalid commands
+- `test_concurrent_captures()`: Test handling multiple concurrent capture sessions
+
+#### 6.2.3 TestHandoffNotes (tests/test_handoff_notes.py)
+```python
+class TestHandoffNotes(unittest.TestCase):
+    """Test cases for handoff notes functionality."""
+    
+    def setUp(self):
+        """Set up test environment."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.project_path = Path(self.temp_dir)
+        
+    def tearDown(self):
+        """Clean up test environment."""
+        import shutil
+        shutil.rmtree(self.temp_dir)
+```
+
+**Test Methods**:
+- `test_handoff_notes_initialization()`: Test HandoffNotes initialization
+- `test_create_handoff_note()`: Test creating a handoff note
+- `test_load_handoff_note()`: Test loading an existing handoff note
+- `test_list_handoff_notes()`: Test listing all handoff notes
+- `test_get_recent_handoffs()`: Test getting recent handoff notes
+- `test_search_handoffs()`: Test searching handoff notes by content
+- `test_generate_context_summary()`: Test generating context summary from handoff notes
+- `test_export_handoffs()`: Test exporting handoff notes to different formats
+- `test_validate_handoff_data()`: Test validation of handoff note data
+- `test_cleanup_old_handoffs()`: Test cleanup of old handoff notes
+
+### 6.3 Integration Tests
+
+#### 6.3.1 TestAutoCaptureIntegration (tests/test_auto_capture.py)
+```python
+class TestAutoCaptureIntegration(unittest.TestCase):
+    """Integration tests for auto-capture with parsers."""
+```
+
+**Test Methods**:
+- `test_integration_with_parsers()`: Test integration between auto-capture and log parsers
+
+#### 6.3.2 TestHandoffNotesIntegration (tests/test_handoff_notes.py)
+```python
+class TestHandoffNotesIntegration(unittest.TestCase):
+    """Integration tests for handoff notes with session management."""
+```
+
+**Test Methods**:
+- `test_integration_with_session_manager()`: Test integration between handoff notes and session management
+
+### 6.4 Test Runner (tests/run_tests.py)
+```python
+def run_tests(verbosity=2, failfast=False, pattern='test_*.py', specific_test=None):
+    """Run the test suite with specified options."""
+    
+def run_coverage_analysis():
+    """Run tests with coverage analysis if coverage.py is available."""
+    
+def run_specific_module_tests():
+    """Run tests for specific modules."""
+```
+
+**Features**:
+- Configurable verbosity levels
+- Fail-fast option
+- Pattern-based test discovery
+- Coverage analysis support
+- Interactive test selection
+- Test environment setup/cleanup
+
+## 7. TECHNICAL SPECIFICATIONS
+
+### 7.1 Data Structures and Formats
+
+#### 7.1.1 Configuration Data Structure
+```yaml
+project:
+  name: "my-project"
+  description: ""
+  modules: []
+embedding:
+  provider: "local"
+  model: "all-MiniLM-L6-v2"
+  chunk_size: 1000
+  chunk_overlap: 150
+  api_key_env: null
+indexing:
+  ignore_patterns: [".git/*", "node_modules/*", ...]
+  redact_patterns: ["(?i)(api[_-]?key|secret|password|token|auth)...", ...]
+  max_file_size_mb: 10
+shared_context:
+  enabled: false
+  repo_url: null
+  branch: "main"
+  auto_push: false
+```
+
+#### 7.1.2 Session Data Structure
+```json
+{
+  "session_id": "abcd1234",
+  "session_name": "session_2024-01-01_abcd1234",
+  "description": "",
+  "created_at": "2024-01-01T10:00:00",
+  "last_updated": "2024-01-01T10:00:00",
+  "scoped_paths": [],
+  "injected_files": [],
+  "captured_logs": [],
+  "status": "active"
+}
+```
+
+#### 7.1.3 Chunk Data Structure
+```json
+{
+  "file_path": "src/main.py",
+  "chunks": [
+    {
+      "chunk_index": 0,
+      "text": "def main():\n    print('Hello, World!')",
+      "start_char": 0,
+      "end_char": 35,
+      "file_hash": "a1b2c3d4e5f6...",
+      "file_path": "src/main.py",
+      "file_hash": "a1b2c3d4e5f6..."
+    }
+  ],
+  "indexed_at": "2024-01-01T10:00:00",
+  "total_chunks": 1
+}
+```
+
+#### 7.1.4 Payload Data Structure
+```json
+{
+  "session_info": {
+    "session_id": "abcd1234",
+    "session_name": "session_2024-01-01_abcd1234",
+    "description": "",
+    "created_at": "2024-01-01T10:00:00",
+    "generated_at": "2024-01-01T10:05:00",
+    "scoped_paths": [],
+    "previous_handoff_notes": ""
+  },
+  "project_context": {
+    "project_root": "/path/to/project",
+    "config": { /* config data */ }
+  },
+  "code_chunks": [],
+  "file_summaries": [],
+  "injected_files": [],
+  "captured_logs": [],
+  "metadata": {
+    "total_chunks": 0,
+    "total_summaries": 0,
+    "total_logs": 0,
+    "payload_size_chars": 0
+  }
+}
+```
+
+### 7.2 API Endpoints and Interfaces
+
+#### 7.2.1 CLI Commands
+The CLI provides a comprehensive set of commands for all major features:
+
+1. **init**: Initialize Context Engine in current directory
+2. **reindex**: Reindex project files
+3. **sync**: Sync changes and update index
+4. **search**: Search indexed content
+5. **start-session**: Start a new session
+6. **stop-session**: Stop current session
+7. **inject**: Rebuild session payload
+8. **capture**: Capture command output
+9. **export**: Export shared digest
+10. **pull-digest**: Pull digest from shared repo
+11. **set-scope**: Set active scope
+12. **suggest-merge**: Suggest merge resolution
+13. **status**: Show context engine status
+14. **checklist**: Check for project documentation
+15. **add-docs**: Add documentation files to context
+16. **enhanced-summarize**: Enhanced file summarization using LangChain methods
+17. **project-overview**: Generate comprehensive project overview
+18. **langchain-process**: Process content using LangChain methods
+19. **smart-select**: Smart file selection using LangChain
+
+#### 7.2.2 Python API
+The Python API provides programmatic access to all Context Engine functionality:
+
+```python
+from context_engine.scripts.embedder import FileIndexer
+from context_engine.scripts.embeddings_store import EmbeddingsStore
+from context_engine.scripts.session import SessionManager
+from context_engine.scripts.auto_capture import AutoCapture
+from context_engine.scripts.summarizer import FileSummarizer
+from context_engine.parsers.parser_factory import parser_factory
+
+# Example usage
+config = ContextConfig.load_or_create()
+indexer = FileIndexer(config)
+store = EmbeddingsStore(config)
+session_manager = SessionManager(config)
+```
+
+### 7.3 Configuration Options
+
+#### 7.3.1 Project Configuration
+- `name`: Project name (default: "my-project")
+- `description`: Project description (default: "")
+- `modules`: List of project modules (default: [])
+
+#### 7.3.2 Embedding Configuration
+- `provider`: Embedding provider (local, openai, openrouter) (default: "local")
+- `model`: Model name for embedding generation (default: "all-MiniLM-L6-v2")
+- `chunk_size`: Size of text chunks for indexing (default: 1000)
+- `chunk_overlap`: Overlap between chunks (default: 150)
+- `api_key_env`: Environment variable for API key (default: None)
+
+#### 7.3.3 Indexing Configuration
+- `ignore_patterns`: File/directory patterns to ignore (default: [".git/*", "node_modules/*", ...])
+- `redact_patterns`: Regex patterns for secret redaction (default: ["(?i)(api[_-]?key|secret|password|token|auth)...", ...])
+- `max_file_size_mb`: Maximum file size to process (default: 10)
+
+#### 7.3.4 Shared Context Configuration
+- `enabled`: Whether shared context is enabled (default: False)
+- `repo_url`: URL for shared context repository (default: None)
+- `branch`: Branch for shared context (default: "main")
+- `auto_push`: Whether to automatically push changes (default: False)
+
+### 7.4 Performance Considerations
+
+#### 7.4.1 Indexing Performance
+- SHA256-based change detection minimizes unnecessary reindexing
+- Chunking with configurable size and overlap balances context preservation with memory efficiency
+- Batch processing of embeddings to avoid memory issues
+- Asynchronous processing where possible
+
+#### 7.4.2 Search Performance
+- FAISS vector store for efficient similarity search
+- Metadata-based filtering to reduce search space
+- Caching of frequently accessed embeddings
+
+#### 7.4.3 Memory Management
+- Streaming processing for large files
+- Batch processing for embeddings generation
+- Efficient data structures for in-memory operations
+
+### 7.5 Cross-Platform Compatibility
+
+#### 7.5.1 Supported Platforms
+- Windows (win32)
+- macOS (darwin)
+- Linux
+
+#### 7.5.2 Python Version Requirements
+- Python 3.8+
+
+#### 7.5.3 Node.js Version Requirements
+- Node.js 14+
+
+#### 7.5.4 Cross-Platform Features
+- Path handling using pathlib for cross-platform compatibility
+- Process management using psutil for cross-platform process monitoring
+- File system operations using standard library functions
+- Configuration using YAML for human-readable cross-platform config
+
+## 8. TESTING AND QUALITY ASSURANCE
+
+### 8.1 Test Coverage Analysis
+
+#### 8.1.1 Unit Test Coverage
+The test suite provides comprehensive unit test coverage for:
+
+1. **Configuration System**: Testing configuration loading, saving, and default values
+2. **File Indexing**: Testing file detection, hashing, chunking, and storage
+3. **Embeddings Store**: Testing embedding generation, storage, and search functionality
+4. **Session Management**: Testing session lifecycle, scope management, and payload generation
+5. **Auto Capture**: Testing process monitoring, log capture, and error parsing
+6. **Log Parsing**: Testing parser detection, content parsing, and error extraction
+7. **File Summarization**: Testing file analysis, summary generation, and storage
+8. **Project Checklist**: Testing documentation detection and reporting
+
+#### 8.1.2 Integration Test Coverage
+Integration tests cover:
+
+1. **Auto Capture with Log Parsers**: Testing the integration between process monitoring and log parsing
+2. **Handoff Notes with Session Management**: Testing the integration between session data and handoff note generation
+3. **Parser Factory with Individual Parsers**: Testing parser selection and delegation
+
+### 8.2 Test Case Descriptions
+
+#### 8.2.1 Configuration Tests
+- Test loading configuration from file
+- Test creating default configuration
+- Test saving configuration to file
+- Test configuration validation
+
+#### 8.2.2 File Indexing Tests
+- Test file detection with ignore patterns
+- Test SHA256 hash computation
+- Test file chunking with overlap
+- Test chunk storage and retrieval
+- Test incremental reindexing
+- Test full reindexing
+
+#### 8.2.3 Embeddings Store Tests
+- Test embedding model initialization
+- Test FAISS index creation and loading
+- Test embedding generation
+- Test similarity search
+- Test index rebuilding
+
+#### 8.2.4 Session Management Tests
+- Test session creation and storage
+- Test session stopping and cleanup
+- Test scope setting and management
+- Test file injection
+- Test log capture
+- Test payload generation
+- Test session status reporting
+
+#### 8.2.5 Auto Capture Tests
+- Test process monitoring initialization
+- Test development server detection
+- Test log capture and storage
+- Test error parsing and storage
+- Test session management
+- Test concurrent captures
+
+#### 8.2.6 Log Parsing Tests
+- Test parser selection
+- Test Python log parsing
+- Test Java log parsing
+- Test JavaScript log parsing
+- Test generic log parsing
+- Test error extraction
+
+#### 8.2.7 File Summarization Tests
+- Test file analysis for different languages
+- Test summary generation
+- Test summary storage
+- Test fallback analysis
+
+#### 8.2.8 Project Checklist Tests
+- Test documentation detection
+- Test pattern matching
+- Test reporting formats
+- Test output options
+
+### 8.3 Integration Test Scenarios
+
+#### 8.3.1 End-to-End Workflow Test
+1. Initialize Context Engine in a test directory
+2. Create sample project files
+3. Run full reindex
+4. Start a session
+5. Set scope to specific files
+6. Inject additional files
+7. Capture simulated logs
+8. Generate payload
+9. Stop session
+10. Verify all components worked together correctly
+
+#### 8.3.2 Change Detection Test
+1. Initialize Context Engine
+2. Index initial project state
+3. Modify a file
+4. Run incremental reindex
+5. Verify only changed file was reindexed
+6. Verify embeddings were updated
+
+#### 8.3.3 Log Parsing Integration Test
+1. Start auto capture monitoring
+2. Simulate development server process
+3. Generate sample error output
+4. Verify logs were captured
+5. Verify errors were parsed correctly
+6. Verify parsed errors were stored
+
+### 8.4 Performance Benchmarks
+
+#### 8.4.1 Indexing Performance
+- Time to index 100 small files (< 1KB each)
+- Time to index 10 medium files (10-100KB each)
+- Time to index 1 large file (> 1MB)
+- Memory usage during indexing
+- Disk space usage for indexed files
+
+#### 8.4.2 Search Performance
+- Time to perform similarity search with 1000 embeddings
+- Time to perform similarity search with 10000 embeddings
+- Time to perform similarity search with 100000 embeddings
+- Memory usage during search
+- Accuracy of search results
+
+#### 8.4.3 Session Performance
+- Time to start a session
+- Time to generate payload with 10 files
+- Time to generate payload with 100 files
+- Time to generate payload with 1000 files
+- Memory usage during payload generation
+
+#### 8.4.4 Auto Capture Performance
+- CPU usage during process monitoring
+- Memory usage during log capture
+- Time to detect development server processes
+- Time to parse captured logs
+
+## 9. DEPENDENCIES AND REQUIREMENTS
+
+### 9.1 Core Dependencies
+- PyYAML>=6.0: YAML parsing for configuration
+- gitpython>=3.1.0: Git integration
+- sentence-transformers>=2.2.0: Local embedding generation
+- faiss-cpu>=1.7.0: Vector similarity search
+- numpy>=1.21.0: Numerical computing
+- scipy>=1.7.0: Scientific computing
+- torch>=1.9.0: Machine learning framework
+- transformers>=4.20.0: Transformer models
+
+### 9.2 Text Processing Dependencies
+- nltk>=3.7: Natural language processing
+- markdown>=3.4.0: Markdown processing
+
+### 9.3 File Handling Dependencies
+- watchdog>=2.1.0: File system monitoring
+- chardet>=5.0.0: Character encoding detection
+
+### 9.4 HTTP Dependencies
+- requests>=2.28.0: HTTP requests for optional API providers
+
+### 9.5 Development and Testing Dependencies
+- pytest>=7.0.0: Testing framework
+- pytest-cov>=4.0.0: Test coverage analysis
+- black>=22.0.0: Code formatting
+- flake8>=5.0.0: Code linting
+- mypy>=0.991: Type checking
+
+## 10. SECURITY AND PRIVACY
+
+### 10.1 Secret Redaction
+The system automatically redacts sensitive information using configurable regex patterns:
+- API keys and secrets
+- Passwords and tokens
+- Authentication credentials
+- Database connection strings
+- Email addresses
+
+### 10.2 Local-First Design
+All processing happens locally by default:
+- No data is sent to external servers without explicit configuration
+- All embeddings are generated locally using sentence-transformers
+- Configuration and data are stored locally
+- Git integration respects .gitignore patterns
+
+### 10.3 File System Security
+- Respects file system permissions
+- Handles file access errors gracefully
+- Validates file paths to prevent directory traversal
+- Limits file sizes to prevent resource exhaustion
+
+## 11. EXTENSIBILITY AND CUSTOMIZATION
+
+### 11.1 Parser Architecture
+The parser system is designed for extensibility:
+- Abstract base class defines parser interface
+- Factory pattern for parser selection
+- Easy to add new language-specific parsers
+- Fallback to generic parser for unknown formats
+
+### 11.2 Configuration System
+The configuration system supports:
+- YAML-based configuration files
+- Environment variable overrides
+- Default values for all settings
+- Validation of configuration values
+
+### 11.3 Plugin System
+The system architecture supports plugins for:
+- Additional embedding providers
+- New log parser types
+- Custom summarization methods
+- Extended CLI commands
+
+## 12. TROUBLESHOOTING AND DEBUGGING
+
+### 12.1 Common Issues
+
+#### 12.1.1 Python Dependencies Not Found
+**Symptom**: Error messages about missing Python packages
+**Solution**: Run `pip install -r requirements.txt`
+
+#### 12.1.2 FAISS Installation Issues
+**Symptom**: ImportError for faiss module
+**Solution**: Install faiss-cpu with `pip install faiss-cpu`
+
+#### 12.1.3 Permission Errors
+**Symptom**: Permission denied errors when accessing files
+**Solution**: Check file permissions and run with appropriate privileges
+
+#### 12.1.4 Large File Processing
+**Symptom**: Slow performance or memory issues with large files
+**Solution**: Adjust max_file_size_mb in configuration
+
+### 12.2 Debugging Tools
+
+#### 12.2.1 Logging
+The system uses Python's logging module with configurable levels:
+- INFO: General operational messages
+- WARNING: Potential issues that don't stop execution
+- ERROR: Errors that affect functionality
+- DEBUG: Detailed information for troubleshooting
+
+#### 12.2.2 Verbose Output
+Many commands support verbose output options for detailed information.
+
+#### 12.2.3 Configuration Validation
+The configuration system validates all settings and provides helpful error messages.
+
+## 13. FUTURE ENHANCEMENTS
+
+### 13.1 Planned Features
+- Advanced re-ranking of search results
+- ML-based merge conflict auto-resolution
+- GPU acceleration for embedding generation
+- Advanced text processing with spaCy
+- BeautifulSoup integration for HTML processing
+
+### 13.2 Performance Improvements
+- Asynchronous processing for better scalability
+- More efficient memory management for large projects
+- Caching strategies for frequently accessed data
+- Optimized chunking algorithms
+
+### 13.3 Integration Enhancements
+- Additional embedding providers (OpenAI, Cohere)
+- Integration with popular IDEs and editors
+- Web-based dashboard for project insights
+- API for programmatic access to Context Engine features
+
+## 14. BEST PRACTICES
+
+### 14.1 Configuration Best Practices
+- Customize ignore_patterns for your project structure
+- Adjust chunk_size and chunk_overlap based on your codebase
+- Regularly review and update redact_patterns for security
+- Enable shared_context for team collaboration
+
+### 14.2 Usage Best Practices
+- Run incremental reindex regularly to keep context fresh
+- Use sessions to maintain context during development
+- Set appropriate scopes to focus AI tools on relevant code
+- Regularly export team context for collaboration
+
+### 14.3 Security Best Practices
+- Regularly review redact_patterns to ensure sensitive data is protected
+- Use .gitignore to prevent sensitive files from being committed
+- Review generated payloads before sharing with AI tools
+- Keep dependencies up to date for security patches
+
+## 15. CONTRIBUTING
+
+### 15.1 Development Setup
+1. Clone the repository
+2. Install dependencies: `pip install -e ".[dev]"`
+3. Run tests: `pytest`
+4. Format code: `black .`
+5. Lint code: `flake8 .`
+
+### 15.2 Code Standards
+- Follow PEP 8 for Python code style
+- Use type hints for all function signatures
+- Write comprehensive docstrings for all public functions and classes
+- Include unit tests for new functionality
+- Maintain backward compatibility when possible
+
+### 15.3 Pull Request Process
+1. Fork the repository
+2. Create a feature branch
+3. Implement changes with tests
+4. Ensure all tests pass
+5. Submit pull request with detailed description
+
+---
+
+*This documentation was automatically generated by analyzing the Context Engine codebase. Last updated: September 5, 2025*

@@ -1,0 +1,52 @@
+{
+  "name": "context-engine",
+  "version": "1.0.0",
+  "description": "A powerful context management tool for development workflows with automatic log capture and intelligent parsing",
+  "main": "bin/context-engine.js",
+  "bin": {
+    "context-engine": "./bin/context-engine.js",
+    "ce": "./bin/context-engine.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "install-python-deps": "pip install -r requirements.txt",
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "keywords": [
+    "context",
+    "development",
+    "logs",
+    "parsing",
+    "session-management",
+    "auto-capture",
+    "cli"
+  ],
+  "author": "Context Engine Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/context-engine.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-org/context-engine/issues"
+  },
+  "homepage": "https://github.com/your-org/context-engine#readme",
+  "engines": {
+    "node": ">=14.0.0",
+    "python": ">=3.8"
+  },
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ],
+  "preferGlobal": true,
+  "files": [
+    "bin/",
+    "scripts/",
+    "context_engine/",
+    "requirements.txt",
+    "README.md",
+    "LICENSE"
+  ]
+}

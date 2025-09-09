@@ -1,0 +1,133 @@
+You are an expert engineer building a production-ready but time-boxed (1 week) Context Engine for dev teams. Deliver a runnable Python CLI tool named `context-engine` (entrypoint: `context_engine/scripts/cli.py`) that implements the core v0.1 features described below. Keep design modular and well-tested. Prioritize correctness, safety (no secrets leaked), and minimal hallucination guards. Use only OSS libraries and make local-first defaults; allow optional API providers.
+
+PROJECT GOAL
+- A local project "brain" that:
+  - Indexes and summarizes code incrementally
+  - Captures runtime/build/test logs
+  - Produces a compact token-friendly session payload (`.context_payload/session_context.txt`) for AI tools (Claude, Codex, Trae, Warp, Cursor)
+  - Exports a safe `team_context/` digest for Git (pre-push hook)
+  - Supports federated usage for multiple repos (frontend/backend) via a separate `shared_context-repo` digest flow (make it optional/configurable)
+  - Provides merge-conflict safety (block indexing while conflicts exist) and minimal hallucination guards (scope-limiting, snippet attachment, diff-check)
+
+CONSTRAINTS & PRIORITIES
+- Timebox: Build a working v0.1 within a single week. Focus on core pipeline; advanced features (re-ranker, ML-based merge auto-resolve) are optional and should be described as follow-ups.
+- Default to local embedding/summarization using `sentence-transformers` (all-MiniLM) or similar; allow `OPENAI_API_KEY` / `OPENROUTER` by config.
+- No secrets/keys should be committed to Git. Provide redaction rules.
+- Provide clear CLI commands, docs, tests, and a short runbook.
+
+REQUIRED FEATURES (implement in this order)
+1) Scaffolding & Config
+   - Create directory structure under repo: `context_engine/` (git-ignored), `team_context/` (git-tracked), `.context_payload/` (git-ignored).
+   - `context_engine/config/context.yml` config with fields: project.name, modules, embedding.provider, chunk_size, hybrid strategy, ignore patterns, redact patterns, shared_context_repo URL (optional).
+   - Add `.gitignore` entries for `context_engine/` and `.context_payload/`.
+
+2) Indexer (incremental)
+   - Script: `context_engine/scripts/embedder.py`
+   - Walk repo excluding ignore patterns; compute SHA256 per file; chunk changed files (800–1200 chars/chunk, overlap 150).
+   - Store chunk metadata JSON under `context_engine/embeddings_db/` (path, chunk_index, sha, text).
+   - Maintain `context_engine/sync.json` mapping file -> sha & last_indexed_time.
+   - CLI: `context-engine reindex --all` and `context-engine reindex --incremental`.
+
+3) Summarizer (consistent template)
+   - Script: `context_engine/scripts/summarizer.py`
+   - Summarize changed files using a template (Purpose, Public Surface, Dependencies, Risks, Recent Changes).
+   - Save per-file summaries under `context_engine/summaries/{relative_path}.md`.
+   - If no API key, fallback to deterministic parsing: extract top-level defs, docstrings, imports.
+
+4) Local Embeddings & Vector Store (pluggable)
+   - Script/wrapper: `context_engine/scripts/embeddings_store.py`
+   - Use `sentence-transformers` local model to produce embeddings by default; store vectors in FAISS (local) or Chroma if available.
+   - Provide `similarity_search(query, k)` function that returns top chunks with metadata.
+   - CLI: `context-engine search "why is payment failing" --k 8` prints top results.
+
+5) Log capture & parsing
+   - Script: `context_engine/scripts/capture.py` to run wrapped commands:
+     `context-engine capture --name backend mvn spring-boot:run`
+     it should tee stdout/stderr into `context_engine/logs/backend.log` and also parse structured errors into `context_engine/logs/errors/*.json` (fields: message, file_hint, line_hint, traceback, timestamp).
+   - Also implement a file-watcher mode: watch `context_engine/logs/*.log` and parse appended content.
+
+6) Session lifecycle & inject payload
+   - Script: `context_engine/scripts/session.py`
+   - CLI:
+     - `context-engine start-session --inject <agent>`:
+       - Runs `context-engine sync` (see 7).
+       - Builds `.context_payload/session_context.txt` containing: project summary, active scope (if set), unresolved errors, 5–12 top relevant summaries + exact code snippets (with file path & line ranges), relevant ADR excerpts.
+       - Offers `--pipe` to send payload to STDOUT for piping into a CLI-based AI tool.
+     - `context-engine inject` (manual rebuild of payload).
+     - `context-engine stop-session`:
+       - Save session summary in `context_engine/summaries/session_summaries/{timestamp}.md`
+       - Update unresolved errors and sync.json.
+
+7) Git integration & Sync
+   - Script: `context_engine/scripts/sync.py`
+   - `context-engine sync` behavior:
+     - Run `git status`/`git ls-files` diff against `sync.json` to find changed files; if merge conflict markers exist, abort and print conflict list.
+     - Re-index changed files only; update embeddings and summaries.
+   - Pre-push hook template that runs `context-engine export --shared` and stages `team_context/*` for commit.
+
+8) Export shared digest
+   - Script: `context_engine/scripts/export_shared.py`
+   - Builds `team_context/latest_changes.md`, `team_context/adr_list.md`, `team_context/dependency_map.json`, `team_context/conflict_warnings.md`.
+   - CLI: `context-engine export --shared` commits (optional) these files into local repo; provide instructions to push them manually or via CI into `shared_context-repo`.
+
+9) Federated digest pull
+   - CLI: `context-engine pull-digest <repo-or-path>`
+   - Fetches digest from `shared_context-repo` (user-provided remote), copies into a read-only external context area and makes it available during `start-session`.
+
+10) Merge-conflict safety & scope declarations
+   - CLI: `context-engine set-scope <path1> [path2 ...]` writes local `active_scope.json` and updates `team_context/active_scopes.md` for sharing.
+   - On `context-engine sync` abort if `.git/MERGE_MSG` or conflict markers present.
+   - Optional: `context-engine suggest-merge <file>` that collects base/ours/theirs and calls LLM to propose merged code (proposal returned but not auto-applied).
+
+11) Minimal hallucination guards (must be implemented v0.1)
+   - Always include exact code snippets for any summary injection.
+   - When AI produces code changes, do a `post-reply diff-check` against current files; block apply if code touches files outside scope or introduces APIs not present — require human approval.
+   - Add strict prompt template in `session` payload:
+     - “You MUST base suggestions ONLY on the provided files and snippets. If info is missing, say ‘INSUFFICIENT CONTEXT’.”
+
+12) Tests & smoke checks
+   - Unit tests for indexer (hash change triggers re-index), summarizer fallback, log parser, sync conflict detection.
+   - Integration smoke: modify a file → incremental reindex → start-session → payload contains updated snippet.
+
+13) Docs & runbook
+   - README with install steps (Python v3.10+, pip requirements), quickstart commands, pre-push hook install, and sample `context_engine/config/context.yml`.
+   - Small runbook `RUNBOOK.md` detailing: how to start a session, how to export, how to pull digest, how to resolve conflicts.
+
+ACCEPTANCE CRITERIA (deliverables)
+- `context_engine/scripts/cli.py` exposes commands: reindex, sync, start-session, stop-session, export, pull-digest, capture, set-scope, suggest-merge, status.
+- Running `python context_engine/scripts/embedder.py --reindex-all` indexes repo into `context_engine/embeddings_db/` and writes `sync.json`.
+- Running `context-engine start-session --inject trae --pipe` creates `.context_payload/session_context.txt` and pipes it to stdout.
+- `context-engine sync` aborts on merge conflicts and prints conflict files.
+- `context-engine export --shared` produces `team_context/` files and stages them for commit.
+- Tests pass and README explains CI step for pushing to `shared_context-repo`.
+
+DELIVERABLE FORMAT
+- Zip or repo branch with the `context_engine/` code, sample `team_context/`, and `shared_context-repo` skeleton.
+- README + RUNBOOK + minimal tests.
+
+IMPLEMENTATION NOTES (developer hints)
+- Use `gitpython` or shell `git` for diff detection, but ensure robust detection of conflict markers.
+- Use `sentence-transformers` (all-MiniLM) for local embeddings; use `faiss` for vector store.
+- For LLM summarization where API is unavailable, use deterministic code heuristics (AST parsing for Python; regex for JS/Java) to populate the summarizer template.
+- Keep payload sizes small: prefer summaries + 1–3 short code snippets per file, not whole files.
+- Redact secrets before any export using configured regex rules.
+- Implement logging and an internal `context-engine status` command.
+
+TIMEBOX & SPRINT PLAN
+- Day 0: Scaffolding, config, simple embedder (reindex-all)
+- Day 1–2: Incremental indexer, summarizer, sync.json logic
+- Day 3: Local vector store + similarity search, search CLI
+- Day 3–4: Log capture + parsing
+- Day 4: Session payload builder & injection CLI
+- Day 5: Export/shared digest + pre-push hook
+- Day 6: Merge safety, scope, suggest-merge stub
+- Day 7: Tests, docs, polish, deliverable package
+
+OUTPUT
+- Provide code, tests, README, and small demo script showing:
+  - Index a sample repo
+  - Start a session and produce payload
+  - Simulate a conflict and show sync abort
+
+If anything is ambiguous, default to safe, minimal, local-first behavior and document any optional paid-API features. Build the first working commitable branch and then split out further PRs for advanced features.
+

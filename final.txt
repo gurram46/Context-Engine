@@ -1,0 +1,33 @@
+Got it — so you’re basically saying:
+
+Baseline setup → Don’t be a smartass auto-decider, just explain every file and let the dev pick what’s important.
+
+Existing projects → You’re undecided on pulling history, but honestly, fresh start is cleaner for v1.
+
+Staleness → Warn, don’t block, but make sure the warning slaps them in the face when they request context.
+
+Error logs → Plain text in the session notes, AI-friendly, no extra folders to babysit.
+
+Team mode → No “oops we created a repo for you” surprises — if they want team mode, they set it up.
+
+Multi-repo linking → Just pull when the dev asks, not every time like some overeager intern.
+
+If we bake this into the Warp-based CLI prompt, the flow for adding mid-project will be:
+
+context init → Lists all files/folders in repo → Dev marks what’s “baseline.”
+
+Creates project_context.md (baseline) and context_config.yml (settings).
+
+Starts tracking sessions immediately — no historical imports.
+
+When baseline files change → hash check triggers warning (shown in CLI output + attached to context load).
+
+context save at end of session → prompts for optional error logs.
+
+If in team mode → push/pull digests only when user asks.
+
+If multi-repo linked → context pull-linked manually grabs shared notes.
+
+Question for you before I finalize the full project prompt: Do you want v1 to still have baseline context + session notes + team mode + multi-repo together, or should we keep team mode/multi-repo for v2 and focus purely on your single-project context problem?
+
+Because if we jam everything into v1, it’ll be a big first sprint.
