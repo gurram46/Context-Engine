@@ -1,15 +1,6 @@
 """CLI commands for Context Engine"""
 
-from . import (
-    init_command,
-    baseline_commands,
-    session_commands,
-    bundle_command,
-    expand_command,
-    status_command,
-    cross_repo_command
-)
-
+# Expose submodule names for `from context_engine.commands import ...`
 __all__ = [
     'init_command',
     'baseline_commands',
@@ -17,5 +8,6 @@ __all__ = [
     'bundle_command',
     'expand_command',
     'status_command',
-    'cross_repo_command'
+    'cross_repo_command',
+    'config_commands',
 ]
