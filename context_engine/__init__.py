@@ -1,4 +1,3 @@
-"""Context Engine - A local project brain for dev teams."""
+"""Context Engine - CLI-based Context Management for AI Coding Tools"""
 
-__version__ = "0.1.0"
-__author__ = "Context Engine Team"
+__version__ = "1.0.0"

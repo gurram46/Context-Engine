@@ -1,187 +1,99 @@
-"""Configuration management for Context Engine."""
+"""Configuration management for Context Engine"""
 
 import os
-import yaml
+import json
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional
 
-@dataclass
-class ProjectConfig:
-    """Project-specific configuration."""
-    name: str = "my-project"
-    description: str = ""
-    modules: List[str] = None
+class Config:
+    """Manages Context Engine configuration"""
     
-    def __post_init__(self):
-        if self.modules is None:
-            self.modules = []
-
-@dataclass
-class EmbeddingConfig:
-    """Embedding provider configuration."""
-    provider: str = "local"  # local, openai, openrouter
-    model: str = "all-MiniLM-L6-v2"
-    chunk_size: int = 1000
-    chunk_overlap: int = 150
-    api_key_env: Optional[str] = None
-
-@dataclass
-class IndexingConfig:
-    """Indexing configuration."""
-    ignore_patterns: List[str] = None
-    redact_patterns: List[str] = None
-    max_file_size_mb: int = 10
+    DEFAULT_CONFIG = {
+        "openrouter_api_key": "",
+        "model": "qwen/qwen3-coder:free",
+        "max_tokens": 100000,
+        "context_dir": ".context",
+        "auto_refresh": False,
+        "compression_rules": {
+            "strip_comments": True,
+            "keep_docstrings": True,
+            "summarize_configs": True,
+            "deduplicate": True,
+            "remove_blank_lines": True
+        },
+        "linked_repos": [],
+        # Security-related defaults
+        "allowed_extensions": [
+            ".md", ".json", ".yml", ".yaml", ".toml", ".ini", ".env",
+            ".py", ".js", ".ts", ".java", ".c", ".cpp"
+        ],
+        "max_file_size_kb": 1024,
+        "note_max_length": 2000
+    }
     
-    def __post_init__(self):
-        if self.ignore_patterns is None:
-            self.ignore_patterns = [
-                ".git/*",
-                "node_modules/*",
-                "__pycache__/*",
-                "*.pyc",
-                "*.pyo",
-                "*.pyd",
-                ".DS_Store",
-                "*.log",
-                "*.tmp",
-                "*.temp",
-                "context_engine/*",
-                ".context_payload/*",
-                "*.min.js",
-                "*.min.css",
-                "dist/*",
-                "build/*",
-                "target/*",
-                "*.jar",
-                "*.war",
-                "*.zip",
-                "*.tar.gz",
-                "*.exe",
-                "*.dll",
-                "*.so",
-                "*.dylib"
-            ]
-        
-        if self.redact_patterns is None:
-            self.redact_patterns = [
-                r"(?i)(api[_-]?key|secret|password|token|auth)[\s]*[=:][\s]*['\"]?([^\s'\"\n]+)",
-                r"(?i)(bearer|basic)\s+([a-zA-Z0-9+/=]+)",
-                r"(?i)-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----",
-                r"(?i)(mongodb://|postgres://|mysql://)[^\s]+",
-                r"(?i)([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"
-            ]
-
-@dataclass
-class SharedContextConfig:
-    """Shared context repository configuration."""
-    enabled: bool = False
-    repo_url: Optional[str] = None
-    branch: str = "main"
-    auto_push: bool = False
-
-@dataclass
-class ContextConfig:
-    """Main configuration class."""
-    project: ProjectConfig
-    embedding: EmbeddingConfig
-    indexing: IndexingConfig
-    shared_context: SharedContextConfig
-    project_root: Optional[Path] = None
+    def __init__(self, project_root: Optional[Path] = None):
+        self.project_root = project_root or Path.cwd().resolve()
+        self.context_dir = self.project_root / ".context"
+        self.config_file = self.context_dir / "config.json"
+        self._config = self.DEFAULT_CONFIG.copy()
+        self.load()
     
-    def __post_init__(self):
-        """Initialize computed properties."""
-        if self.project_root is None:
-            self.project_root = Path.cwd()
+    def load(self) -> None:
+        """Load configuration from file if it exists"""
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    stored_config = json.load(f)
+                    self._config.update(stored_config)
+            except (json.JSONDecodeError, IOError):
+                pass
+    
+    def save(self) -> None:
+        """Save configuration to file"""
+        self.context_dir.mkdir(exist_ok=True)
+        with open(self.config_file, 'w') as f:
+            json.dump(self._config, f, indent=2)
+    
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get configuration value"""
+        return self._config.get(key, default)
+    
+    def set(self, key: str, value: Any) -> None:
+        """Set configuration value"""
+        self._config[key] = value
+        self.save()
     
     @property
-    def data_dir(self) -> Path:
-        """Get the data directory path."""
-        return self.project_root / '.context' / 'data'
+    def openrouter_api_key(self) -> str:
+        """Get OpenRouter API key from config or environment"""
+        return self.get("openrouter_api_key") or os.getenv("OPENROUTER_API_KEY", "")
     
     @property
-    def handoff_dir(self) -> Path:
-        """Get the handoff notes directory path."""
-        return self.project_root / '.context' / 'handoffs'
+    def baseline_dir(self) -> Path:
+        """Get baseline directory path"""
+        return self.context_dir / "baseline"
     
     @property
-    def logs_dir(self) -> Path:
-        """Get the logs directory path."""
-        return self.project_root / '.context' / 'logs'
+    def adrs_dir(self) -> Path:
+        """Get ADRs directory path"""
+        return self.context_dir / "adrs"
     
-    @classmethod
-    def default(cls) -> 'ContextConfig':
-        """Create default configuration."""
-        return cls(
-            project=ProjectConfig(),
-            embedding=EmbeddingConfig(),
-            indexing=IndexingConfig(),
-            shared_context=SharedContextConfig(),
-            project_root=Path.cwd()
-        )
+    @property
+    def session_file(self) -> Path:
+        """Get session file path"""
+        return self.context_dir / "session.md"
     
-    @classmethod
-    def load_from_file(cls, config_path: Path) -> 'ContextConfig':
-        """Load configuration from YAML file."""
-        if not config_path.exists():
-            raise FileNotFoundError(f"Configuration file not found: {config_path}")
-        
-        with open(config_path, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f) or {}
-        
-        return cls(
-            project=ProjectConfig(**data.get('project', {})),
-            embedding=EmbeddingConfig(**data.get('embedding', {})),
-            indexing=IndexingConfig(**data.get('indexing', {})),
-            shared_context=SharedContextConfig(**data.get('shared_context', {})),
-            project_root=config_path.parent.parent.parent
-        )
+    @property
+    def cross_repo_file(self) -> Path:
+        """Get cross-repo file path"""
+        return self.context_dir / "cross_repo.md"
     
-    def save_to_file(self, config_path: Path) -> None:
-        """Save configuration to YAML file."""
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        data = {
-            'project': asdict(self.project),
-            'embedding': asdict(self.embedding),
-            'indexing': asdict(self.indexing),
-            'shared_context': asdict(self.shared_context)
-        }
-        
-        with open(config_path, 'w', encoding='utf-8') as f:
-            yaml.dump(data, f, default_flow_style=False, indent=2)
+    @property
+    def context_file(self) -> Path:
+        """Get context_for_ai.md file path"""
+        return self.context_dir / "context_for_ai.md"
     
-    @classmethod
-    def load_or_create(cls, project_root: Optional[Path] = None) -> 'ContextConfig':
-        """Load existing config or create default one."""
-        if project_root is None:
-            project_root = Path.cwd()
-        
-        config_path = project_root / "context_engine" / "config" / "context.yml"
-        
-        if config_path.exists():
-            return cls.load_from_file(config_path)
-        else:
-            # Create default config
-            config = cls.default()
-            # Try to infer project name from directory
-            config.project.name = project_root.name
-            return config
-    
-    def get_context_engine_dir(self, project_root: Optional[Path] = None) -> Path:
-        """Get the context engine directory path."""
-        if project_root is None:
-            project_root = Path.cwd()
-        return project_root / "context_engine"
-    
-    def get_team_context_dir(self, project_root: Optional[Path] = None) -> Path:
-        """Get the team context directory path."""
-        if project_root is None:
-            project_root = Path.cwd()
-        return project_root / "team_context"
-    
-    def get_context_payload_dir(self, project_root: Optional[Path] = None) -> Path:
-        """Get the context payload directory path."""
-        if project_root is None:
-            project_root = Path.cwd()
-        return project_root / ".context_payload"
+    @property
+    def hashes_file(self) -> Path:
+        """Get hashes.json file path"""
+        return self.context_dir / "hashes.json"
