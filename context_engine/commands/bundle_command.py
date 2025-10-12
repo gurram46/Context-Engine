@@ -27,6 +27,13 @@ def bundle(use_ai):
     session_content = _read_session(config)
     cross_repo_content = _read_cross_repo(config)
     expanded = _read_expanded_section(config)
+    
+    # Add compressed source files section if present
+    compressed_src_content = _read_compressed_src_section(config)
+    if expanded and compressed_src_content:
+        expanded = expanded + "\n\n" + compressed_src_content
+    elif compressed_src_content:
+        expanded = compressed_src_content
 
     # Redact secrets
     arch = redact_secrets(arch)
@@ -138,6 +145,23 @@ def _read_expanded_section(config: Config) -> str:
     return ""
 
 
+def _read_compressed_src_section(config: Config) -> str:
+    """Read compressed source files if they exist"""
+    compressed_src_dir = config.context_dir / "compressed_src"
+    if not compressed_src_dir.exists():
+        return ""
+    
+    compressed_files = list(compressed_src_dir.glob("*.zip"))
+    if not compressed_files:
+        return ""
+    
+    content = "### Compressed Source Files\n"
+    for file in compressed_files:
+        content += f"- {file.name} ({file.stat().st_size} bytes)\n"
+    
+    return content
+
+
 def _apply_config_summarization(content: str) -> str:
     """Apply config summarization"""
     lines = content.split("\n")
@@ -200,4 +224,3 @@ def _manual_fixed_bundle(
     lines.append("\n## Expanded Files\n")
     lines.append(expanded if expanded.strip() else "None")
     return "\n".join(lines)
-
