@@ -10,7 +10,7 @@ class OpenRouterClient:
     SYSTEM_PROMPT = (
         "You are the Context Engine formatter.\n\n"
         "Always output `.context/context_for_ai.md` exactly in this structure and order:\n"
-        "## Architecture\n## APIs\n## Configuration\n## Database Schema\n## Session Notes\n## Cross-Repo Notes\n## Expanded Files\n\n"
+        "## Architecture\n## APIs\n## Configuration\n## Database Schema\n## Task\n## Session Notes\n## Cross-Repo Notes\n## Expanded Files\n\n"
         "Rules:\n"
         "- Apply strict compression: strip all inline code comments, keep API docstrings only.\n"
         "- Summarize configs without secrets.\n"
@@ -94,13 +94,14 @@ class OpenRouterClient:
             return content
     
     def generate_fixed_context_bundle(self, *, architecture: str, apis: str, configuration: str,
-                                      schema: str, session: str, cross_repo: str, expanded: str) -> str:
+                                      schema: str, session: str, cross_repo: str, expanded: str, task: str) -> str:
         """Generate the final context_for_ai.md content in the fixed structure"""
         content = (
             "## Architecture\n" + architecture + "\n\n"
             "## APIs\n" + apis + "\n\n"
             "## Configuration\n" + configuration + "\n\n"
             "## Database Schema\n" + schema + "\n\n"
+            "## Task\n" + task + "\n\n"
             "## Session Notes\n" + session + "\n\n"
             "## Cross-Repo Notes\n" + cross_repo + "\n\n"
             "## Expanded Files\n" + expanded + "\n"

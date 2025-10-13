@@ -16,7 +16,7 @@ from ..core import (
     update_hash,
 )
 from ..core.auto_architecture import generate_auto_architecture
-from ..core.utils import validate_path_in_project
+from ..core.utils import validate_path_in_project, redact_secrets
 
 
 @click.group()
@@ -77,13 +77,15 @@ def add(files):
 
         dest = config.baseline_dir / source.name
 
-        # Copy file to baseline
-        shutil.copy2(source, dest)
+        # Read, redact secrets, and write to baseline
+        content = source.read_text(encoding="utf-8")
+        redacted_content = redact_secrets(content)
+        dest.write_text(redacted_content, encoding="utf-8")
 
         # Update hash
         update_hash(dest, hashes)
 
-        success(f"Added {source.name} to baseline")
+        success(f"Added {source.name} to baseline (secrets redacted)")
 
     save_hashes(config.hashes_file, hashes)
     info(f"\nBaseline files saved to {config.baseline_dir}")

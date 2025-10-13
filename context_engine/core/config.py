@@ -24,7 +24,7 @@ class Config:
         "linked_repos": [],
         # Security-related defaults
         "allowed_extensions": [
-            ".md", ".json", ".yml", ".yaml", ".toml", ".ini", ".env",
+            ".md", ".json", ".yml", ".yaml", ".toml", ".ini",
             ".py", ".js", ".ts", ".java", ".c", ".cpp"
         ],
         "max_file_size_kb": 1024,

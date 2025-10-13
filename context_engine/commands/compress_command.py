@@ -6,7 +6,7 @@ import click
 from ..ui import success, info, warn, error
 from ..core import Config, count_tokens, redact_secrets, deduplicate_content
 from ..core.utils import compress_whitespace
-from ..compressors.longcodezip_wrapper import LongcodezipWrapper as LongCodeZipWrapper
+from ..compressors.longcodezip_wrapper import LongCodeZipWrapper
 
 
 @click.command()
