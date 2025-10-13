@@ -47,3 +47,6 @@ Thumbs.db
 htmlcov/
 .tox/
 .hypothesis/
+PROJECT_CODE_DOCUMENTATION.md.backup
+PROJECT_CODE_DOCUMENTATION.md
+PROJECT_DOCUMENTATION.txt

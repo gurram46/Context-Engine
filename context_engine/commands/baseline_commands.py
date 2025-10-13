@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 import click
+from builtins import list as builtin_list
 
 from ..ui import success, info, warn
 from ..core import (
@@ -14,6 +15,7 @@ from ..core import (
     check_staleness,
     update_hash,
 )
+from ..core.auto_architecture import generate_auto_architecture
 from ..core.utils import validate_path_in_project
 
 
@@ -22,6 +24,29 @@ def baseline():
     """Manage baseline files"""
     pass
 
+
+
+
+@baseline.command()
+def auto():
+    """Auto-generate architecture doc when none exists."""
+    config = Config()
+    config.baseline_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_docs = builtin_list(config.baseline_dir.glob('architecture*.md'))
+    if existing_docs:
+        info('Architecture document already present in baseline:')
+        for doc in existing_docs:
+            click.echo(f"  - {doc.name}")
+        return
+
+    generated_path = generate_auto_architecture(config.project_root)
+
+    hashes = load_hashes(config.hashes_file)
+    update_hash(generated_path, hashes)
+    save_hashes(config.hashes_file, hashes)
+
+    info('No architecture doc found - auto-generated architecture_auto.md.')
 
 @baseline.command()
 @click.argument("files", nargs=-1, required=True, type=click.Path(exists=True))
@@ -73,7 +98,7 @@ def list():  # noqa: A001 - Click command name
         warn("No baseline directory found. Run 'context init' first.")
         return
 
-    files = list(config.baseline_dir.glob("*"))
+    files = builtin_list(config.baseline_dir.glob("*"))
 
     if not files:
         warn("No baseline files found.")
@@ -95,7 +120,7 @@ def review():
         warn("No baseline directory found. Run 'context init' first.")
         return
 
-    files = list(config.baseline_dir.glob("*"))
+    files = builtin_list(config.baseline_dir.glob("*"))
     if not files:
         warn("No baseline files found.")
         return

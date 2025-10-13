@@ -1,6 +1,7 @@
 """Core utilities for Context Engine"""
 
 from .config import Config
+from .auto_architecture import generate_auto_architecture
 from .utils import (
     calculate_file_hash,
     load_hashes,
@@ -11,11 +12,12 @@ from .utils import (
     redact_secrets,
     strip_comments,
     summarize_config,
-    deduplicate_content
+    deduplicate_content,
 )
 
 __all__ = [
     'Config',
+    'generate_auto_architecture',
     'calculate_file_hash',
     'load_hashes',
     'save_hashes',
@@ -25,5 +27,5 @@ __all__ = [
     'redact_secrets',
     'strip_comments',
     'summarize_config',
-    'deduplicate_content'
+    'deduplicate_content',
 ]

@@ -4,6 +4,7 @@ import click
 
 from ..ui import info, success
 from ..core import Config
+from ..core.auto_architecture import generate_auto_architecture
 
 
 @click.command()
@@ -22,6 +23,13 @@ def init():
 
     # Save initial config
     config.save()
+
+    # Auto-generate baseline architecture summary
+    try:
+        arch_path = generate_auto_architecture(config.project_root)
+        info(f'Generated baseline architecture: {arch_path.relative_to(config.project_root)}')
+    except Exception as exc:  # pragma: no cover - best effort
+        info(f'Failed to auto-generate architecture summary: {exc}')
 
     # Create sample ADR
     sample_adr = config.adrs_dir / "001-context-engine.md"
