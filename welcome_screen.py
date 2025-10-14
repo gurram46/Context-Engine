@@ -28,22 +28,35 @@ def create_welcome_screen():
     # Get current working directory
     current_dir = Path.cwd()
 
-    # Create the C*NTXT ENGINE logo with Peace Sans style
+    # Create the C* NTXT ENGINE logo with maximum visual emphasis
     # Using a regular asterisk for better Windows compatibility
-    logo_text = Text("C*NTXT ENGINE", style=Style(color="#FF3B00", bold=True))
+    # We'll create a multi-line bold text to simulate the boldness of the reference logo
+    logo_content = "C✱ NTXT ENGINE"
+    
+    # Create a bold, impactful logo by repeating it on multiple lines
+    # This simulates the thickness and weight of the reference logo
+    logo_text = Text()
+    logo_text.append("\n", style=Style(color="#FF3B00"))
+    
+    # Create multiple lines to simulate font size 15 and boldness
+    for i in range(3):  # Repeat 3 times to create a bolder appearance
+        logo_text.append(logo_content + "\n", style=Style(color="#FF3B00", bold=True))
+    
+    # Add extra spacing
+    logo_text.append("\n", style=Style(color="#FF3B00"))
     
     # Left panel content (logo and project info)
     left_content_parts = []
     
     # Add spacing to match Claude's layout
-    left_content_parts.append("\n\n\n\n")
+    left_content_parts.append("\n\n")
     
-    # Add the logo
+    # Add the logo with even more emphasis
     left_content_parts.append(logo_text)
     
     # Add welcome message and project info
     welcome_text = Text.from_markup(
-        f"\n\n[bold white]Welcome back![/bold white]\n\n"
+        f"\n[bold white]Welcome back![/bold white]\n\n"
         f"[dim]Current Project:\n{current_dir}[/dim]"
     )
     left_content_parts.append(welcome_text)
@@ -86,7 +99,15 @@ def create_welcome_screen():
     # Clear screen and display
     os.system('cls' if os.name == 'nt' else 'clear')
     console.print("\n")
-    console.print(welcome_panel)
+    
+    # Try to print with UTF-8 encoding
+    try:
+        console.print(welcome_panel)
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        # Fallback: replace special characters and try again
+        panel_str = str(welcome_panel).replace("✱", "*")
+        console.print(panel_str)
+    
     console.print("\n")
     console.print(footer)
     console.print("\n")
