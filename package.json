@@ -1,40 +1,46 @@
 {
-  "name": "context-engine",
+  "name": "context-engine-hybrid",
   "version": "1.0.0",
-  "description": "A powerful context management tool for development workflows with automatic log capture and intelligent parsing",
-  "main": "bin/context-engine.js",
+  "description": "Context Engine Hybrid CLI - Node.js frontend with Python backend",
+  "main": "ui/index.js",
   "bin": {
-    "context-engine": "./bin/context-engine.js",
-    "ce": "./bin/context-engine.js"
+    "context-engine": "./ui/bin/context-engine.js",
+    "ce": "./ui/bin/ce.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "install-python-deps": "pip install -r requirements.txt",
-    "postinstall": "node scripts/postinstall.js"
+    "start": "node ui/index.js",
+    "dev": "nodemon ui/index.js",
+    "install:backend": "cd backend && python -m venv venv && pip install -r requirements.txt",
+    "build": "cd ui && npm run build",
+    "test": "cd ui && npm test",
+    "lint": "cd ui && npm run lint",
+    "postinstall": "cd ui && npm install"
   },
   "keywords": [
     "context",
-    "development",
-    "logs",
-    "parsing",
-    "session-management",
-    "auto-capture",
-    "cli"
+    "compression",
+    "cli",
+    "documentation",
+    "productivity",
+    "context-engine",
+    "hybrid",
+    "nodejs",
+    "python"
   ],
   "author": "Context Engine Team",
   "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0",
+    "python": ">=3.7"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-org/context-engine.git"
+    "url": "https://github.com/contextengine/cli.git"
   },
   "bugs": {
-    "url": "https://github.com/your-org/context-engine/issues"
+    "url": "https://github.com/contextengine/cli/issues"
   },
-  "homepage": "https://github.com/your-org/context-engine#readme",
-  "engines": {
-    "node": ">=14.0.0",
-    "python": ">=3.8"
-  },
+  "homepage": "https://contextengine.dev",
   "os": [
     "win32",
     "darwin",
@@ -42,10 +48,10 @@
   ],
   "preferGlobal": true,
   "files": [
-    "bin/",
-    "scripts/",
-    "context_engine/",
-    "requirements.txt",
+    "ui/bin/",
+    "ui/lib/",
+    "ui/scripts/",
+    "backend/",
     "README.md",
     "LICENSE"
   ]

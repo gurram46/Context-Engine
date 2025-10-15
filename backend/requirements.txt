@@ -1,0 +1,6 @@
+# Context Engine Backend Dependencies
+rich>=13.0.0
+chardet>=5.0.0
+python-dotenv>=1.0.0
+pathspec>=0.10.0
+click>=8.0.0
