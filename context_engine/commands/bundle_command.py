@@ -4,7 +4,7 @@ from pathlib import Path
 
 import click
 
-from ..ui import success, info, warn
+from ..ui import success, info, warn, error
 from ..core import (
     Config,
     count_tokens,
@@ -102,15 +102,22 @@ def bundle(use_ai):
             task=task_content or "None",
         )
 
-    config.context_file.write_text(content, encoding="utf-8")
-    tokens = count_tokens(content)
-    success(f"Generated context bundle: {config.context_file}")
-    info(f"Token count: {tokens:,}")
-    if tokens > config.get("max_tokens", 100000):
-        warn(
-            f"Token count exceeds limit ({config.get('max_tokens', 100000):,})"
-        )
-        info("Consider removing some baseline files or older session notes.")
+    try:
+        config.context_file.write_text(content, encoding="utf-8")
+        tokens = count_tokens(content)
+        success(f"Generated context bundle: {config.context_file}")
+        info(f"Token count: {tokens:,}")
+        if tokens > config.get("max_tokens", 100000):
+            warn(
+                f"Token count exceeds limit ({config.get('max_tokens', 100000):,})"
+            )
+            info("Consider removing some baseline files or older session notes.")
+    except IOError as e:
+        error(f"Failed to write context bundle: {e}")
+        raise click.ClickException(f"Could not write context file: {e}")
+    except Exception as e:
+        error(f"Unexpected error while generating bundle: {e}")
+        raise click.ClickException(f"Bundle generation failed: {e}")
 
 
 def _collect_structured_baseline(config: Config):
@@ -123,7 +130,14 @@ def _collect_structured_baseline(config: Config):
         for pattern in name_patterns:
             for file in config.baseline_dir.glob(pattern):
                 if file.is_file():
-                    return file.read_text(encoding="utf-8")
+                    try:
+                        return file.read_text(encoding="utf-8")
+                    except UnicodeDecodeError:
+                        warn(f"Could not read {file.name}: Invalid UTF-8 encoding")
+                        return f"# [Error: Could not read {file.name} - invalid encoding]\n"
+                    except IOError as e:
+                        warn(f"Could not read {file.name}: {e}")
+                        return f"# [Error: Could not read {file.name} - {e}]\n"
         return ""
 
     architecture = read_if_exists(["architecture.*", "arch.*", "system.*"])
@@ -140,7 +154,14 @@ def _collect_adrs(config: Config) -> str:
 
     contents = []
     for file in sorted(config.adrs_dir.glob("*.md")):
-        contents.append(file.read_text(encoding="utf-8"))
+        try:
+            contents.append(file.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            warn(f"Could not read {file.name}: Invalid UTF-8 encoding")
+            contents.append(f"# [Error: Could not read {file.name} - invalid encoding]\n")
+        except IOError as e:
+            warn(f"Could not read {file.name}: {e}")
+            contents.append(f"# [Error: Could not read {file.name} - {e}]\n")
 
     return "\n\n---\n\n".join(contents)
 
@@ -149,21 +170,43 @@ def _read_session(config: Config) -> str:
     """Read session notes"""
     if not config.session_file.exists():
         return ""
-    return config.session_file.read_text(encoding="utf-8")
+    try:
+        return config.session_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        warn(f"⚠️ Could not read session file: Invalid UTF-8 encoding")
+        return "# [Error: Could not read session file - invalid encoding]\n"
+    except IOError as e:
+        warn(f"⚠️ Could not read session file: {e}")
+        return f"# [Error: Could not read session file - {e}]\n"
 
 
 def _read_cross_repo(config: Config) -> str:
     """Read cross-repo notes"""
     if not config.cross_repo_file.exists():
         return ""
-    return config.cross_repo_file.read_text(encoding="utf-8")
+    try:
+        return config.cross_repo_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        warn(f"⚠️ Could not read cross-repo file: Invalid UTF-8 encoding")
+        return "# [Error: Could not read cross-repo file - invalid encoding]\n"
+    except IOError as e:
+        warn(f"⚠️ Could not read cross-repo file: {e}")
+        return f"# [Error: Could not read cross-repo file - {e}]\n"
 
 
 def _read_expanded_section(config: Config) -> str:
     """Read the Expanded Files section from existing context (if present)"""
     if not config.context_file.exists():
         return ""
-    content = config.context_file.read_text(encoding="utf-8")
+    try:
+        content = config.context_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        warn(f"⚠️ Could not read context file: Invalid UTF-8 encoding")
+        return "# [Error: Could not read expanded section - invalid encoding]\n"
+    except IOError as e:
+        warn(f"⚠️ Could not read context file: {e}")
+        return f"# [Error: Could not read expanded section - {e}]\n"
+
     # Extract section starting with ## Expanded Files
     parts = content.split("\n## Expanded Files\n", 1)
     if len(parts) == 2:
@@ -176,31 +219,29 @@ def _read_compressed_src_section(config: Config) -> str:
     compressed_src_dir = config.context_dir / "compressed_src"
     if not compressed_src_dir.exists():
         return ""
-    
-    # Look for markdown files (generated by LongCodeZip)
+
+    # Look for markdown files (generated by our compression)
     compressed_files = list(compressed_src_dir.glob("*.md"))
     if not compressed_files:
         return ""
-    
+
     content = "### Compressed Source Files\n\n"
     for file in sorted(compressed_files):
-        content += f"#### {file.stem}\n\n"
-        file_content = file.read_text(encoding="utf-8")
-        # Extract just the code part from the markdown
-        lines = file_content.split('\n')
-        in_code_block = False
-        code_lines = []
-        
-        for line in lines:
-            if line.startswith('```'):
-                in_code_block = not in_code_block
-                continue
-            if in_code_block:
-                code_lines.append(line)
-        
-        if code_lines:
-            content += "```\n" + "\n".join(code_lines) + "\n```\n\n"
-    
+        try:
+            file_content = file.read_text(encoding="utf-8")
+            # Validate that the content has at least one code block
+            if not file_content.strip() or "```" not in file_content:
+                warn(f"Compressed file {file.name} appears to be empty or malformed")
+                file_content = f"# [Warning: {file.name} appears to be empty or malformed]\n"
+            # Add the entire markdown content (it's already properly formatted)
+            content += file_content + "\n\n"
+        except UnicodeDecodeError:
+            warn(f"⚠️ Could not read compressed file {file.name}: Invalid UTF-8 encoding")
+            content += f"# [Error: Could not read {file.name} - invalid encoding]\n\n"
+        except IOError as e:
+            warn(f"⚠️ Could not read compressed file {file.name}: {e}")
+            content += f"# [Error: Could not read {file.name} - {e}]\n\n"
+
     return content
 
 

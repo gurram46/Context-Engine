@@ -21,6 +21,15 @@ class Config:
             "deduplicate": True,
             "remove_blank_lines": True
         },
+        "skip_patterns": [
+            r'\.pyc$', r'\.pyo$', r'\.class$', r'\.jar$', r'\.war$',
+            r'\.exe$', r'\.dll$', r'\.so$', r'\.dylib$',
+            r'\.png$', r'\.jpg$', r'\.jpeg$', r'\.gif$', r'\.bmp$', r'\.ico$',
+            r'\.pdf$', r'\.doc$', r'\.docx$', r'\.xls$', r'\.xlsx$',
+            r'\.zip$', r'\.tar$', r'\.gz$', r'\.7z$', r'\.rar$',
+            r'\.log$', r'\.tmp$', r'\.bak$', r'\.swp$',
+            r'^__pycache__/', r'^\.git/', r'^node_modules/', r'^\.vscode/', r'^\.idea/'
+        ],
         "linked_repos": [],
         # Security-related defaults
         "allowed_extensions": [

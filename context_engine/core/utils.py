@@ -76,34 +76,99 @@ def is_high_entropy_token(token: str) -> bool:
 
 def redact_secrets(text: str) -> str:
     """Redact potential secrets from text using regex and entropy detection"""
-    # First, handle specific known secret patterns (order matters!)
-    # Match sk- keys with or without quotes
-    text = re.sub(r'="(sk-[A-Za-z0-9\-_]{20,})"', r'="[REDACTED_KEY]"', text)
-    text = re.sub(r"='(sk-[A-Za-z0-9\-_]{20,})'", r"='[REDACTED_KEY]'", text)
-    text = re.sub(r'=(sk-[A-Za-z0-9\-_]{20,})(?=\s|$)', r'=[REDACTED_KEY]', text)
-    text = re.sub(r'"(sk-[A-Za-z0-9\-_]{20,})"', r'"[REDACTED_KEY]"', text)
-    
-    # AWS keys
-    text = re.sub(r'(["\']?)(AKIA[0-9A-Z]{16})(["\']?)', r'\1[REDACTED_AWS]\3', text)
-    
-    # Generic patterns for other secrets
-    text = re.sub(r'(password|passwd|pwd|pass)\s*[=:]\s*["\']?([^"\'\s]+)["\']?', r'\1=[REDACTED]', text, flags=re.IGNORECASE)
-    text = re.sub(r'(token|jwt|bearer)\s*[=:]\s*["\']?([^"\'\s]+)["\']?', r'\1=[REDACTED]', text, flags=re.IGNORECASE)
-    
-    # Environment variables - skip if already redacted
-    if '[REDACTED_KEY]' not in text:
-        text = re.sub(r'(API_KEY|SECRET|TOKEN|PASSWORD|PASSWD)\s*=\s*["\']?([^"\'\s]+)["\']?', r'\1=[REDACTED]', text)
+    # Store original text to avoid duplicate processing
+    original_text = text
 
-    # Entropy-based redaction only for standalone hex-like strings (not variable names)
+    # 1. Handle OpenAI API keys (sk- format) - most specific first
+    sk_patterns = [
+        (r'="(sk-[A-Za-z0-9\-_]{20,})"', r'="[REDACTED_KEY]"'),
+        (r"='(sk-[A-Za-z0-9\-_]{20,})'", r"'[REDACTED_KEY]'"),
+        (r'^\s*(sk-[A-Za-z0-9\-_]{20,})\s*$', r'[REDACTED_KEY]'),  # Standalone sk- keys
+        (r':\s*"(sk-[A-Za-z0-9\-_]{20,})"', r': "[REDACTED_KEY]"'),
+        (r":\s*'(sk-[A-Za-z0-9\-_]{20,})'", r": '[REDACTED_KEY]'"),
+        (r'=\s*(sk-[A-Za-z0-9\-_]{20,})(?=\s|$)', r'=[REDACTED_KEY]'),  # Assignment
+        (r'\b(sk-[A-Za-z0-9\-_]{20,})\b', r'[REDACTED_KEY]')  # In natural text
+    ]
+    for pattern, replacement in sk_patterns:
+        text = re.sub(pattern, replacement, text)
+    # Special handling for quoted sk- keys - remove quotes around the redacted value
+    text = re.sub(r'\b(API_KEY)\s*=\s*"\[REDACTED_KEY\]"', r'\1 = [REDACTED_KEY]', text)
+    text = re.sub(r'\b(API_KEY)\s*=\s*\'\[REDACTED_KEY\]\'', r'\1 = [REDACTED_KEY]', text)
+    text = re.sub(r'=\s*"?\[REDACTED_KEY\]"?\s*$', r' = [REDACTED_KEY]', text)
+    text = re.sub(r'=\s*\'?\[REDACTED_KEY\]\'?\s*$', r' = [REDACTED_KEY]', text)
+
+    # 2. Handle AWS keys
+    text = re.sub(r'(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY)\s*([=:])\s*["\']?(AKIA[0-9A-Z]{16}|[A-Za-z0-9+/]{40})["\']?',
+                  r'\1 \2 [REDACTED_AWS]', text, flags=re.IGNORECASE)
+    text = re.sub(r'(["\']?)(AKIA[0-9A-Z]{16})(["\']?)', r'\1[REDACTED_AWS]\3', text)
+
+    # 3. Handle Bearer tokens in various formats
+    bearer_patterns = [
+        r'Authorization:\s*Bearer\s+([A-Za-z0-9_\-\.]{20,})',
+        r'bearer:\s*["\']?([A-Za-z0-9_\-\.]{20,})["\']?',
+        r'Bearer\s+([A-Za-z0-9_\-\.]{20,})',
+        r'\bbearer[_\s-]*([A-Za-z0-9_\-\.]{20,})\b',
+        r'\b(bearer[a-z0-9_]{10,})\b',  # Handles cases like "bearer_token_1234567890"
+    ]
+    for pattern in bearer_patterns:
+        text = re.sub(pattern, 'Bearer [REDACTED]', text, flags=re.IGNORECASE)
+
+    # 4. Handle generic password patterns
+    text = re.sub(r'(password|passwd|pwd|pass|secret|private_key|privatekey)\s*([=:])\s*["\']?([^"\'\s]{6,})["\']?',
+                  r'\1 \2 [REDACTED]', text, flags=re.IGNORECASE)
+    text = re.sub(r'(DB_PASSWORD|DATABASE_PASSWORD|USER_PASSWORD|ADMIN_PASSWORD)\s*([=:])\s*["\']?([^"\'\s]{6,})["\']?',
+                  r'\1 \2 [REDACTED]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b\w*(?:password|passwd|pwd|pass|secret)\w*\s+[A-Za-z0-9_]{8,}\b',
+                  r'password = [REDACTED]', text, flags=re.IGNORECASE)
+
+    # 5. Handle JWT and API tokens
+    text = re.sub(r'(jwt|token|auth_token|access_token|refresh_token|session_token)\s*[=:]\s*["\']?([A-Za-z0-9_\-\.]{20,})["\']?',
+                  r'token=[REDACTED]', text, flags=re.IGNORECASE)
+    text = re.sub(r'["\']([a-zA-Z_]*token[a-zA-Z_]*|auth_token|access_token)["\']:\s*["\']([A-Za-z0-9_\-\.]{20,})["\']',
+                  r'"\1": "[REDACTED]"', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(?:jwt|token)[_\s-]*([A-Za-z0-9_\-\.]{20,})\b',
+                  r'token=[REDACTED]', text, flags=re.IGNORECASE)
+
+    # 6. Handle environment variable patterns in ${VAR} and $VAR format
+    env_var_patterns = [
+        (r'\$\{?([A-Z_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|KEY|WEBHOOK|DB|DATABASE)[A-Z_]*)\}?', '[REDACTED]'),
+    ]
+    for pattern, replacement in env_var_patterns:
+        text = re.sub(pattern, replacement, text)
+
+    # 7. Handle specific high-value patterns
+    text = re.sub(r'(JWT_SECRET|SECRET_KEY|API_SECRET|AUTH_SECRET)\s*([=:])\s*["\']?([^"\'\s]{10,})["\']?',
+                  r'\1 \2 [REDACTED]', text, flags=re.IGNORECASE)
+    # API_KEY handling - be careful not to override sk- keys
+    if '[REDACTED_KEY]' not in text:
+        text = re.sub(r'(API_KEY)\s*([=:])\s*["\']?([^"\'\s]{20,})["\']?',
+                      r'\1 \2 [REDACTED]', text, flags=re.IGNORECASE)
+    text = re.sub(r'(DATABASE_URL|MONGODB_URI|REDIS_URL)\s*([=:])\s*["\']?([^"\'\s]{10,})["\']?',
+                  r'\1 \2 [REDACTED]', text, flags=re.IGNORECASE)
+
+    # 8. Entropy-based redaction for hex-like strings (last resort)
     def _mask_high_entropy(match: re.Match) -> str:
         token = match.group(0)
-        # Skip if it looks like a variable name (contains underscores in middle)
+        # Skip common non-secret patterns
+        skip_patterns = [
+            r'^[a-fA-F0-9]{8}$',  # 8-char hex (likely hash or ID)
+            r'^[0-9a-fA-F]{32}$',  # 32-char hex (MD5 hash)
+            r'^[0-9a-fA-F]{40}$',  # 40-char hex (SHA1)
+            r'^[0-9a-fA-F]{64}$',  # 64-char hex (SHA256)
+        ]
+        for skip_pat in skip_patterns:
+            if re.match(skip_pat, token):
+                return token
+
+        # Skip if it looks like a variable name
         if '_' in token[1:-1] and not token.startswith('sk-'):
             return token
+
         return "[REDACTED]" if is_high_entropy_token(token) else token
 
-    # Only match hex-like strings, not typical variable names
-    text = re.sub(r'\b[a-fA-F0-9]{32,}\b', _mask_high_entropy, text)
+    # Only match hex-like strings that aren't obviously hashes
+    text = re.sub(r'\b[a-fA-F0-9]{40,}\b', _mask_high_entropy, text)
+
     return text
 
 def strip_comments(code: str, language: str = "python") -> str:
@@ -235,14 +300,126 @@ def sanitize_note_input(note: str, max_len: int = 2000) -> str:
 def extract_api_docstrings(code: str, language: str = "python") -> str:
     """Extract only API docstrings/comments and signatures, not raw code"""
     if language in ["python", "py"]:
-        # Keep only triple-quoted docstrings
-        blocks = re.findall(r'("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\')', code)
-        return "\n\n".join(b.strip() for b in blocks if b.strip()) or "(no docstrings)"
+        # Extract class and function definitions with their docstrings
+        lines = code.split('\n')
+        result = []
+        i = 0
+
+        # First, look for module-level docstring
+        module_docstring = _find_docstring(lines, 0)
+        if module_docstring:
+            result.append(module_docstring)
+            result.append("")
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # Look for class definitions
+            if line.startswith('class '):
+                class_match = re.match(r'class\s+(\w+)', line)
+                if class_match:
+                    class_name = class_match.group(1)
+                    result.append(f"class {class_name}:")
+                    # Look for docstring in next few lines
+                    docstring = _find_docstring(lines, i + 1)
+                    if docstring:
+                        result.append(docstring)
+                    result.append("")
+
+            # Look for function definitions
+            elif line.startswith('def '):
+                func_match = re.match(r'def\s+(\w+)\s*\(', line)
+                if func_match:
+                    func_name = func_match.group(1)
+                    # Get the full function signature
+                    func_line = line
+                    # Look for closing parenthesis
+                    j = i
+                    while j < len(lines) and '(' in func_line and ')' not in func_line:
+                        j += 1
+                        if j < len(lines):
+                            func_line += " " + lines[j].strip()
+
+                    result.append(f"def {func_name}(...):")
+                    # Look for docstring in next few lines
+                    docstring = _find_docstring(lines, j + 1)
+                    if docstring:
+                        result.append(docstring)
+                    result.append("")
+
+            i += 1
+
+        return "\n".join(result).strip() or "(no docstrings)"
+
     elif language in ["javascript", "js", "typescript", "ts"]:
-        blocks = re.findall(r'/\*\*[^*]*\*+(?:[^/*][^*]*\*+)*/', code, flags=re.DOTALL)
-        return "\n\n".join(b.strip() for b in blocks if b.strip()) or "(no API docs)"
+        # Extract function declarations and JSDoc comments
+        lines = code.split('\n')
+        result = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # Look for JSDoc comments
+            if line.startswith('/**'):
+                jsdoc_comment = line
+                j = i + 1
+                while j < len(lines) and not lines[j].strip().endswith('*/'):
+                    jsdoc_comment += "\n" + lines[j]
+                    j += 1
+                if j < len(lines):
+                    jsdoc_comment += "\n" + lines[j]
+                result.append(jsdoc_comment)
+
+                # Look for function declaration after JSDoc
+                k = j + 1
+                while k < len(lines) and not lines[k].strip():
+                    k += 1
+                if k < len(lines):
+                    func_line = lines[k].strip()
+                    if func_line.startswith('function ') or 'function ' in func_line:
+                        result.append(f"// {func_line}")
+
+                result.append("")
+
+            # Look for function declarations without JSDoc
+            elif line.startswith('function '):
+                func_match = re.match(r'function\s+(\w+)', line)
+                if func_match:
+                    func_name = func_match.group(1)
+                    result.append(f"function {func_name}(...) {{")
+                    result.append("")
+
+            i += 1
+
+        return "\n".join(result).strip() or "(no API docs)"
+
     else:
         return "(no API docs)"
+
+
+def _find_docstring(lines: list, start_idx: int) -> str:
+    """Find docstring starting from given line index"""
+    i = start_idx
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith('"""') or line.startswith("'''"):
+            # Found docstring
+            docstring = line
+            if not (line.endswith('"""') or line.endswith("'''")):
+                # Multi-line docstring
+                j = i + 1
+                while j < len(lines):
+                    docstring += "\n" + lines[j]
+                    if lines[j].strip().endswith('"""') or lines[j].strip().endswith("'''"):
+                        break
+                    j += 1
+            return docstring
+        elif line and not line.startswith('#') and line != '':
+            # Non-empty, non-comment line found - no docstring
+            break
+        i += 1
+    return None
 
 def compress_code(code: str, language: str = "python") -> str:
     """Strict compression: Keep docstrings only, remove comments/whitespace"""
