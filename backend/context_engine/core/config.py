@@ -106,3 +106,12 @@ class Config:
     def hashes_file(self) -> Path:
         """Get hashes.json file path"""
         return self.context_dir / "hashes.json"
+
+
+class ContextConfig(Config):
+    """Alias for Config class for backward compatibility"""
+
+    @classmethod
+    def load_or_create(cls, project_root: Optional[Path] = None) -> 'ContextConfig':
+        """Load or create a ContextConfig instance"""
+        return cls(project_root)

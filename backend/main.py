@@ -19,20 +19,20 @@ def main():
 
     # Map commands to existing Context Engine functionality
     if command == "init":
-        from context_engine.commands.init_command import main as init_main
-        init_main()
+        from context_engine.commands.init_command import init
+        init()
     elif command == "baseline":
-        from context_engine.commands.baseline_command import main as baseline_main
-        baseline_main()
+        from context_engine.commands.baseline_command import baseline
+        baseline()
     elif command == "bundle":
-        from context_engine.commands.bundle_command import main as bundle_main
-        bundle_main()
+        from context_engine.commands.bundle_command import bundle
+        bundle()
     elif command == "compress":
-        from context_engine.compressors.compress_src import main as compress_main
-        compress_main()
+        from context_engine.compressors.compress_src import compress
+        compress()
     elif command == "welcome":
-        from welcome_screen import main as welcome_main
-        welcome_main()
+        from welcome_screen import welcome
+        welcome()
     else:
         print(json.dumps({"error": f"Unknown command: {command}"}))
         sys.exit(1)
