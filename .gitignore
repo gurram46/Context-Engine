@@ -74,3 +74,4 @@ bin/
 backend/setup.py
 backend/test_cli.py
 backend/tmp_*.py
+ui/backend/

@@ -20,7 +20,8 @@
     "prepack": "npm run build",
     "postinstall": "node scripts/postinstall.js",
     "clean": "rm -rf dist/ node_modules/.cache/",
-    "prepublishOnly": "npm run test && npm run lint",
+    "prepublishOnly": "npm run test && npm run lint && node scripts/stage-backend.js",
+    "postpublish": "node scripts/cleanup-backend.js",
     "version": "python ../scripts/sync_versions.py $npm_package_version"
   },
   "keywords": [
@@ -65,7 +66,8 @@
     "lib/",
     "scripts/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "backend/"
   ],
   "repository": {
     "type": "git",
