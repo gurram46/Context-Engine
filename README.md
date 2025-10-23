@@ -1,126 +1,107 @@
-# Context Engine
+﻿# Context Engine
 
-Context Engine is a hybrid Python/Node.js toolkit that records local development activity, generates AI-ready summaries, and packages project context for handoffs.
+Context Engine is a hybrid CLI that tracks local development sessions, generates summaries, and bundles context for AI handoffs. The CLI is split into a Python backend (Click + watchdog tracker) and a Node/Ink frontend (interactive chat + command palette).
 
-## Highlights
+## Key Features
 
-- **Automatic session tracking** using a background watchdog process that logs file edits and CLI commands.
-- **Session management commands** (`start-session`, `stop-session`, `session save`, `session status`) exposed through a single Click CLI entry point.
-- **AI-assisted summaries** with OpenRouter support and a deterministic fallback when no API key is provided.
-- **Interactive chat palette** (Ink + React) that mirrors CLI commands and displays responses inline.
-- **Cross-platform pipeline** validated on Ubuntu and Windows runners via GitHub Actions.
-
-## Installation
-
-```bash
-# Install the Node.js CLI globally
-npm install -g context-engine
-
-# (Optional) install Python dependencies for local development
-python -m pip install -r backend/requirements.txt
-```
+- Background session tracker that logs filesystem events and CLI commands to .context/session.md.
+- context session save generates Markdown summaries (AI-assisted when an OpenRouter key is available, static otherwise).
+- Ink chat interface mirrors all CLI commands (/start-session, /session status, /bundle, etc.).
+- Ready-to-publish npm package (context-engine-dev) and Python package (context-engine).
 
 ## Quick Start
 
-```bash
-# 1. Initialise project scaffolding (.context directory and session log)
+`ash
+# Initialise scaffolding
 context-engine init
 
-# 2. Launch the tracker in the background
+# Start tracker in background
 context-engine start-session --auto
 
-# 3. Check tracker health
+# Inspect tracker status
 context-engine session status
 
-# 4. Save a snapshot summary (static or AI-powered depending on configuration)
-context-engine session save
+# Capture a summary snapshot
+context-engine session save "Wrapped up dashboard wiring"
 
-# 5. Stop tracking once finished
+# Stop tracking
 context-engine stop-session
 
-# 6. Generate a quick session recap for the terminal
-context-engine summary -m ai
-
-# 7. Create compressed/bundled context when handing off to another AI agent
-context-engine compress
-context-engine bundle
-
-# 8. Launch the chat-enabled palette (optional)
+# Launch chat palette
 context-engine chat
-```
+`
 
-The Ink chat interface mirrors the palette, lets you run commands by typing `/command`, and streams responses from the backend.
+Files created in .context/:
 
-## CLI Commands
+| File | Purpose |
+|------|---------|
+| session.md | Log of file events and CLI commands. |
+| session_summary.md | AI/static summary written by session save. |
+| session.pid | PID of watchdog process. |
+| session_state.json | Cache used by context session status. |
 
-| Command | Description |
-|---------|-------------|
-| `init` | Create `.context/` scaffolding and default configuration. |
-| `start-session --auto` | Start the watchdog tracker in a background process. |
-| `stop-session` | Terminate the tracker and write a stop marker to the log. |
-| `session save` | Generate a markdown summary of `.context/session.md`. |
-| `session status` | Report tracker PID, watched directories, and last events. |
-| `summary -m ai` | Print a brief session recap (AI if available, static otherwise). |
-| `compress` | Run LongCodeZip compression (optional workflow). |
-| `bundle` | Produce a context bundle for downstream tooling. |
-| `config show` | Display `.context/config.json` values. |
+## Project Structure
 
-## Architecture Overview
-
-```
+`
 Context-Engine/
-+-- ui/               # Node + Ink frontend
-�   +-- index.js      # CLI entry and chat bootstrapper
-�   +-- components/   # Ink chat + palette components
-�   +-- lib/          # Backend bridge
-+-- backend/          # Python backend
-�   +-- main.py       # CLI bridge entry
-�   +-- context_engine/
-�       +-- cli.py               # Click command surface
-�       +-- core/session_tracker.py  # Watchdog process manager
-�       +-- core/ai_summary.py       # AI/static summary helpers
-+-- tests/            # Pytest-based smoke tests
-```
+├── backend/                # Python package
+│   ├── main.py             # CLI bridge invoked by Node
+│   └── context_engine/
+│       ├── cli.py          # Click command definitions
+│       ├── core/session_tracker.py
+│       ├── core/ai_summary.py
+│       └── commands/       # Command modules (baseline, bundle, session, etc.)
+├── ui/                     # Node + Ink frontend
+│   ├── index.js            # CLI entry and palette bootstrapper
+│   ├── components/ChatApp.tsx
+│   └── lib/backend-bridge.js
+└── docs/                   # Authoring guides for contributors
+`
 
-Node commands spawn `backend/main.py`, which forwards invocations to `context_engine.cli`. Background tracking runs in a separate process whose PID is stored in `.context/session.pid`.
+## Development Workflow
 
-## Configuration
-
-A minimal configuration is created automatically:
-
-```json
-{
-  "model": "qwen-1.5-mini",
-  "api_key": null
-}
-```
-
-Set `OPENROUTER_API_KEY` or update `.context/config.json` to enable AI summaries. Without an API key the summariser falls back to a deterministic markdown summary.
-
-## Testing
-
-```
-# Node unit tests
+`ash
+# Install deps and run lint/tests (Node)
 cd ui
+npm install
 npm test
+npm run lint
 
-# Python smoke tests
+# Run Python tests
 cd ..
 python -m pytest -q
-```
+`
 
-## Contributing
+## Publishing
 
-1. Fork the repository and create a feature branch.
-2. Make your changes (ensure sessions remain cross-platform and ASCII-clean).
-3. Add or update tests (`npm test`, `pytest -q`).
-4. Submit a pull request.
-
-## License
-
-MIT. See `LICENSE` for details.
+1. Bump versions:
+   `ash
+   cd ui
+   npm version <new-version> --no-git-tag-version
+   cd ..
+   python scripts/sync_versions.py <new-version>
+   `
+2. Commit, tag, and push:
+   `ash
+   git add .
+   git commit -m "chore: release <new-version>"
+   git tag v<new-version>
+   git push origin main
+   git push origin v<new-version>
+   `
+3. Publish packages:
+   `ash
+   cd ui
+   npm publish --access public
+   cd ..
+   python -m build
+   twine upload dist/*
+   `
 
 ## Documentation
 
-See docs/README.md for guide principles and per-topic documentation files.
+See docs/README.md for writing principles and deep-dive guides.
 
+## License
+
+MIT
