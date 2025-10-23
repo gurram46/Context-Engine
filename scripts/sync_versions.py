@@ -9,6 +9,8 @@ import sys
 import re
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+
 def sync_versions(new_version):
     """Sync versions across setup.py and package.json"""
     new_version = new_version.strip().lstrip('v')
@@ -16,7 +18,8 @@ def sync_versions(new_version):
     print(f"Syncing versions to {new_version}")
 
     # --- Sync setup.py ---
-    with open("setup.py", "r", encoding="utf-8") as f:
+    setup_path = ROOT / "setup.py"
+    with setup_path.open("r", encoding="utf-8") as f:
         content = f.read()
 
     # Use regex to find and replace version line
@@ -24,7 +27,7 @@ def sync_versions(new_version):
     new_content = re.sub(pattern, f'version="{new_version}"', content)
 
     if new_content != content:
-        with open("setup.py", "w", encoding="utf-8") as f:
+        with setup_path.open("w", encoding="utf-8") as f:
             f.write(new_content)
         print(f"  Updated setup.py version to {new_version}")
     else:
@@ -32,7 +35,8 @@ def sync_versions(new_version):
 
     # --- Sync workspace package.json ---
     try:
-        with open("package.json", "r+", encoding="utf-8") as f:
+        workspace_pkg_path = ROOT / "package.json"
+        with workspace_pkg_path.open("r+", encoding="utf-8") as f:
             workspace_pkg = json.load(f)
             workspace_old = workspace_pkg.get("version", "")
             workspace_pkg["version"] = new_version
@@ -50,7 +54,8 @@ def sync_versions(new_version):
 
     # --- Sync ui/package.json ---
     try:
-        with open("ui/package.json", "r+", encoding="utf-8") as f:
+        ui_pkg_path = ROOT / "ui" / "package.json"
+        with ui_pkg_path.open("r+", encoding="utf-8") as f:
             pkg = json.load(f)
             old_version = pkg.get("version", "")
             pkg["version"] = new_version
@@ -72,14 +77,14 @@ def sync_versions(new_version):
         sys.exit(1)
 
     # --- Sync package-lock files if present ---
-    for lock_path in ["package-lock.json", "ui/package-lock.json"]:
-        lock_file = Path(lock_path)
+    for lock_rel_path in ["package-lock.json", "ui/package-lock.json"]:
+        lock_file = ROOT / lock_rel_path
         if not lock_file.exists():
             continue
         try:
             data = json.loads(lock_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            print(f"  Skipping {lock_path} due to invalid JSON: {exc}")
+            print(f"  Skipping {lock_rel_path} due to invalid JSON: {exc}")
             continue
 
         original_version = data.get("version")
@@ -90,7 +95,7 @@ def sync_versions(new_version):
             packages[""]["version"] = new_version
 
         lock_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        print(f"  Updated {lock_path} version to {new_version} (was {original_version})")
+        print(f"  Updated {lock_rel_path} version to {new_version} (was {original_version})")
 
     print(f"Version synchronization completed!")
 
