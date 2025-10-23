@@ -2,9 +2,13 @@
 
 const { Command } = require('commander');
 const chalk = require('chalk');
-const inquirer = require('inquirer');
+const ora = require('ora');
+const fs = require('fs');
+const path = require('path');
+const { pathToFileURL } = require('url');
 const WelcomeScreen = require('./lib/welcome');
 const BackendBridge = require('./lib/backend-bridge');
+const BULLET = '-';
 
 class ContextEngineCLI {
   constructor() {
@@ -17,10 +21,9 @@ class ContextEngineCLI {
   setupCommands() {
     this.program
       .name('context-engine')
-      .description('Context Engine CLI - Compress the Chaos')
-      .version('1.0.0');
+      .description('Context Engine v1.2 - AI-powered session intelligence for coding projects')
+      .version('1.2.0');
 
-    // Interactive mode (default)
     this.program
       .command('welcome', { isDefault: true })
       .description('Show welcome screen and interactive command palette')
@@ -28,32 +31,33 @@ class ContextEngineCLI {
         await this.showWelcomeAndCommandPalette();
       });
 
-    // Direct commands
     this.program
       .command('init')
       .description('Initialize Context Engine in current directory')
-      .action(async () => {
-        try {
-          await this.backendBridge.init();
-          console.log(chalk.green('✓ Project initialized successfully'));
-        } catch (error) {
-          console.error(chalk.red('✗ Initialization failed:'), error.message);
-          process.exit(1);
-        }
+      .action(() => this.runSimpleCommand('init', 'Project initialized successfully'));
+
+    this.program
+      .command('start-session')
+      .description('Start background logging of CLI and file activity')
+      .option('--auto', 'Enable automatic logging of file and CLI actions')
+      .action((options) => {
+        const args = [];
+        if (options.auto) args.push('--auto');
+        return this.runSimpleCommand('start-session', 'Session tracking started', args);
       });
 
     this.program
-      .command('baseline')
-      .description('Generate project baseline')
-      .option('-o, --output <file>', 'Output file', 'BASELINE.md')
-      .action(async (options) => {
-        try {
-          await this.backendBridge.baseline(['--output', options.output]);
-          console.log(chalk.green(`✓ Baseline generated: ${options.output}`));
-        } catch (error) {
-          console.error(chalk.red('✗ Baseline generation failed:'), error.message);
-          process.exit(1);
-        }
+      .command('stop-session')
+      .description('Stop current session gracefully')
+      .action(() => this.runSimpleCommand('stop-session', 'Session stopped'));
+
+    this.program
+      .command('session')
+      .description('Session management commands')
+      .argument('[action]', 'Session action (save)')
+      .action((action) => {
+        const args = [action || 'save'];
+        return this.runSimpleCommand('session', 'Session command executed', args);
       });
 
     this.program
@@ -61,180 +65,179 @@ class ContextEngineCLI {
       .description('Create context bundle')
       .option('-o, --output <file>', 'Output file', 'bundle.md')
       .option('-f, --format <format>', 'Output format', 'markdown')
-      .action(async (options) => {
-        try {
-          await this.backendBridge.bundle(['--output', options.output, '--format', options.format]);
-          console.log(chalk.green(`✓ Bundle created: ${options.output}`));
-        } catch (error) {
-          console.error(chalk.red('✗ Bundle creation failed:'), error.message);
-          process.exit(1);
-        }
-      });
+      .action(({ output, format }) => this.runSimpleCommand('bundle', `Bundle created: ${output}`, ['--output', output, '--format', format]));
 
     this.program
       .command('compress')
-      .description('Compress source files')
-      .option('-o, --output <file>', 'Output file', 'compressed.md')
-      .option('-r, --recursive', 'Recursive compression')
-      .action(async (options) => {
-        try {
-          const args = ['--output', options.output];
-          if (options.recursive) args.push('--recursive');
-          await this.backendBridge.compress(args);
-          console.log(chalk.green(`✓ Compression complete: ${options.output}`));
-        } catch (error) {
-          console.error(chalk.red('✗ Compression failed:'), error.message);
-          process.exit(1);
-        }
+      .description('Compress baseline files for AI context')
+      .option('--rate <rate>', 'Compression rate (0.0 - 1.0)')
+      .option('--query <query>', 'Compression guidance query')
+      .option('--instruction <instruction>', 'Compression instruction prompt')
+      .action((options) => {
+        const args = [];
+        if (options.rate) args.push('--rate', options.rate);
+        if (options.query) args.push('--query', options.query);
+        if (options.instruction) args.push('--instruction', options.instruction);
+        return this.runSimpleCommand('compress', 'Compression completed', args);
       });
 
-    // Interactive command palette
+    this.program
+      .command('summary')
+      .description('Generate AI-powered project summary or display latest summary')
+      .option('--project-root <path>', 'Project root directory')
+      .action(({ projectRoot }) =>
+        this.runCommandWithSpinner('summary', () => this.generateSummary(projectRoot))
+      );
+
+    this.program
+      .command('config-show')
+      .description('Display current configuration values')
+      .action(() => this.runSimpleCommand('config show', 'Configuration displayed'));
+
+    this.program
+      .command('config-set <key> <value>')
+      .description('Set configuration value (model, api_key)')
+      .action((key, value) => this.runSimpleCommand('config set ' + [key, value].join(' '), 'Configuration updated'));
+
     this.program
       .command('palette')
-      .alias('p')
-      .description('Show interactive command palette')
-      .action(async () => {
-        await this.showCommandPalette();
-      });
+      .description('Open the interactive command palette')
+      .action(() => this.showCommandPalette());
 
-    // Help command
+    this.program
+      .command('chat')
+      .description('Launch the combined palette + chat interface')
+      .action(() => this.launchInteractiveUI());
+
     this.program
       .command('help')
       .description('Show help information')
-      .action(() => {
-        this.showHelp();
-      });
+      .action(() => this.showHelp());
   }
 
   async showWelcomeAndCommandPalette() {
     await this.welcomeScreen.showWelcomeScreen();
-
-    // Show command palette after welcome screen
-    console.log(chalk.cyan('\nPress Enter to open command palette or Ctrl+C to exit...'));
-
-    // Wait for user input
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.setEncoding('utf8');
-
-    await new Promise((resolve) => {
-      process.stdin.on('data', async (key) => {
-        if (key === '\r' || key === '\n') {
-          process.stdin.setRawMode(false);
-          process.stdin.pause();
-          await this.showCommandPalette();
-          resolve();
-        } else if (key === '\u0003') { // Ctrl+C
-          console.log(chalk.yellow('\nGoodbye!'));
-          process.exit(0);
-        }
-      });
-    });
+    await this.launchInteractiveUI();
   }
 
   async showCommandPalette() {
-    try {
-      const command = await this.welcomeScreen.showCommandPalette();
+    await this.launchInteractiveUI();
+  }
 
-      if (command === 'exit') {
-        console.log(chalk.yellow('Goodbye!'));
-        process.exit(0);
-      } else if (command === 'help') {
-        this.showHelp();
-        await this.showCommandPalette(); // Show palette again after help
-      } else {
-        // Execute the selected command
-        await this.executeCommand(command);
+  async launchInteractiveUI() {
+    try {
+      const React = require('react');
+      const { render } = await import('ink');
+      const compiledPath = path.join(__dirname, 'dist', 'components', 'chat-app.mjs');
+
+      if (!fs.existsSync(compiledPath)) {
+        console.error(chalk.red('Chat UI bundle missing. Run "npm run build" inside ui/ first.'));
+        return;
       }
+
+      const { default: ChatApp } = await import(pathToFileURL(compiledPath).href);
+      const { waitUntilExit } = render(React.createElement(ChatApp));
+      await waitUntilExit();
     } catch (error) {
-      console.error(chalk.red('Error executing command:'), error.message);
-      process.exit(1);
+      console.error(chalk.red('Interactive UI failed:'), error.message);
     }
   }
 
-  async executeCommand(command) {
-    const chalk = require('chalk');
-    const ora = require('ora');
-
-    const spinner = ora(`Executing ${command}...`).start();
-
-    try {
-      switch (command) {
-        case 'init':
-          await this.backendBridge.init();
-          spinner.succeed(chalk.green('Project initialized successfully'));
-          break;
-        case 'baseline':
-          await this.backendBridge.baseline();
-          spinner.succeed(chalk.green('Baseline generated successfully'));
-          break;
-        case 'bundle':
-          await this.backendBridge.bundle();
-          spinner.succeed(chalk.green('Bundle created successfully'));
-          break;
-        case 'compress':
-          await this.backendBridge.compress();
-          spinner.succeed(chalk.green('Compression completed successfully'));
-          break;
-        default:
-          spinner.fail(chalk.red(`Unknown command: ${command}`));
-          return;
-      }
-
-      // Show command palette again after successful execution
-      console.log(chalk.cyan('\nPress Enter to continue or Ctrl+C to exit...'));
-      await this.waitForUserInput();
-      await this.showCommandPalette();
-
-    } catch (error) {
-      spinner.fail(chalk.red(`Command failed: ${error.message}`));
-      process.exit(1);
-    }
-  }
-
-  async waitForUserInput() {
-    return new Promise((resolve) => {
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdin.setEncoding('utf8');
-
-      process.stdin.on('data', (key) => {
-        if (key === '\r' || key === '\n') {
-          process.stdin.setRawMode(false);
-          process.stdin.pause();
-          resolve();
-        } else if (key === '\u0003') { // Ctrl+C
-          console.log(chalk.yellow('\nGoodbye!'));
-          process.exit(0);
-        }
-      });
+  async runSimpleCommand(command, successMessage, args = []) {
+    return this.runCommandWithSpinner(command, async () => {
+      await this.backendBridge.executeCommand(command, args);
+      console.log(chalk.green(successMessage));
     });
   }
 
+  async runCommandWithSpinner(label, executor) {
+    const spinner = ora(`Executing ${label}...`).start();
+    try {
+      const result = await executor();
+      spinner.succeed(chalk.hex('#ff3131')(`${label} completed`));
+      return result;
+    } catch (error) {
+      spinner.fail(chalk.red(`Command failed: ${error.message}`));
+      throw error;
+    }
+  }
+
+  async generateSummary() {
+    const result = await this.backendBridge.executeCommand('summary', []);
+    const lines = result.stdout.split('\n');
+    const payload = lines.find((line) => line.trim().startsWith('{'));
+    if (!payload) {
+      console.log(chalk.red('Summary command did not return JSON output.'));
+      return null;
+    }
+
+    const parsed = JSON.parse(payload);
+    if (!parsed.success) {
+      throw new Error(parsed.error || 'Summary generation failed');
+    }
+
+    const red = chalk.hex('#ff3131');
+    const orange = chalk.hex('#ff6b35');
+    const green = chalk.hex('#4ade80');
+    const rule = '-'.repeat(60);
+
+    console.log(red.bold('\n*** PROJECT SUMMARY GENERATED\n'));
+    console.log(chalk.gray(rule));
+
+    const summaryLines = parsed.summary.split('\n');
+    let displayed = 0;
+    for (const line of summaryLines) {
+      if (displayed >= 30) {
+        console.log(chalk.gray('...'));
+        break;
+      }
+
+      const trimmed = line.trimStart();
+      if (line.startsWith('# ')) {
+        console.log(red.bold(line));
+      } else if (line.startsWith('## ')) {
+        console.log(orange.bold(line));
+      } else if (line.startsWith('- ') || trimmed.startsWith(BULLET) || trimmed.startsWith('-')) {
+        console.log(green(line));
+      } else {
+        console.log(line);
+      }
+
+      displayed += 1;
+    }
+
+    console.log(chalk.gray(rule));
+    console.log(red(`Summary saved to: ${parsed.summary_path}`));
+    console.log(red(`Model used: ${parsed.model_used}`));
+    return parsed;
+  }
+
   showHelp() {
-    console.log(chalk.bold.cyan('\nContext Engine CLI Help\n'));
-    console.log(chalk.bold('Commands:'));
-    console.log(chalk.cyan('  init') + '       Initialize Context Engine in current directory');
-    console.log(chalk.cyan('  baseline') + '  Generate project baseline');
-    console.log(chalk.cyan('  bundle') + '    Create context bundle');
-    console.log(chalk.cyan('  compress') + '  Compress source files');
-    console.log(chalk.cyan('  palette') + '    Show interactive command palette');
-    console.log(chalk.cyan('  help') + '       Show this help message');
-    console.log(chalk.cyan('  welcome') + '   Show welcome screen and command palette');
+    console.log(chalk.bold.cyan('\nContext Engine v1.2 CLI Help - Session Intelligence Model\n'));
+    console.log(chalk.bold('Core Commands (8 total):'));
+    console.log(`${chalk.cyan('init')}              Initialize Context Engine in current directory`);
+    console.log(`${chalk.cyan('start-session')}     Start background logging of CLI and file activity`);
+    console.log(`${chalk.cyan('stop-session')}      Stop current session gracefully`);
+    console.log(`${chalk.cyan('session save')}      Save session note and generate AI-powered summary`);
+    console.log(`${chalk.cyan('summary')}           Generate AI-powered project summary or display latest`);
+    console.log(`${chalk.cyan('compress')}          Compress project context using LongCodeZip`);
+    console.log(`${chalk.cyan('bundle')}            Create context bundle for AI handoff`);
+    console.log(`${chalk.cyan('config show')}       Display current configuration values`);
+    console.log(`${chalk.cyan('chat')}              Launch palette + chat interface`);
+    console.log(`${chalk.cyan('palette')}           Interactive command palette`);
+    console.log(`${chalk.cyan('help')}              Show this help message`);
 
-    console.log(chalk.bold('\nInteractive Mode:'));
-    console.log('Run ' + chalk.cyan('context-engine') + ' without arguments to start interactive mode');
+    console.log(chalk.bold('\nSession Intelligence Flow:'));
+    console.log(`1. ${chalk.cyan('init')} -> Initialize project`);
+    console.log(`2. ${chalk.cyan('start-session')} -> Begin logging activity`);
+    console.log(`3. ${chalk.cyan('session save')} -> Generate AI summary`);
+    console.log(`4. ${chalk.cyan('compress')} + ${chalk.cyan('bundle')} -> Package for AI`);
 
-    console.log(chalk.bold('\nExamples:'));
-    console.log('  ' + chalk.cyan('context-engine init') + '                    # Initialize project');
-    console.log('  ' + chalk.cyan('context-engine bundle -o docs.md') + '       # Create bundle with custom output');
-    console.log('  ' + chalk.cyan('context-engine compress --recursive') + '    # Compress recursively');
-
-    console.log(chalk.bold('\nQuick Tips:'));
-    console.log('• Use ' + chalk.cyan('/init') + ', ' + chalk.cyan('/bundle') + ', ' + chalk.cyan('/compress') + ' shortcuts in interactive mode');
-    console.log('• Press Ctrl+C anytime to exit');
-    console.log('• Check generated files in your project directory');
-    console.log(chalk.gray('\nContext Engine — Compress the Chaos.'));
+    console.log(chalk.bold('\nInteractive Tips:'));
+    console.log(`- Use ${chalk.cyan('/init')}, ${chalk.cyan('/start-session')}, ${chalk.cyan('/summary')} shortcuts`);
+    console.log('- Press Enter for the palette, /exit to quit');
+    console.log('- Session notes: /session save "Fixed authentication bug in API"');
+    console.log(`- Run ${chalk.cyan('context-engine chat')} for the chat-enabled palette`);
   }
 
   async run() {
@@ -247,10 +250,9 @@ class ContextEngineCLI {
   }
 }
 
-// Run the CLI
 if (require.main === module) {
   const cli = new ContextEngineCLI();
-  cli.run().catch(error => {
+  cli.run().catch((error) => {
     console.error(chalk.red('Fatal error:'), error);
     process.exit(1);
   });

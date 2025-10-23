@@ -4,39 +4,43 @@ from pathlib import Path
 import click
 
 from ..ui import success, info, warn, error
-from ..core import Config, count_tokens, redact_secrets, deduplicate_content
+from ..core import count_tokens, redact_secrets, deduplicate_content
+from ..core.config import get_model, set_model, get_api_key
 from ..core.utils import compress_whitespace
 from ..compressors.longcodezip_wrapper import LongCodeZipWrapper
 
 
 @click.command()
 @click.option("--rate", default=0.5, type=float, help="Compression rate (0.0 to 1.0)")
-@click.option("--model-name", default="Qwen/Qwen2.5-Coder-0.5B-Instruct", help="Model name for compression")
 @click.option("--query", default="Summarize for AI context", help="Query to guide compression")
 @click.option("--instruction", default="Focus on essential information for AI understanding.", help="Instruction for compression model")
-def compress_cmd(rate, model_name, query, instruction):
+def compress_cmd(rate, query, instruction):
     """Compress project context using LongCodeZip."""
     if not 0.0 <= rate <= 1.0:
         error("Compression rate must be between 0.0 and 1.0")
         return
-        
-    config = Config()
-    
+
+    # Get AI model from config.json
+    ai_model = get_model()
+    info(f"🧠 Using model: {ai_model}")
+
     # Check if baseline files exist
-    if not config.baseline_dir.exists():
-        warn("No baseline directory found. Run 'context init' and 'context baseline add <files>' first.")
+    context_dir = Path.cwd() / ".context" / "baseline"
+    if not context_dir.exists():
+        warn("No baseline directory found. Run 'context init' first.")
         return
-    
-    baseline_files = list(config.baseline_dir.glob("*"))
+
+    baseline_files = list(context_dir.glob("*"))
     if not baseline_files:
         warn("No baseline files found. Add files with: context baseline add <files>")
         return
-    
-    info(f"Using LongCodeZip compression with model: {model_name}")
-    info(f"Compression rate: {rate}")
-    
+
+    info(f"📦 Files scanned: {len([f for f in baseline_files if f.is_file()])}")
+
     try:
-        compressor = LongCodeZipWrapper(model_name=model_name, rate=rate)
+        # Use user's configured model for compression
+        # Falls back to default model if not specified
+        compressor = LongCodeZipWrapper(model_name=ai_model, rate=rate)
     except ImportError as e:
         error(f"Failed to initialize compressor: {e}")
         return
@@ -46,6 +50,9 @@ def compress_cmd(rate, model_name, query, instruction):
     results = []
     
     for file_path in baseline_files:
+        if file_path.name.startswith('compressed_'):
+            info(f"Skipping already compressed file {file_path.name}")
+            continue
         if file_path.is_file():
             try:
                 # Read file content
@@ -81,14 +88,13 @@ def compress_cmd(rate, model_name, query, instruction):
                 error(f"Error processing {file_path.name}: {e}")
     
     if results:
-        # Print summary
+        # Print summary with compression percentage
         overall_compression = total_compressed_tokens / total_original_tokens if total_original_tokens > 0 else 0
-        info(f"Compression Summary:")
-        info(f"- Files processed: {len(results)}")
-        info(f"- Original tokens: {total_original_tokens:,}")
-        info(f"- Compressed tokens: {total_compressed_tokens:,}")
-        info(f"- Overall compression: {overall_compression:.2%}")
-        
+        size_reduction = (1 - overall_compression) * 100
+
+        info(f"📦 Files processed: {len(results)}")
+        info(f"🪶 Compression complete: {size_reduction:.0f}% size reduction")
+
         success("Compression completed. Compressed files saved with 'compressed_' prefix.")
     else:
         error("No files were successfully compressed.")

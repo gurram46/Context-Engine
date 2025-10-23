@@ -1,64 +1,52 @@
-"""Initialize Context Engine in a project"""
+"""Initialize Context Engine in a project."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
 
 import click
 
 from ..ui import info, success
-from ..core import Config
-from ..core.auto_architecture import generate_auto_architecture
+from ..core.config import load_config, get_config_file
 
 
 @click.command()
 def init():
-    """Initialize Context Engine in current project"""
-    config = Config()
+    """Initialize Context Engine assets in the current project."""
+    project_root = Path.cwd()
+    context_dir = project_root / ".context"
+    baseline_dir = context_dir / "baseline"
+    notes_dir = context_dir / "notes"
 
-    # Create directory structure
-    config.context_dir.mkdir(exist_ok=True)
-    config.baseline_dir.mkdir(exist_ok=True)
-    config.adrs_dir.mkdir(exist_ok=True)
+    context_dir.mkdir(exist_ok=True)
+    baseline_dir.mkdir(exist_ok=True)
+    notes_dir.mkdir(exist_ok=True)
 
-    # Create empty files
-    config.session_file.touch()
-    config.cross_repo_file.touch()
-
-    # Save initial config
-    config.save()
-
-    # Auto-generate baseline architecture summary
-    try:
-        arch_path = generate_auto_architecture(config.project_root)
-        info(f'Generated baseline architecture: {arch_path.relative_to(config.project_root)}')
-    except Exception as exc:  # pragma: no cover - best effort
-        info(f'Failed to auto-generate architecture summary: {exc}')
-
-    # Create sample ADR
-    sample_adr = config.adrs_dir / "001-context-engine.md"
-    if not sample_adr.exists():
-        sample_adr.write_text(
-            """# ADR-001: Context Engine Adoption
-
-## Status
-Accepted
-
-## Context
-We need a way to reduce token waste when starting AI coding sessions.
-
-## Decision
-Use Context Engine to manage project context.
-
-## Consequences
-- Reduced token usage by 20-30%
-- Better session continuity
-- Manual control over context
-""",
+    session_file = context_dir / "session.md"
+    if not session_file.exists():
+        session_file.write_text(
+            "# Context Engine Session Log\n"
+            f"# Created: {Path.cwd().name} - {datetime.now():%Y-%m-%d %H:%M:%S}\n\n",
             encoding="utf-8",
         )
 
-    success(f"Initialized Context Engine in {config.context_dir}")
-    info("\nNext steps:")
-    info("1. Add baseline files: context baseline add <files>")
-    info("2. Bundle context: context bundle")
-    info("\nAI Tool Prompt:")
-    info("---")
-    info("Load .context/context_for_ai.md and continue working on current session")
-    info("---")
+    readme_file = context_dir / "README.md"
+    if not readme_file.exists():
+        readme_file.write_text(
+            "# Context Engine Workspace\n\n"
+            "- `session.md`: Running log of edits, commands, and notes.\n"
+            "- `session_summary.md`: AI-generated summary snapshots.\n"
+            "- `baseline/`: Store reference docs or baseline context inputs.\n"
+            "- `notes/`: Add freeform notes you want to persist between sessions.\n",
+            encoding="utf-8",
+        )
+
+    # Ensure config file exists (load_config creates default if missing)
+    load_config()
+    info(f"Configuration stored at {get_config_file().relative_to(project_root)}")
+
+    success(f"Initialized Context Engine assets in {context_dir}")
+    info("Next steps:")
+    info("  - Start tracking with `context start-session --auto`")
+    info("  - Add important files to `.context/baseline/` for summaries")

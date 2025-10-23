@@ -1,58 +1,17 @@
 {
-  "name": "context-engine-hybrid",
-  "version": "1.0.0",
-  "description": "Context Engine Hybrid CLI - Node.js frontend with Python backend",
-  "main": "ui/index.js",
-  "bin": {
-    "context-engine": "./ui/bin/context-engine.js",
-    "ce": "./ui/bin/ce.js"
-  },
-  "scripts": {
-    "start": "node ui/index.js",
-    "dev": "nodemon ui/index.js",
-    "install:backend": "cd backend && python -m venv venv && pip install -r requirements.txt",
-    "build": "cd ui && npm run build",
-    "test": "cd ui && npm test",
-    "lint": "cd ui && npm run lint",
-    "postinstall": "cd ui && npm install"
-  },
-  "keywords": [
-    "context",
-    "compression",
-    "cli",
-    "documentation",
-    "productivity",
-    "context-engine",
-    "hybrid",
-    "nodejs",
-    "python"
-  ],
-  "author": "Context Engine Team",
+  "name": "context-engine-workspace",
+  "version": "1.1.1",
+  "private": true,
+  "description": "Workspace root for the Context Engine hybrid CLI",
   "license": "MIT",
-  "engines": {
-    "node": ">=16.0.0",
-    "python": ">=3.7"
+  "scripts": {
+    "build": "npm run build --prefix ui",
+    "test": "npm test --prefix ui",
+    "lint": "npm run lint --prefix ui",
+    "prepare": "npm run prepare --prefix ui",
+    "postinstall": "npm run postinstall --prefix ui"
   },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/contextengine/cli.git"
-  },
-  "bugs": {
-    "url": "https://github.com/contextengine/cli/issues"
-  },
-  "homepage": "https://contextengine.dev",
-  "os": [
-    "win32",
-    "darwin",
-    "linux"
-  ],
-  "preferGlobal": true,
-  "files": [
-    "ui/bin/",
-    "ui/lib/",
-    "ui/scripts/",
-    "backend/",
-    "README.md",
-    "LICENSE"
+  "workspaces": [
+    "ui"
   ]
 }

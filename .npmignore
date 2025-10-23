@@ -1,0 +1,5 @@
+# Exclude internal documentation from npm packages
+CLAUDE.md
+CLAUDE-APPENDIX.md
+
+docs/

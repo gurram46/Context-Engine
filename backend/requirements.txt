@@ -1,6 +1,23 @@
-# Context Engine Backend Dependencies
+# Core Context Engine Backend Dependencies
+click>=8.0.0
+tiktoken>=0.5.0
+requests>=2.28.0
 rich>=13.0.0
+pyyaml>=6.0
+openrouter>=0.2.0
 chardet>=5.0.0
 python-dotenv>=1.0.0
 pathspec>=0.10.0
-click>=8.0.0
+watchdog>=3.0.0
+
+# Development Dependencies (optional)
+pytest>=7.0.0
+pytest-cov>=4.0.0
+flake8>=5.0.0
+black>=22.0.0
+mypy>=1.0.0
+
+# Build Dependencies
+build>=0.10.0
+twine>=4.0.0
+wheel>=0.38.0

@@ -1,0 +1,197 @@
+name: CI/CD - Context Engine
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+  id-token: write
+  packages: write
+
+env:
+  PYPI_REPOSITORY_URL: https://upload.pypi.org/legacy/
+  PROJECT_NAME: context-engine
+  NODE_ENV: production
+  PYTHONUNBUFFERED: 1
+  FORCE_COLOR: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-test:
+    name: Build / Test / Validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node-version: [20]
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            ui/package-lock.json
+            package-lock.json
+
+      - name: Install Node Dependencies
+        run: npm ci
+        working-directory: ui
+
+      - name: Build Frontend
+        run: |
+          npm run build
+          npm run postinstall
+        working-directory: ui
+
+      - name: Lint Node
+        run: npm run lint --if-present
+        working-directory: ui
+
+      - name: Test Node
+        run: npm test --if-present
+        working-directory: ui
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest flake8 build twine
+
+      - name: Lint Python
+        run: flake8 backend/context_engine --max-line-length=120
+
+      - name: Test Python
+        run: pytest -q
+
+      - name: Clean old builds
+        run: |
+          rm -rf dist/ build/
+          rm -rf ui/*.tgz
+
+      - name: Build Python Package
+        run: python -m build
+
+      - name: Pack Node CLI
+        run: |
+          cd ui
+          npm pack
+
+      - name: Verify Version Sync
+        run: |
+          echo "Python version: $(python setup.py --version)"
+          echo "Node version: $(node -p \"require('./ui/package.json').version\")"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: context-engine-build-${{ matrix.os }}
+          path: |
+            dist/**
+            ui/*.tgz
+
+  release:
+    name: Version Sync and Publish
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python Tools
+        run: pip install toml build twine
+
+      - name: Install Node Dependencies
+        run: npm ci
+        working-directory: ui
+
+      - name: Sync Versions (setup.py <-> package.json)
+        id: sync
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "Detected release tag: $TAG"
+          python3 scripts/sync_versions.py "$TAG"
+          echo "version=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Commit Synced Version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "gurram46"
+          git config user.email "sandeepgurram456@gmail.com"
+          git remote set-url origin https://github.com/gurram46/Context-Engine.git
+          git add package.json package-lock.json ui/package.json ui/package-lock.json setup.py
+          git commit -m "Sync version to ${{ steps.sync.outputs.version }}" || echo "No version changes"
+          git push origin main
+
+      - name: Clean old builds
+        run: |
+          rm -rf dist/ build/
+          rm -rf ui/*.tgz
+
+      - name: Build Python dist
+        run: python -m build
+
+      - name: Build Node dist
+        run: |
+          cd ui
+          npm pack
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Context Engine ${{ steps.sync.outputs.version }}
+          tag_name: ${{ steps.sync.outputs.version }}
+          body: |
+            Context Engine ${{ steps.sync.outputs.version }} Released
+            - Versions synced between Python and Node packages
+            - Artifacts published to PyPI and npm
+            - Built and tested on GitHub Actions (Ubuntu and Windows)
+          draft: false
+          prerelease: false
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.12.2
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          repository-url: https://upload.pypi.org/legacy/
+
+      - name: Publish to npm
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          cd ui
+          npm publish --access public
