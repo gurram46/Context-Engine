@@ -1,6 +1,6 @@
 {
-  "name": "context-engine-dev",
-  "version": "1.2.0",
+  "name": "context-engine",
+  "version": "1.2.1",
   "description": "Context Engine CLI - Compress the Chaos",
   "main": "index.js",
   "bin": {
