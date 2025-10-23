@@ -1,0 +1,4 @@
+exclude CLAUDE.md
+exclude CLAUDE-APPENDIX.md
+recursive-exclude docs *
+

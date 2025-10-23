@@ -1,108 +1,105 @@
-"""Configuration management for Context Engine"""
-
+"""Ultra-simplified AI model configuration for Context Engine v1.2.1"""
 import os
 import json
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Optional
 
+# Default model - works out of the box
+DEFAULT_MODEL = "qwen-1.5-mini"
+
+# Minimal config structure - only what we actually need
+DEFAULT_CONFIG = {"model": DEFAULT_MODEL, "api_key": None}
+
+
+def get_config_file() -> Path:
+    """Get the config file path"""
+    return Path.cwd() / ".context" / "config.json"
+
+
+def load_config() -> dict:
+    """Load minimal config or create default"""
+    config_file = get_config_file()
+
+    if config_file.exists():
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Fallback to defaults if config is corrupted
+            return DEFAULT_CONFIG.copy()
+    else:
+        # Create default config on first use
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2)
+        return DEFAULT_CONFIG.copy()
+
+
+def get_model() -> str:
+    """Get the current AI model - environment override first, then config, then default"""
+    return os.getenv("CONTEXT_ENGINE_MODEL") or load_config().get("model", DEFAULT_MODEL)
+
+
+def set_model(model: str) -> None:
+    """Set and save the model preference"""
+    config = load_config()
+    config["model"] = model
+
+    config_file = get_config_file()
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(config_file, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+
+def get_api_key() -> str:
+    """Get API key from environment or config"""
+    return os.getenv("OPENROUTER_API_KEY") or load_config().get("api_key")
+
+
+# Legacy compatibility class providing filesystem helpers
 class Config:
-    """Manages Context Engine configuration"""
-    
-    DEFAULT_CONFIG = {
-        "openrouter_api_key": "",
-        "model": "qwen/qwen3-coder:free",
-        "max_tokens": 100000,
-        "context_dir": ".context",
-        "auto_refresh": False,
-        "compression_rules": {
-            "strip_comments": True,
-            "keep_docstrings": True,
-            "summarize_configs": True,
-            "deduplicate": True,
-            "remove_blank_lines": True
-        },
-        "skip_patterns": [
-            r'\.pyc$', r'\.pyo$', r'\.class$', r'\.jar$', r'\.war$',
-            r'\.exe$', r'\.dll$', r'\.so$', r'\.dylib$',
-            r'\.png$', r'\.jpg$', r'\.jpeg$', r'\.gif$', r'\.bmp$', r'\.ico$',
-            r'\.pdf$', r'\.doc$', r'\.docx$', r'\.xls$', r'\.xlsx$',
-            r'\.zip$', r'\.tar$', r'\.gz$', r'\.7z$', r'\.rar$',
-            r'\.log$', r'\.tmp$', r'\.bak$', r'\.swp$',
-            r'^__pycache__/', r'^\.git/', r'^node_modules/', r'^\.vscode/', r'^\.idea/'
-        ],
-        "linked_repos": [],
-        # Security-related defaults
-        "allowed_extensions": [
-            ".md", ".json", ".yml", ".yaml", ".toml", ".ini",
-            ".py", ".js", ".ts", ".java", ".c", ".cpp"
-        ],
-        "max_file_size_kb": 1024,
-        "note_max_length": 2000
-    }
-    
-    def __init__(self, project_root: Optional[Path] = None):
-        self.project_root = project_root or Path.cwd().resolve()
+    """Lightweight configuration wrapper exposing common paths."""
+
+    def __init__(self, project_root: Optional[Path] = None, create_dirs: bool = True):
+        self.project_root = Path(project_root or Path.cwd())
         self.context_dir = self.project_root / ".context"
+        self.baseline_dir = self.context_dir / "baseline"
+        self.notes_dir = self.context_dir / "notes"
+        self.session_file = self.context_dir / "session.md"
+        self.cross_repo_file = self.context_dir / "cross_repo.json"
         self.config_file = self.context_dir / "config.json"
-        self._config = self.DEFAULT_CONFIG.copy()
-        self.load()
-    
-    def load(self) -> None:
-        """Load configuration from file if it exists"""
+        self.context_file = self.context_dir / "context_for_ai.md"
+        self.hashes_file = self.context_dir / "hashes.json"
+
+        if create_dirs:
+            self.context_dir.mkdir(parents=True, exist_ok=True)
+            self.baseline_dir.mkdir(exist_ok=True)
+            self.notes_dir.mkdir(exist_ok=True)
+
+        self._config = self._load_local_config()
+
+    def _load_local_config(self) -> dict:
         if self.config_file.exists():
             try:
-                with open(self.config_file, 'r') as f:
-                    stored_config = json.load(f)
-                    self._config.update(stored_config)
-            except (json.JSONDecodeError, IOError):
+                return json.loads(self.config_file.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
                 pass
-    
+        else:
+            self.config_file.parent.mkdir(parents=True, exist_ok=True)
+        self.config_file.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
+        return DEFAULT_CONFIG.copy()
+
     def save(self) -> None:
-        """Save configuration to file"""
-        self.context_dir.mkdir(exist_ok=True)
-        with open(self.config_file, 'w') as f:
-            json.dump(self._config, f, indent=2)
-    
-    def get(self, key: str, default: Any = None) -> Any:
-        """Get configuration value"""
+        self.config_file.write_text(json.dumps(self._config, indent=2), encoding="utf-8")
+
+    def get(self, key: str, default=None):
         return self._config.get(key, default)
-    
-    def set(self, key: str, value: Any) -> None:
-        """Set configuration value"""
-        self._config[key] = value
-        self.save()
-    
+
     @property
-    def openrouter_api_key(self) -> str:
-        """Get OpenRouter API key from config or environment"""
-        return self.get("openrouter_api_key") or os.getenv("OPENROUTER_API_KEY", "")
-    
+    def model(self) -> str:
+        return self._config.get("model", DEFAULT_MODEL)
+
     @property
-    def baseline_dir(self) -> Path:
-        """Get baseline directory path"""
-        return self.context_dir / "baseline"
-    
-    @property
-    def adrs_dir(self) -> Path:
-        """Get ADRs directory path"""
-        return self.context_dir / "adrs"
-    
-    @property
-    def session_file(self) -> Path:
-        """Get session file path"""
-        return self.context_dir / "session.md"
-    
-    @property
-    def cross_repo_file(self) -> Path:
-        """Get cross-repo file path"""
-        return self.context_dir / "cross_repo.md"
-    
-    @property
-    def context_file(self) -> Path:
-        """Get context_for_ai.md file path"""
-        return self.context_dir / "context_for_ai.md"
-    
-    @property
-    def hashes_file(self) -> Path:
-        """Get hashes.json file path"""
-        return self.context_dir / "hashes.json"
+    def api_key(self) -> Optional[str]:
+        return self._config.get("api_key")

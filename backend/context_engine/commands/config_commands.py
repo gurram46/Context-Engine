@@ -1,11 +1,9 @@
-"""Configuration commands for Context Engine"""
+"""Simplified configuration commands for Context Engine v1.2.1"""
 
 import json
-from typing import Any
-
 import click
 
-from ..core import Config
+from ..core.config import load_config, get_config_file, set_model, get_model, get_api_key
 from ..ui import info, success, warn, error
 
 
@@ -17,58 +15,51 @@ def config():
 
 @config.command("show")
 def show():
-    """Show current configuration (merged defaults + file)"""
-    cfg = Config()
+    """Display current configuration values"""
     try:
-        data = cfg._config  # merged view
+        data = load_config()
         info(json.dumps(data, indent=2))
     except Exception:
         error("Failed to load configuration")
-
-
-@config.command("path")
-def path():
-    """Print the config file path"""
-    cfg = Config()
-    info(str(cfg.config_file))
-
-
-def _parse_value(value: str) -> Any:
-    # Try JSON parsing to support numbers, bools, lists, objects
-    try:
-        return json.loads(value)
-    except Exception:
-        return value
 
 
 @config.command("set")
 @click.argument("key")
 @click.argument("value")
 def set_value(key: str, value: str):
-    """Set KEY to VALUE (VALUE can be JSON)"""
-    cfg = Config()
-    parsed = _parse_value(value)
-    cfg.set(key, parsed)
-    success(f"Set {key}")
+    """Set configuration value (only 'model' and 'api_key' supported)"""
+
+    # Only allow essential config keys
+    allowed_keys = ["model", "api_key"]
+
+    if key not in allowed_keys:
+        warn(f"Unsupported key: {key}. Only {allowed_keys} are supported.")
+        return
+
+    try:
+        config = load_config()
+
+        if key == "model":
+            set_model(value)
+            success(f"Model set to: {value}")
+        elif key == "api_key":
+            config[key] = value
+            config_file = get_config_file()
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+            success(f"API key set (hidden for security)")
+
+    except Exception as e:
+        error(f"Failed to set {key}: {e}")
 
 
-@config.command("unset")
-@click.argument("key")
-def unset_value(key: str):
-    """Remove KEY from the config file"""
-    cfg = Config()
-    # Remove directly from file to avoid leaving a null
-    data = {}
-    if cfg.config_file.exists():
-        try:
-            data = json.loads(cfg.config_file.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    if key in data:
-        data.pop(key, None)
-        cfg.context_dir.mkdir(parents=True, exist_ok=True)
-        cfg.config_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        success(f"Unset {key}")
-    else:
-        warn(f"Key not found: {key}")
+@config.command("path")
+def path():
+    """Print the config file path"""
+    info(str(get_config_file()))
+
+
+# Remove unsupported commands: unset, and any advanced config options
+# The config system now only supports: model and api_key
 

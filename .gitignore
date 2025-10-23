@@ -48,5 +48,29 @@ htmlcov/
 .tox/
 .hypothesis/
 PROJECT_CODE_DOCUMENTATION.md.backup
-PROJECT_CODE_DOCUMENTATION.md
-PROJECT_DOCUMENTATION.txt
+
+# Node.js
+/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+/dist/
+/ui/node_modules/
+/ui/dist/
+# Local-only documentation helpers
+CLAUDE.md
+CLAUDE-APPENDIX.md
+
+# Build artifacts
+/backend/.context/
+
+# Temporary files (deleted during cleanup)
+src/
+tmp_*.py
+*.tmp
+
+# Duplicates (deleted during cleanup)
+bin/
+backend/setup.py
+backend/test_cli.py
+backend/tmp_*.py

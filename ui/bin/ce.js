@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 
+/**
+ * Short alias for the Context Engine CLI.
+ * Mirrors the behaviour of the primary context-engine binary.
+ */
+
 const { spawn } = require('child_process');
 const path = require('path');
 
-// Get the directory of this script
 const scriptDir = path.dirname(__filename);
 const mainScript = path.join(scriptDir, '..', 'index.js');
 
-// Spawn the main process
 const child = spawn('node', [mainScript, ...process.argv.slice(2)], {
   stdio: 'inherit',
   cwd: process.cwd(),

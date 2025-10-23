@@ -1,10 +1,8 @@
 """Wrapper for LongCodeZip compression functionality."""
 
-import os
-import signal
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
-from typing import Dict, List, Optional
-import time
+from typing import Dict
 
 
 class LongCodeZipWrapper:
@@ -44,7 +42,7 @@ class LongCodeZipWrapper:
         """
         if not self._compressor:
             return {
-                "error": "⚠ LongCodeZip unavailable, skipping compression.",
+                "error": "LongCodeZip unavailable, skipping compression.",
                 "ratio": 0,
                 "token_count": 0,
                 "task": task_query
@@ -84,51 +82,49 @@ class LongCodeZipWrapper:
             try:
                 # Read file content
                 content = file_path.read_text(encoding="utf-8")
-                
-                # Set up timeout handler
-                def timeout_handler(signum, frame):
-                    raise TimeoutError("Compression timeout")
-                
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(30)  # 30 second timeout
-                
+
                 try:
-                    # Compress the code
-                    compressed_code = self._compressor.compress_code_file(
-                        content, 
-                        query=task_query, 
-                        instruction="Compress code for this task.",
-                        rate=self.rate
-                    )
-                    
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(
+                            self._compressor.compress_code_file,
+                            content,
+                            query=task_query,
+                            instruction="Compress code for this task.",
+                            rate=self.rate
+                        )
+                        compressed_code = future.result(timeout=30)
+
+                    if compressed_code is None:
+                        raise RuntimeError("Compression returned no data")
+
                     # Count tokens (rough estimate)
                     token_count = len(compressed_code.split())
                     total_tokens += token_count
-                    
+
                     # Save compressed code
                     relative_path = file_path.relative_to(src_path)
                     output_file = output_dir / f"{relative_path}.md"
                     output_file.parent.mkdir(parents=True, exist_ok=True)
-                    
+
                     # Create markdown content
                     markdown_content = f"# {relative_path}\n\n```\n{compressed_code}\n```"
                     output_file.write_text(markdown_content, encoding="utf-8")
-                    
+
+                    original_tokens = len(content.split())
                     results.append({
                         "file": str(relative_path),
-                        "original_tokens": len(content.split()),
+                        "original_tokens": original_tokens,
                         "compressed_tokens": token_count,
-                        "compression_ratio": 1 - (token_count / len(content.split()))
+                        "compression_ratio": 1 - (token_count / original_tokens) if original_tokens else 0
                     })
-                    
-                finally:
-                    signal.alarm(0)  # Cancel timeout
-                    
-            except TimeoutError:
-                results.append({
-                    "file": str(file_path.relative_to(src_path)),
-                    "error": "Compression timeout (30s)"
-                })
+
+                except FuturesTimeoutError:
+                    results.append({
+                        "file": str(file_path.relative_to(src_path)),
+                        "error": "Compression timeout (30s)"
+                    })
+                    continue
+
             except Exception as e:
                 results.append({
                     "file": str(file_path.relative_to(src_path)),
@@ -151,3 +147,63 @@ class LongCodeZipWrapper:
             "token_count": total_tokens,
             "task": task_query
         }
+
+    def compress(self, content: str, query: str = "Summarize for AI context", instruction: str = "Focus on essential information for AI understanding.") -> tuple:
+        """Backward-compatible compress method for CLI integration.
+
+        This method provides the interface expected by the CLI command,
+        which calls compressor.compress(content, query, instruction).
+
+        Args:
+            content: Text content to compress
+            query: Query to guide compression
+            instruction: Instruction for compression model
+
+        Returns:
+            Tuple of (compressed_content, compressed_prompt, compression_ratio)
+        """
+        if not self._compressor:
+            return None, "LongCodeZip unavailable, using basic compression", 0.0
+
+        try:
+            # Log compression attempt
+            print(f"Compressing content ({len(content)} chars)...")
+
+            # Use LongCodeZip to compress the content
+            compressed_result = self._compressor.compress_text(
+                content,
+                query=query,
+                instruction=instruction,
+                rate=self.rate
+            )
+
+            if compressed_result and hasattr(compressed_result, 'text'):
+                compressed_text = compressed_result.text
+                compression_ratio = 1.0 - (len(compressed_text) / len(content)) if content else 0.0
+
+                print(f"Compression successful: {len(content)} -> {len(compressed_text)} chars")
+                print(f"Compression ratio: {compression_ratio:.2%}")
+
+                return compressed_text, query, compression_ratio
+            else:
+                # Fallback to basic compression if LongCodeZip fails
+                lines = content.split('\n')
+                if len(lines) > 100:
+                    # Take top 100 lines as basic compression
+                    compressed_text = '\n'.join(lines[:100])
+                    compressed_text += f"\n\n... [{len(lines) - 100} more lines compressed]"
+                    compression_ratio = 1.0 - (len(compressed_text) / len(content))
+
+                    print(f"LongCodeZip compression failed, used basic compression")
+                    print(f"Compression ratio: {compression_ratio:.2%}")
+
+                    return compressed_text, f"Basic compression: {query}", compression_ratio
+                else:
+                    print(f"LongCodeZip compression failed, content already small")
+                    return content, f"Original content: {query}", 0.0
+
+        except Exception as e:
+            print(f"Compression error: {e}")
+
+            # Fallback: return original content with error indication
+            return content, f"Compression failed: {str(e)}", 0.0

@@ -1,2 +1,0 @@
-[console_scripts]
-context-engine = context_engine.scripts.cli:main
