@@ -1,6 +1,6 @@
 {
   "name": "context-engine-cli",
-  "version": "1.2.1-1",
+  "version": "1.2.1-2",
   "description": "Context Engine CLI - Compress the Chaos",
   "main": "index.js",
   "bin": {
@@ -67,7 +67,9 @@
     "scripts/",
     "README.md",
     "LICENSE",
-    "backend/"
+    "backend/",
+    "welcome_screen.js",
+    "dist/"
   ],
   "repository": {
     "type": "git",

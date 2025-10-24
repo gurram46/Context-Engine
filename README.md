@@ -11,7 +11,7 @@ After installation the Ink-based CLI launches the Python backend automatically, 
 
 ### npm (recommended)
 ```bash
-npm install -g context-engine-cli@1.2.1-1
+npm install -g context-engine-cli@1.2.1-2
 ```
 This installs the Node/Ink CLI, bundles the Python backend, and runs `pip install -r backend/requirements.txt` during postinstall (requires Python 3.8+ on PATH).
 
