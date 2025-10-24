@@ -10,19 +10,19 @@ After installation the Ink-based CLI launches the Python backend automatically, 
 ## Installation
 
 ### npm (recommended)
-`ash
+```bash
 npm install -g context-engine-dev@1.2.1
-`
-This installs the Node/Ink CLI, bundles the Python backend, and runs pip install -r backend/requirements.txt during postinstall (requires Python 3.8+ on PATH).
+```
+This installs the Node/Ink CLI, bundles the Python backend, and runs `pip install -r backend/requirements.txt` during postinstall (requires Python 3.8+ on PATH).
 
 ### PyPI
-`ash
+```bash
 pip install context-engine-dev==1.2.1
-`
+```
 This provides the Python modules and console scripts. Pair it with the npm package if you prefer to manage the frontend separately.
 
 ## Quick Start
-`ash
+```bash
 # Initialise scaffolding (.context/ directory, default config)
 context-engine init
 
@@ -40,76 +40,79 @@ context-engine stop-session
 
 # Launch the interactive chat palette
 context-engine chat
-`
-During a session the tracker writes to .context/:
+```
+During a session the tracker writes to `.context/`:
 
 | File | Purpose |
 |------|---------|
 | session.md | Log of file events and CLI commands. |
-| session_summary.md | Markdown summary produced by context session save. |
+| session_summary.md | Markdown summary produced by `context-engine session save`. |
 | session.pid | PID of the watchdog process. |
-| session_state.json | Cache for rapid context session status responses. |
+| session_state.json | Cache for rapid `context-engine session status` responses. |
 
 ## Project Structure
-`	ext
+```text
 Context-Engine/
-├── backend/                # Python package
-│   ├── main.py             # CLI bridge invoked by Node
-│   └── context_engine/
-│       ├── cli.py          # Click command definitions
-│       ├── core/session_tracker.py
-│       ├── core/ai_summary.py
-│       └── commands/       # Command modules (baseline, bundle, session, etc.)
-├── ui/                     # Node + Ink frontend
-│   ├── index.js            # CLI entry and palette bootstrapper
-│   ├── components/ChatApp.tsx
-│   └── lib/backend-bridge.js
-└── docs/                   # Authoring guides for contributors
-`
+|-- backend/                # Python package
+|   |-- main.py             # CLI bridge invoked by Node
+|   `-- context_engine/
+|       |-- cli.py          # Click command definitions
+|       |-- core/session_tracker.py
+|       |-- core/ai_summary.py
+|       `-- commands/       # Command modules (baseline, bundle, session, etc.)
+|-- ui/                     # Node + Ink frontend
+|   |-- index.js            # CLI entry and palette bootstrapper
+|   |-- components/ChatApp.tsx
+|   `-- lib/backend-bridge.js
+`-- docs/                   # Authoring guides for contributors
+```
 
 ## Development Workflow
-`ash
-# Frontend (Node) tests + lint
-cd ui
-npm install
-npm test
-npm run lint
 
-# Backend (Python) tests
-cd ..
+### Frontend (Node) tests & lint
+```bash
+npm install --prefix ui
+npm test --prefix ui
+npm run lint --prefix ui
+```
+Run the install command when dependencies change. Alternatively `cd ui` first and omit `--prefix`.
+
+### Backend (Python) tests
+```bash
 python -m pytest -q
-`
+```
+Execute from the repository root; there is no separate `scripts/run_test` helper.
 
 ## Publishing
 
 1. Bump versions
-   `ash
+   ```bash
    cd ui
    npm version <new-version> --no-git-tag-version
    cd ..
    python scripts/sync_versions.py <new-version>
    npm install --prefix ui          # refresh lockfile
-   `
+   ```
 2. Commit, tag, and push
-   `ash
+   ```bash
    git add .
    git commit -m "chore: release <new-version>"
    git tag v<new-version>
    git push origin main
    git push origin v<new-version>
-   `
+   ```
 3. Publish packages
-   `ash
+   ```bash
    cd ui
    npm publish --access public
    cd ..
    python -m build
    twine upload dist/*
-   `
+   ```
 
 ## Documentation
 
-Guides explaining the codebase live in [docs/](docs/README.md). Start with docs/README.md for the index and authoring principles.
+Guides explaining the codebase live in `docs/`. Start with `docs/README.md` for the index and authoring principles.
 
 ## License
 
