@@ -16,7 +16,7 @@ const ignoredNames = new Set([
 ]);
 
 if (!fs.existsSync(sourceDir)) {
-  console.error('[context-engine-dev] Unable to bundle backend: source directory not found', sourceDir);
+  console.error('[context-engine-cli] Unable to bundle backend: source directory not found', sourceDir);
   process.exit(1);
 }
 
@@ -42,4 +42,4 @@ fs.cpSync(sourceDir, targetDir, {
   filter: (src) => shouldInclude(src)
 });
 
-console.log('[context-engine-dev] Bundled Python backend for npm package.');
+console.log('[context-engine-cli] Bundled Python backend for npm package.');

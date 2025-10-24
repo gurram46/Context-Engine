@@ -2,7 +2,7 @@
 
 Context Engine is a hybrid CLI that tracks development sessions, generates summaries, and bundles project context for AI handoffs. The tool ships as two packages:
 
-- **npm**: [context-engine-dev](https://www.npmjs.com/package/context-engine-dev)
+- **npm**: [context-engine-cli](https://www.npmjs.com/package/context-engine-cli)
 - **PyPI**: [context-engine-dev](https://pypi.org/project/context-engine-dev/)
 
 After installation the Ink-based CLI launches the Python backend automatically, so a single install provides both halves.
@@ -11,7 +11,7 @@ After installation the Ink-based CLI launches the Python backend automatically, 
 
 ### npm (recommended)
 ```bash
-npm install -g context-engine-dev@1.2.1
+npm install -g context-engine-cli@1.2.1-1
 ```
 This installs the Node/Ink CLI, bundles the Python backend, and runs `pip install -r backend/requirements.txt` during postinstall (requires Python 3.8+ on PATH).
 

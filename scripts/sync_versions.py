@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+NPM_PACKAGE_NAME = "context-engine-cli"
 
 def sync_versions(new_version):
     """Sync versions across setup.py and package.json"""
@@ -61,8 +62,8 @@ def sync_versions(new_version):
             old_name = pkg.get("name")
             name_updated = False
             pkg["version"] = new_version
-            if old_name != "context-engine":
-                pkg["name"] = "context-engine"
+            if old_name != NPM_PACKAGE_NAME:
+                pkg["name"] = NPM_PACKAGE_NAME
                 name_updated = True
 
             f.seek(0)
@@ -72,7 +73,7 @@ def sync_versions(new_version):
             print(f"  Updated ui/package.json version to {new_version} (was {old_version})")
             if name_updated:
                 previous = old_name if old_name is not None else "<unset>"
-                print(f"  Updated package.json name to context-engine (was {previous})")
+                print(f"  Updated package.json name to {NPM_PACKAGE_NAME} (was {previous})")
 
     except FileNotFoundError:
         print("  ui/package.json not found")

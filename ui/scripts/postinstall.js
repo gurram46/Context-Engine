@@ -4,7 +4,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-console.log('[context-engine-dev] Checking Python backend dependencies...');
+console.log('[context-engine-cli] Checking Python backend dependencies...');
 
 const projectRoot = path.join(__dirname, '..');
 const backendDir = path.join(projectRoot, 'backend');
@@ -32,7 +32,7 @@ function findPython() {
 
       child.on('close', (code) => {
         if (code === 0) {
-          console.log(`[context-engine-dev] Python detected via "${cmd}": ${output.trim()}`);
+          console.log(`[context-engine-cli] Python detected via "${cmd}": ${output.trim()}`);
           resolve(cmd);
         } else {
           tryNext(index + 1);
@@ -66,7 +66,7 @@ requests>=2.28.0
 
 async function installBackendDependencies() {
   if (!fs.existsSync(backendDir)) {
-    console.log('[context-engine-dev] Backend directory not found. Skipping Python setup.');
+    console.log('[context-engine-cli] Backend directory not found. Skipping Python setup.');
     return;
   }
 
@@ -74,12 +74,12 @@ async function installBackendDependencies() {
   const pythonCmd = await findPython();
 
   if (!pythonCmd) {
-    console.log('[context-engine-dev] Python 3.8+ not detected. Install dependencies manually:');
+    console.log('[context-engine-cli] Python 3.8+ not detected. Install dependencies manually:');
     console.log('  python -m pip install -r backend/requirements.txt');
     return;
   }
 
-  console.log('[context-engine-dev] Installing Python backend dependencies...');
+  console.log('[context-engine-cli] Installing Python backend dependencies...');
 
   await new Promise((resolve) => {
     const pip = spawn(pythonCmd, ['-m', 'pip', 'install', '-r', requirementsPath], {
@@ -89,15 +89,15 @@ async function installBackendDependencies() {
 
     pip.on('close', (code) => {
       if (code === 0) {
-        console.log('[context-engine-dev] Backend dependencies installed successfully.');
+        console.log('[context-engine-cli] Backend dependencies installed successfully.');
       } else {
-        console.log('[context-engine-dev] pip install exited with a non-zero code. Install manually if needed.');
+        console.log('[context-engine-cli] pip install exited with a non-zero code. Install manually if needed.');
       }
       resolve();
     });
 
     pip.on('error', (error) => {
-      console.log('[context-engine-dev] Could not install backend dependencies automatically:', error.message);
+      console.log('[context-engine-cli] Could not install backend dependencies automatically:', error.message);
       console.log('Run manually: python -m pip install -r backend/requirements.txt');
       resolve();
     });
@@ -107,14 +107,14 @@ async function installBackendDependencies() {
 async function main() {
   try {
     await installBackendDependencies();
-    console.log('[context-engine-dev] Setup complete.');
+    console.log('[context-engine-cli] Setup complete.');
     console.log('');
     console.log('Usage:');
     console.log('  context-engine         # Launch interactive CLI');
     console.log('  context-engine help    # Show all commands');
     console.log('');
   } catch (error) {
-    console.log('[context-engine-dev] Post-install setup completed with warnings');
+    console.log('[context-engine-cli] Post-install setup completed with warnings');
     console.log(error.message);
   }
 }
