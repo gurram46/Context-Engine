@@ -58,16 +58,21 @@ def sync_versions(new_version):
         with ui_pkg_path.open("r+", encoding="utf-8") as f:
             pkg = json.load(f)
             old_version = pkg.get("version", "")
+            old_name = pkg.get("name")
+            name_updated = False
             pkg["version"] = new_version
-            pkg["name"] = "context-engine"  # Ensure unified name
+            if old_name != "context-engine":
+                pkg["name"] = "context-engine"
+                name_updated = True
 
             f.seek(0)
             json.dump(pkg, f, indent=2)
             f.truncate()
 
             print(f"  Updated ui/package.json version to {new_version} (was {old_version})")
-            if pkg.get("name") != "context-engine":
-                print(f"  Updated package.json name to context-engine (was {pkg.get('name')})")
+            if name_updated:
+                previous = old_name if old_name is not None else "<unset>"
+                print(f"  Updated package.json name to context-engine (was {previous})")
 
     except FileNotFoundError:
         print("  ui/package.json not found")
