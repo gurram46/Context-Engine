@@ -109,6 +109,17 @@ class ContextEngineCLI {
       .description('Launch the combined palette + chat interface')
       .action(() => this.launchInteractiveUI());
 
+    // Baseline commands
+    this.program
+      .command('baseline')
+      .description('Manage baseline files')
+      .argument('[action]', 'Baseline action (list, add, review, auto)')
+      .argument('[files...]', 'Files to add (for add action)')
+      .action((action, files) => {
+        const args = action ? [action, ...files] : [];
+        return this.runSimpleCommand('baseline', `Baseline ${action || 'command'} executed`, args);
+      });
+
     this.program
       .command('help')
       .description('Show help information')
@@ -214,7 +225,7 @@ class ContextEngineCLI {
 
   showHelp() {
     console.log(chalk.bold.cyan('\nContext Engine v1.2 CLI Help - Session Intelligence Model\n'));
-    console.log(chalk.bold('Core Commands (8 total):'));
+    console.log(chalk.bold('Core Commands (9 total):'));
     console.log(`${chalk.cyan('init')}              Initialize Context Engine in current directory`);
     console.log(`${chalk.cyan('start-session')}     Start background logging of CLI and file activity`);
     console.log(`${chalk.cyan('stop-session')}      Stop current session gracefully`);
@@ -222,19 +233,27 @@ class ContextEngineCLI {
     console.log(`${chalk.cyan('summary')}           Generate AI-powered project summary or display latest`);
     console.log(`${chalk.cyan('compress')}          Compress project context using LongCodeZip`);
     console.log(`${chalk.cyan('bundle')}            Create context bundle for AI handoff`);
+    console.log(`${chalk.cyan('baseline')}          Manage baseline files (list, add, review, auto)`);
     console.log(`${chalk.cyan('config show')}       Display current configuration values`);
     console.log(`${chalk.cyan('chat')}              Launch palette + chat interface`);
     console.log(`${chalk.cyan('palette')}           Interactive command palette`);
     console.log(`${chalk.cyan('help')}              Show this help message`);
 
+    console.log(chalk.bold('\nBaseline Commands:'));
+    console.log(`${chalk.cyan('baseline list')}     List files in baseline`);
+    console.log(`${chalk.cyan('baseline add <file>')} Add file to baseline`);
+    console.log(`${chalk.cyan('baseline review')}   Review baseline with staleness warnings`);
+    console.log(`${chalk.cyan('baseline auto')}     Auto-generate architecture document`);
+
     console.log(chalk.bold('\nSession Intelligence Flow:'));
     console.log(`1. ${chalk.cyan('init')} -> Initialize project`);
-    console.log(`2. ${chalk.cyan('start-session')} -> Begin logging activity`);
-    console.log(`3. ${chalk.cyan('session save')} -> Generate AI summary`);
-    console.log(`4. ${chalk.cyan('compress')} + ${chalk.cyan('bundle')} -> Package for AI`);
+    console.log(`2. ${chalk.cyan('baseline add')} -> Add important files to baseline`);
+    console.log(`3. ${chalk.cyan('start-session')} -> Begin logging activity`);
+    console.log(`4. ${chalk.cyan('session save')} -> Generate AI summary`);
+    console.log(`5. ${chalk.cyan('compress')} + ${chalk.cyan('bundle')} -> Package for AI`);
 
     console.log(chalk.bold('\nInteractive Tips:'));
-    console.log(`- Use ${chalk.cyan('/init')}, ${chalk.cyan('/start-session')}, ${chalk.cyan('/summary')} shortcuts`);
+    console.log(`- Use ${chalk.cyan('/init')}, ${chalk.cyan('/baseline add')}, ${chalk.cyan('/start-session')}, ${chalk.cyan('/summary')} shortcuts`);
     console.log('- Press Enter for the palette, /exit to quit');
     console.log('- Session notes: /session save "Fixed authentication bug in API"');
     console.log(`- Run ${chalk.cyan('context-engine chat')} for the chat-enabled palette`);
