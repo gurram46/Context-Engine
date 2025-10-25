@@ -1,6 +1,6 @@
 {
   "name": "context-engine-workspace",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "private": true,
   "description": "Workspace root for the Context Engine hybrid CLI",
   "license": "MIT",
