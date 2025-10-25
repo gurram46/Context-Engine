@@ -22,7 +22,11 @@ const paletteItems: PaletteItem[] = [
   { label: 'Generate summary (/summary -m ai)', command: 'summary', args: ['-m', 'ai'] },
   { label: 'Compress context (/compress)', command: 'compress' },
   { label: 'Create bundle (/bundle)', command: 'bundle' },
-  { label: 'Show config (/config show)', command: 'config', args: ['show'] }
+  { label: 'Show config (/config show)', command: 'config', args: ['show'] },
+  { label: 'Baseline list files (/baseline list)', command: 'baseline', args: ['list'] },
+  { label: 'Baseline add files (/baseline add)', command: 'baseline', args: ['add'] },
+  { label: 'Baseline review (/baseline review)', command: 'baseline', args: ['review'] },
+  { label: 'Baseline auto generate (/baseline auto)', command: 'baseline', args: ['auto'] }
 ];
 
 const selectItems: SelectItem<PaletteItem>[] = paletteItems.map((item) => ({

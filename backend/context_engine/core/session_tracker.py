@@ -67,10 +67,40 @@ def _create_session_header() -> None:
 
 
 def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
-    tmp_path.replace(path)
+    """Atomically write data to a JSON file with Windows compatibility."""
+    import time
+    import random
+
+    # Generate unique temporary filename
+    random_id = f"{int(time.time())}_{random.randint(1000, 9999)}"
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp_{random_id}")
+
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+
+        # Windows-specific file replacement with retry logic
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                tmp_path.replace(path)
+                return
+            except PermissionError as e:
+                if attempt < max_retries - 1:
+                    time.sleep(0.1)  # Brief delay before retry
+                    continue
+                else:
+                    # As a last resort, write directly without atomic operation
+                    with path.open("w", encoding="utf-8") as handle:
+                        json.dump(data, handle, indent=2)
+                    return
+    finally:
+        # Clean up temporary file if it exists
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except:
+                pass  # Ignore cleanup errors
 
 
 def _read_state() -> Dict[str, Any]:

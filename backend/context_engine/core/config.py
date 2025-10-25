@@ -8,7 +8,16 @@ from typing import Optional
 DEFAULT_MODEL = "qwen-1.5-mini"
 
 # Minimal config structure - only what we actually need
-DEFAULT_CONFIG = {"model": DEFAULT_MODEL, "api_key": None}
+DEFAULT_CONFIG = {
+    "model": DEFAULT_MODEL,
+    "api_key": None,
+    "allowed_extensions": [
+        ".py", ".js", ".ts", ".jsx", ".tsx", ".md", ".txt", ".json",
+        ".yaml", ".yml", ".toml", ".cfg", ".ini", ".dockerfile",
+        ".sql", ".sh", ".bat", ".ps1", ".html", ".css", ".scss", ".less"
+    ],
+    "max_file_size_kb": 1024
+}
 
 
 def get_config_file() -> Path:
