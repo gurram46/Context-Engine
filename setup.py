@@ -9,7 +9,7 @@ long_description = readme_file.read_text(encoding="utf-8") if readme_file.exists
 
 setup(
     name="context-engine-dev",
-    version="1.2.2",
+    version="1.2.3",
     author="Context Engine Team",
     description="Context Engine CLI - Compress the Chaos",
     long_description=long_description,

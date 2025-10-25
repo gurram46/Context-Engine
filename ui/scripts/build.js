@@ -21,8 +21,17 @@ function ensureDistDirectory() {
   }
 }
 
+function stageBackend() {
+  const stageScript = path.join(__dirname, 'stage-backend.js');
+  if (fs.existsSync(stageScript)) {
+    console.log('Staging backend for bundling...');
+    require('./stage-backend.js');
+  }
+}
+
 async function main() {
   ensureDistDirectory();
+  stageBackend();
   await buildComponents();
   console.log('Context Engine CLI build step completed.');
 }

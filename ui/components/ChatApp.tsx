@@ -82,7 +82,8 @@ export default function ChatApp() {
           appendMessage('system', result.stderr.trim());
         }
       } catch (error: any) {
-        appendMessage('assistant', `Command error: ${error.message}`);
+        const errorMessage = error.message || 'Unknown error occurred';
+        appendMessage('assistant', `Command error: ${errorMessage}`);
       } finally {
         setBusy(false);
       }
