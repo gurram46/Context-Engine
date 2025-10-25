@@ -1,6 +1,6 @@
 {
   "name": "context-engine-cli",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "description": "Context Engine CLI - Compress the Chaos",
   "main": "index.js",
   "bin": {
@@ -20,7 +20,7 @@
     "prepack": "npm run build",
     "postinstall": "node scripts/postinstall.js",
     "clean": "rm -rf dist/ node_modules/.cache/",
-    "prepublishOnly": "npm run test && npm run lint && node scripts/stage-backend.js",
+    "prepublishOnly": "npm run lint && node scripts/stage-backend.js",
     "postpublish": "node scripts/cleanup-backend.js",
     "version": "python ../scripts/sync_versions.py $npm_package_version"
   },

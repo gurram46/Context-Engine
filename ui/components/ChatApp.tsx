@@ -125,7 +125,7 @@ export default function ChatApp() {
         'system',
         'Treating message as AI summary request. Use "/" prefix to run explicit CLI commands.'
       );
-      runCommand('summary', ['-m', 'ai']);
+      runCommand('summary', ['--model', 'claude']);
     },
     [appendMessage, runCommand]
   );
