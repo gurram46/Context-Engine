@@ -57,6 +57,10 @@ yarn-error.log*
 /dist/
 /ui/node_modules/
 /ui/dist/
+# Context Engine V2
+/v2/node_modules/
+/v2/dist/
+.opencode/
 # Local-only documentation helpers
 CLAUDE.md
 CLAUDE-APPENDIX.md
@@ -65,7 +69,7 @@ CLAUDE-APPENDIX.md
 /backend/.context/
 
 # Temporary files (deleted during cleanup)
-src/
+/src/
 tmp_*.py
 *.tmp
 

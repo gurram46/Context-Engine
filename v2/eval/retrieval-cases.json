@@ -1,0 +1,45 @@
+[
+  {
+    "id": "bundle-flow",
+    "query": "Trace the Bundle Generation Flow context bundle --no-ai to .context/context_for_ai.md",
+    "type": "MIXED",
+    "expectedFiles": [
+      "backend/context_engine/commands/bundle_command.py",
+      "backend/context_engine/cli.py",
+      "backend/context_engine/core/config.py",
+      "backend/context_engine/core/utils.py",
+      "backend/context_engine/models/openrouter.py"
+    ],
+    "expectedSymbols": ["bundle", "_manual_fixed_bundle"],
+    "mustNotTop": ["ui/index.js", "backend/context_engine/core/task_manager.py"]
+  },
+  {
+    "id": "count_tokens",
+    "query": "Where is count_tokens implemented?",
+    "type": "SYMBOL",
+    "expectedFiles": ["backend/context_engine/core/utils.py"],
+    "expectedSymbols": ["count_tokens"]
+  },
+  {
+    "id": "callers-bundle",
+    "query": "What calls bundle?",
+    "type": "DEPENDENCY",
+    "expectedFiles": ["backend/context_engine/cli.py"],
+    "expectedSymbols": ["bundle"],
+    "note": "OCI caller graph misses Click registration; must be discoverable via exact fallback"
+  },
+  {
+    "id": "tests-bundle",
+    "query": "What tests cover bundle generation?",
+    "type": "TEST",
+    "expectedFiles": ["tests/test_bundle_integration.py"],
+    "expectedSymbols": ["TestBundleIntegration"]
+  },
+  {
+    "id": "redact_secrets",
+    "query": "Where is secret redaction implemented?",
+    "type": "CONCEPTUAL",
+    "expectedFiles": ["backend/context_engine/core/utils.py"],
+    "expectedSymbols": ["redact_secrets"]
+  }
+]
