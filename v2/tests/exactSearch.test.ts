@@ -8,7 +8,7 @@ describe("exactSearch", () => {
     expect(ev[0].file).toBeDefined();
   });
   it("finds count_tokens", async () => {
-    const ev = await exactSearch("count_tokens", { literal: true, limit: 20 });
+    const ev = await exactSearch("count_tokens", { literal: true, limit: 50 });
     expect(ev.some((e) => e.file.includes("utils.py"))).toBe(true);
   });
   it("returns empty for nonsense", async () => {

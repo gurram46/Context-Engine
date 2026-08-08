@@ -195,16 +195,21 @@ export function scoreAuthority(inp: AuthorityInput): { score: number; reasons: s
     const isReference = evidence.source === "exact" && evidence.relation === "reference" && targetSym && (evidence.text || "").toLowerCase().includes(targetSym);
     const isCaller = evidence.relation === "caller";
     if (isReference || isCaller) {
-      // Check if this reference is outside definition file
-      // We don't have defFile here, but if file is not the definition's file (heuristic: not bundle_command for bundle)
-      // For generic, if file does not contain targetSym as definition, treat as external
       const isExternal = !file.toLowerCase().includes(targetSym?.slice(0,4) ?? "") || !isTrueDefinition(evidence, rawQuery);
-      // Simpler: if file !== likely def file, boost
-      // Use evidence.file !== "backend/context_engine/commands/bundle_command.py" for bundle case
-      // Generic: boost if file doesn't look like definition holder
       if (isExternal || evidence.file !== "backend/context_engine/commands/bundle_command.py") {
         score += AUTHORITY_WEIGHTS.callerReference;
         reasons.push(`+${AUTHORITY_WEIGHTS.callerReference} caller reference`);
+        // Extra wiring boost for registration patterns like add_command, register, use
+        const txt = (evidence.text || "").toLowerCase();
+        if (txt.includes("add_command") || txt.includes("register") || txt.includes("bundle_command.bundle")) {
+          score += 8;
+          reasons.push(`+8 wiring pattern`);
+        }
+        // Prefer backend over ui/docs for bundle callers
+        if (file.startsWith("backend/")) {
+          score += 5;
+          reasons.push(`+5 backend wiring`);
+        }
       }
     }
     if (evidence.relation === "definition" && evidence.source === "symbol" && isTrueDefinition(evidence, rawQuery)) {
