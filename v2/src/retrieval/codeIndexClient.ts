@@ -5,17 +5,31 @@
  */
 import { spawn, ChildProcess } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Evidence } from "../core/types.js";
 
 type JsonRpcResponse = { jsonrpc: "2.0"; id: number; result?: any; error?: any };
 
-function projectRoot(): string {
-  return process.cwd();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// v2/dist/retrieval -> v2 -> Context-Engine root
+const CONTEXT_ENGINE_ROOT = path.resolve(__dirname, "../../..");
+
+function defaultProjectRoot(): string {
+  return process.env.CONTEXT_ENGINE_PROJECT_ROOT || process.cwd();
 }
 
 function cliPath(): string {
-  // installed pkg bin is dist/cli.js
-  return path.resolve(projectRoot(), "node_modules/open-codebase-index/dist/cli.js");
+  // Always use Context-Engine's installed binary, not the target repo's
+  return path.join(CONTEXT_ENGINE_ROOT, "node_modules/open-codebase-index/dist/cli.js");
+}
+
+let activeProjectRoot: string = defaultProjectRoot();
+export function setActiveProjectRoot(root: string) {
+  activeProjectRoot = path.resolve(root);
+}
+export function getActiveProjectRoot(): string {
+  return activeProjectRoot;
 }
 
 class McpClient {
@@ -24,10 +38,16 @@ class McpClient {
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void; timer: NodeJS.Timeout }>();
   private buffer = "";
   private ready = false;
+  private projectRoot: string;
+
+  constructor(projectRoot?: string) {
+    this.projectRoot = projectRoot ? path.resolve(projectRoot) : getActiveProjectRoot();
+  }
 
   async start(): Promise<void> {
     if (this.proc) return;
-    const proc = spawn("node", [cliPath()], { stdio: ["pipe", "pipe", "pipe"] });
+    // Spawn OCI MCP with cwd = target project so it indexes that repo
+    const proc = spawn("node", [cliPath()], { stdio: ["pipe", "pipe", "pipe"], cwd: this.projectRoot });
     this.proc = proc;
     proc.stdout.on("data", (d) => this.onData(d));
     proc.stderr.on("data", () => {});
@@ -117,9 +137,21 @@ class McpClient {
 }
 
 let singleton: McpClient | null = null;
+let singletonRoot: string | null = null;
 function client(): McpClient {
-  if (!singleton) singleton = new McpClient();
+  const root = getActiveProjectRoot();
+  if (!singleton || singletonRoot !== root) {
+    if (singleton) { try { singleton.close(); } catch {} }
+    singleton = new McpClient(root);
+    singletonRoot = root;
+  }
   return singleton;
+}
+export function createCodeIndexClientForRoot(root: string): CodeIndexClient {
+  setActiveProjectRoot(root);
+  // Force new singleton for that root
+  if (singleton) { try { singleton.close(); } catch {} singleton = null; singletonRoot = null; }
+  return createCodeIndexClient();
 }
 
 // ---- parsers: OCI returns formatted text, parse back to Evidence ----
@@ -201,12 +233,11 @@ function parsePeekLike(text: string, source: Evidence["source"], relation: Evide
 }
 
 function normalizeFile(p: string): string {
-  // handle Windows C:\... -> relative
-  const root = process.cwd();
+  // handle Windows C:\... -> relative to active project root
+  const root = getActiveProjectRoot();
   const abs = path.isAbsolute(p) ? p : path.join(root, p);
   const rel = path.relative(root, abs);
   const posix = rel.split(path.sep).join("/");
-  // if still absolute (outside root), return basename-ish posix
   if (posix.startsWith("..")) {
     const base = p.split(/[\\/]/).slice(-3).join("/");
     return base;

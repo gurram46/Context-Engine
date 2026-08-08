@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import type { Evidence } from "../core/types.js";
+import { getActiveProjectRoot } from "./codeIndexClient.js";
 
 export interface ExactSearchOptions {
   projectRoot?: string;
@@ -26,7 +27,8 @@ const DEFAULT_IGNORES = [
 ];
 
 function normalizeProjectRoot(root?: string): string {
-  return root ? path.resolve(root) : process.cwd();
+  if (root) return path.resolve(root);
+  try { return getActiveProjectRoot(); } catch { return process.cwd(); }
 }
 
 function normalizeFile(file: string, root: string): string {

@@ -1,5 +1,6 @@
 import type { Evidence, QueryType } from "../core/types.js";
 import { applyAuthority, AUTHORITY_WEIGHTS } from "./authority.js";
+import { classifyFile } from "../core/fileClassifier.js";
 
 export interface FuseOptions {
   topN?: number;
@@ -96,8 +97,33 @@ export function fuseEvidence(evidence: Evidence[], opts: FuseOptions) {
   // Re-sort collapsed list by finalScore
   collapsedList.sort((a, b) => b.finalScore - a.finalScore);
 
-  // 5. Authority must not be penalized for file-diversity: ensure top exact definition survives
-  // If an exact symbol definition was removed, reinsert it
+  // 5. Query-aware doc balancing: for implementation/runtime queries, limit docs to ≤2 in topN
+  const lowerQuery = opts.rawQuery.toLowerCase();
+  const wantsImpl = opts.queryType === "SYMBOL" || opts.queryType === "DEPENDENCY" || opts.queryType === "MIXED" || (opts.queryType === "CONCEPTUAL" && /implemented|generation|bundle|logic|validation|handler|router|service|enforced|ontology|pipeline|wired|scoring|delivery|isolation/.test(lowerQuery));
+  const wantsDoc = /documented|explain the architecture|docs|documentation/.test(lowerQuery);
+  if (wantsImpl && !wantsDoc) {
+    let docCount = 0;
+    const balanced: typeof collapsedList = [];
+    for (const e of collapsedList) {
+      const kind = classifyFile(e.file);
+      if (kind === "DOC") {
+        if (docCount < 2) {
+          balanced.push(e);
+          docCount++;
+        } else {
+          // defer docs beyond 2 for impl queries
+          continue;
+        }
+      } else {
+        balanced.push(e);
+      }
+    }
+    // Do not fill with deferred docs; keep docs limited to 2 for impl queries
+    collapsedList = balanced;
+    collapsedList.sort((a, b) => b.finalScore - a.finalScore);
+  }
+
+  // 6. Authority must not be penalized for file-diversity: ensure top exact definition survives
   const defExists = collapsedList.some((e) => e.relation === "definition" && e.source === "symbol");
   if (!defExists) {
     const bestDef = scored.find((e) => e.relation === "definition" && e.source === "symbol");

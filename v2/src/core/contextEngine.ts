@@ -1,10 +1,11 @@
 import { routeQuery } from "../router/router.js";
 import { fuseEvidence } from "../ranking/fuse.js";
 import { packEvidence } from "../packing/evidencePacker.js";
-import { createCodeIndexClient } from "../retrieval/codeIndexClient.js";
+import { createCodeIndexClient, setActiveProjectRoot, getActiveProjectRoot } from "../retrieval/codeIndexClient.js";
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Evidence, QueryType } from "./types.js";
 
 export interface ContextResult {
@@ -37,9 +38,17 @@ export interface ContextStatus {
 
 function getVersion(): string {
   try {
-    const pkg = JSON.parse(readFileSync(path.resolve("v2/package.json"), "utf8"));
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = path.dirname(__filename);
+    const root = path.resolve(__dirname, "../../..");
+    const pkg = JSON.parse(readFileSync(path.join(root, "v2/package.json"), "utf8"));
     return pkg.version ?? "0.1.0";
-  } catch { return "0.1.0"; }
+  } catch {
+    try {
+      const pkg2 = JSON.parse(readFileSync(path.resolve("v2/package.json"), "utf8"));
+      return pkg2.version ?? "0.1.0";
+    } catch { return "0.1.0"; }
+  }
 }
 
 function getGitBranch(): string | undefined {
@@ -56,8 +65,16 @@ async function checkRg(): Promise<boolean> {
 }
 
 export class ContextEngine {
-  private client = createCodeIndexClient();
+  private client: ReturnType<typeof createCodeIndexClient>;
   private closed = false;
+  public readonly projectRoot: string;
+
+  constructor(projectRoot?: string) {
+    const envRoot = process.env.CONTEXT_ENGINE_PROJECT_ROOT;
+    this.projectRoot = path.resolve(projectRoot || envRoot || process.cwd());
+    setActiveProjectRoot(this.projectRoot);
+    this.client = createCodeIndexClient();
+  }
 
   async search(query: string, opts: { budgetTokens?: number; maxResults?: number; debug?: boolean } = {}): Promise<ContextResult> {
     return this.execute(query, opts);
@@ -93,6 +110,7 @@ export class ContextEngine {
   }
 
   async status(): Promise<ContextStatus> {
+    setActiveProjectRoot(this.projectRoot);
     const warnings: string[] = [];
     const rgAvailable = await checkRg();
     if (!rgAvailable) warnings.push("rg not available");
@@ -119,8 +137,8 @@ export class ContextEngine {
     }
     return {
       version: getVersion(),
-      projectRoot: process.cwd(),
-      gitBranch: getGitBranch(),
+      projectRoot: this.projectRoot,
+      gitBranch: (()=>{ try{ return execSync(`git -C "${this.projectRoot}" branch --show-current`, {encoding:"utf8"}).trim() || undefined; } catch{ return getGitBranch(); } })(),
       nodeVersion: process.version,
       rgAvailable,
       ociConnected,
@@ -139,16 +157,16 @@ export class ContextEngine {
   }
 
   private async execute(rawQuery: string, opts: { budgetTokens?: number; maxResults?: number; debug?: boolean }): Promise<ContextResult> {
+    setActiveProjectRoot(this.projectRoot);
     const t0 = Date.now();
     const warnings: string[] = [];
     let result: Awaited<ReturnType<typeof routeQuery>> | null = null;
     try {
       result = await routeQuery(rawQuery);
     } catch (e: any) {
-      // Fallback to exact only if OCI fails
       warnings.push(`retrieval failed: ${e.message}, falling back to exact`);
       const { exactSearch } = await import("../retrieval/exactSearch.js");
-      const ev = await exactSearch(rawQuery, { literal: true, limit: opts.maxResults ?? 10 }).catch(() => []);
+      const ev = await exactSearch(rawQuery, { literal: true, limit: opts.maxResults ?? 10, projectRoot: this.projectRoot }).catch(() => []);
       result = {
         classified: { type: "MIXED" as QueryType, raw: rawQuery, normalized: rawQuery, hints: ["fallback-exact"] },
         evidence: ev,
