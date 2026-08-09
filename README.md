@@ -1,5 +1,8 @@
 # Context Engine
 
+> **Frontend:** Zed / Codex / OpenCode (MCP stdio) — **Backend:** `contextd` (Rust) + V2 (TypeScript) bridge.
+> **Migration:** R0 `contextd` MCP shell over V2 is **implemented** (`rust/contextd-r0`, `target/release/contextd.exe`). Retrieval/ranking/indexing still in Node; R1-R5 will port to Rust. See `docs/architecture/contextd.md`.
+
 Context Engine is a hybrid CLI that tracks development sessions, generates summaries, and bundles project context for AI handoffs. The tool ships as two packages:
 
 - **npm**: [context-engine-cli](https://www.npmjs.com/package/context-engine-cli)
@@ -64,10 +67,30 @@ Context-Engine/
 |   |-- index.js            # CLI entry and palette bootstrapper
 |   |-- components/ChatApp.tsx
 |   `-- lib/backend-bridge.js
-`-- docs/                   # Authoring guides for contributors
+|-- v2/                     # TypeScript behavioral reference (15b053e) — 41 tests, 5 MCP tools
+|   |-- src/core/contextEngine.ts
+|   |-- src/mcp/server.ts
+|   `-- eval/retrieval-cases.json
+|-- crates/
+|   |-- contextd/           # Rust MCP shell (R0) — stdio + V2 bridge
+|   `-- context-core/       # shared MCP types
+`-- docs/                   # guides + architecture + audit
 ```
 
 ## Development Workflow
+
+### Rust backend (contextd) — R0
+```bash
+cargo build --release              # -> target/release/contextd.exe
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo doc --workspace --no-deps
+# MCP smoke (Node harness)
+node v2/test_contextd_smoke.js
+```
+`contextd` requires `node` + `v2/dist/mcp/server.js` (`npm run build --prefix v2`). Configure one client:
+`mcp.contextd.command = ["C:/path/to/target/release/contextd.exe"]` with `CONTEXT_ENGINE_PROJECT_ROOT`.
 
 ### Frontend (Node) tests & lint
 ```bash
@@ -82,6 +105,12 @@ Run the install command when dependencies change. Alternatively `cd ui` first an
 python -m pytest -q
 ```
 Execute from the repository root; there is no separate `scripts/run_test` helper.
+
+### V2 behavioral reference
+```bash
+.\v2\node_modules\.bin\vitest run --config v2/vitest.config.ts  # 41 tests
+.\v2\node_modules\.bin\tsx v2/eval/runner.ts                    # 5/5 Top1
+```
 
 ## Publishing
 
