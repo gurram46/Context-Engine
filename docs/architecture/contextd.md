@@ -1,8 +1,8 @@
 # contextd — Rust backend for Context Engine
 
-**Status:** R2 implemented — Rust owns file discovery, hashing, classification, exact search, query classification, routing, authority ranking, fusion, packing; `contextd.exe` is the backend; Zed / Codex / OpenCode are frontends. R0 shell and R1 `context-index` verified.
+**Status:** R3 implemented — Rust now owns structural repository intelligence (tree-sitter, symbols, chunks, graph) plus all R2 capabilities; `contextd.exe` remains the backend; Zed / Codex / OpenCode are frontends. R0 shell, R1 `context-index`, R2 routing/ranking verified.
 
-## Current architecture (R2)
+## Current architecture (R3)
 
 ```
 Zed / Codex / OpenCode
@@ -13,25 +13,44 @@ Zed / Codex / OpenCode
         │                              │
         │                         classify / route (context-rank)
         │                              │
-        │              ┌───────────────┴───────────────┐
-        │              ▼                               ▼
-        │         Rust exact (rg)          OCI raw candidates (candidateProvider.js)
-        │              │                     semantic / symbol / graph / test
-        │              └───────────┬───────────────────┘
-        │                          ▼
+        │              ┌────────────────┼────────────────┐
+        │              ▼                │                ▼
+        │         Rust exact (rg)  Rust structural  OCI semantic (candidateProvider.js)
+        │              │            symbols/refs/          │
+        │              │            graph/chunks       semantic only
+        │              └───────────────┼────────────────┘
+        │                              ▼
         │                    Rust authority → Rust fuse → Rust pack (tiktoken)
-        │                          │
-        │                          ▼
-        │                         MCP
+        │                              │
+        │                              ▼
+        │                             MCP
         │
-        └── V2/OCI TEMP (candidateProvider.js) — NOT final ranking
+        └── V2/OCI TEMP (candidateProvider.js) — semantic only
 ```
 
 - **Implemented (R0):** Rust MCP contract, 5 tools, project-root forwarding, one persistent V2 child, graceful shutdown, single restart, tracing to stderr.
-- **Implemented (R1):** Rust `ProjectRoot`, `ProjectIndex`, `FileKind`, `blake3` (10 MB), `ExactQuery` via `rg` (`crates`/`target` handling via `ENGINE_INTERNAL_EXCLUDES`).
-- **Implemented (R2):** Rust `QueryType` (`classify_query`), `extract_identifiers`, `RetrievalPlan` (exact/symbol/semantic/graph/test), `Evidence` typed, `authority` (18 weights, `is_true_definition`, `FileKind`), `fuse` (dedup, overlap collapse 2–4/file, doc quota ≤2), `packer` (`tiktoken-rs` `cl100k_base`, budget 10k, `packed_tokens`), `PipelineStats` (`candidate_count`, `evidence_count`, `files_returned`, `packed_tokens`, `retrievers_used`, `elapsed_ms`), `candidate` provider (`symbol_candidates` via `implementation_lookup`, `semantic` via `peek`, `graph` via `call_graph`, all raw, no `authorityScore`).
-- **Current limitation (R2):** semantic/symbol/graph still via OCI (`candidateProvider.js` temporary), no `tree-sitter`/`usearch`/`tantivy`/`ort`/`notify`/`SQLite` yet.
-- **Planned (R3-R5):** R3 `context-store` (`rusqlite`, `tree-sitter`, `usearch` mmap), R4 `tantivy`/`ort`/`notify`, R5 remove Node.
+- **Implemented (R1):** Rust `ProjectRoot`, `ProjectIndex`, `FileKind`, `blake3` (10 MB), `ExactQuery` via `rg` (`.context`/`target` handling via `ENGINE_INTERNAL_EXCLUDES`; `crates/` now indexed for structural).
+- **Implemented (R2):** Rust `QueryType` (`classify_query`), `extract_identifiers`, `RetrievalPlan` (exact/symbol/semantic/graph/test), `Evidence` typed, `authority` (18 weights, `is_true_definition`, `FileKind`), `fuse` (dedup, overlap collapse 2–4/file, doc quota ≤2), `packer` (`tiktoken-rs` `cl100k_base`, budget 10k, `packed_tokens`), `PipelineStats`, `candidate` provider (raw, no `authorityScore`).
+- **Implemented (R3):** Rust structural (`context-index::structural`):
+  - `Language` (Rust/Python/Go/TypeScript/JavaScript, detect via extension; TSX via TS grammar)
+  - `ParsedFile { file, language, content_hash, symbols, references, imports, chunks }`
+  - `Symbol { id (blake3 stable), name, qualified_name, kind, file, start/end_line/byte, visibility, parent }` with invariant: same file+qualified+kind → same id across body edits
+  - `SymbolKind` (Function/Method/Class/Struct/Enum/Trait/Interface/Module/Constant/Variable/TypeAlias/Field/Unknown)
+  - `Reference { name, file, line, parent_symbol, kind (Call/Read/Type/Import/Unknown) }`
+  - `Import { file, import_path, alias, line, is_relative }`
+  - `Chunk { id (blake3), file, language, start/end_line/byte, parent_symbol, content_hash, text_size_bytes }` — syntax-aware, per-symbol, hash for R4 vector reuse
+  - `CallEdge { caller_symbol_id, callee_name, resolved_symbol_id, confidence (Resolved/Probable/Unresolved), file, line }` — conservative, never lies
+  - Tree-sitter 0.25 + grammars: `tree-sitter-rust 0.24`, `python 0.25`, `go 0.25`, `typescript 0.23`, `javascript 0.25`
+  - `StructuralIndex` with persistent SQLite (`rusqlite` bundled) at `<repo>/.context/index/structural.db` (worktree-safe, per-worktree dir, `.context/.gitignore` prevents commit, WAL mode, foreign_keys)
+  - Schema v1: `schema_version`, `files (path, hash, language, size_bytes, parse_error)`, `symbols`, `imports`, `refs`, `chunks`, `call_edges` with indexes; version check with clear error for newer schema
+  - Incremental: `hash == DB hash → SKIP PARSE`; single changed file reparses only that file; deletion removes stale state atomically; rename → delete+add; transaction rollback on failure via `rusqlite` transaction
+  - Worktree-safe: `<repo>/.context/index/` per worktree; two worktrees don't share writable DB (tested)
+  - Native lookup APIs: `find_definitions`, `find_symbol_exact/prefix`, `find_references`, `find_callers/callees`, `find_tests_related` — normalize directly into `Evidence` with provenance `rust:symbol`, `rust:graph:resolved|probable|unresolved`, `rust:test`, `rust:exact-reference` fallback retained
+  - Pipeline: `symbol` and `graph` now `rust:*` (OCI symbol/graph no longer on production path; kept behind `#[allow(dead_code)]` for R4 shadow); `test` uses `rust:test` + `FileKind::Test` fallback; `semantic` remains `oci:semantic`
+  - Performance (Context-Engine, 141 files, 1033 symbols): initial 9.3s, no-change 0.95s, single-file 2.56s; lookups warm: symbol ~16ms, refs ~27ms, callers ~20ms
+  - No embeddings/tantivy/watcher yet (R4); no Node removal yet (R5)
+- **Current limitation (R3):** structural call graph is static/best-effort (dynamic Click/DI wiring falls back to `rust:exact`); semantic still OCI; no automatic filesystem watcher/queue (manual `ensure()` rebuild); no native vector index (R4); `crates/` indexed for Rust but `target/` still excluded
+- **Planned (R4-R5):** R4 `tantivy`/`ort`/`notify` (vector/BM25, embeddings, watcher), R5 remove Node/OCI, keep `v2/` as `reference/`.
 
 ## Process model
 

@@ -50,6 +50,7 @@ fn find_contextd_bin() -> PathBuf {
     panic!("cannot find contextd binary — run cargo build first");
 }
 
+#[allow(dead_code)]
 fn find_v2_bin() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
@@ -95,6 +96,7 @@ async fn spawn_contextd(
     Ok(client)
 }
 
+#[allow(dead_code)]
 async fn spawn_v2(
     project_root: &Path,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>> {
@@ -503,7 +505,11 @@ async fn rust_frozen_live_correctness() -> Result<()> {
         .await;
 
     let fixtures = vec![
-        ("symbol_lookup", json!({"symbol":"count_tokens"}), "core/utils.py"),
+        (
+            "symbol_lookup",
+            json!({"symbol":"count_tokens"}),
+            "core/utils.py",
+        ),
         (
             "context_search",
             json!({"query":"Where is secret redaction implemented?"}),
@@ -514,7 +520,11 @@ async fn rust_frozen_live_correctness() -> Result<()> {
             json!({"symbol":"bundle","direction":"callers"}),
             "cli.py",
         ),
-        ("test_lookup", json!({"query":"bundle generation"}), "test_bundle_integration.py"),
+        (
+            "test_lookup",
+            json!({"query":"bundle generation"}),
+            "test_bundle_integration.py",
+        ),
     ];
 
     for (tool, args, expected) in fixtures {

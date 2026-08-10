@@ -290,14 +290,28 @@ impl Contextd {
                     json!(idx.root.display().to_string()),
                 );
             }
-            // R2: routing/ranking backends
+            // R3: backends
             obj.insert("routingBackend".to_string(), json!("rust"));
             obj.insert("rankingBackend".to_string(), json!("rust"));
             obj.insert("packingBackend".to_string(), json!("rust"));
             obj.insert("exactBackend".to_string(), json!("rust-rg"));
             obj.insert("semanticBackend".to_string(), json!("v2-oci"));
-            obj.insert("symbolBackend".to_string(), json!("v2-oci"));
-            obj.insert("graphBackend".to_string(), json!("v2-oci"));
+            obj.insert("symbolBackend".to_string(), json!("rust"));
+            obj.insert("graphBackend".to_string(), json!("rust"));
+            obj.insert("structuralBackend".to_string(), json!("rust-tree-sitter"));
+            // structural stats if available
+            if let Ok(root) = context_index::ProjectRoot::resolve(None) {
+                let si = context_index::structural::StructuralIndex::new(&root);
+                if let Ok(cnt) = si.count_symbols() {
+                    obj.insert("structuralSymbols".to_string(), json!(cnt));
+                }
+                obj.insert(
+                    "structuralIndexPath".to_string(),
+                    json!(context_index::structural::store::index_db_path(root.path())
+                        .display()
+                        .to_string()),
+                );
+            }
         }
 
         Ok(CallToolResult::success(vec![

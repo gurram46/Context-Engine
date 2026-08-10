@@ -288,6 +288,7 @@ impl CandidateProvider {
         vec![]
     }
 
+    #[allow(dead_code)]
     pub async fn symbol_candidates(&self, symbol: &str) -> Result<Vec<Value>, ContextError> {
         let res = self
             .call_raw(
@@ -312,6 +313,7 @@ impl CandidateProvider {
         Ok(Self::extract_candidates_from_tool_result(res))
     }
 
+    #[allow(dead_code)]
     pub async fn graph_candidates(
         &self,
         symbol: &str,
@@ -336,16 +338,15 @@ impl CandidateProvider {
         Ok(Self::extract_candidates_from_tool_result(res))
     }
 
+    #[allow(dead_code)]
     pub async fn pid(&self) -> Option<u32> {
         self.child.lock().await.as_ref().and_then(|c| c.id())
     }
 
+    #[allow(dead_code)]
     pub async fn is_alive(&self) -> bool {
         if let Some(child) = self.child.lock().await.as_mut() {
-            match child.try_wait() {
-                Ok(None) => true,
-                _ => false,
-            }
+            matches!(child.try_wait(), Ok(None))
         } else {
             false
         }

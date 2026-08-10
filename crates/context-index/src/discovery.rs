@@ -36,14 +36,10 @@ fn is_engine_internal(rel: &str, engine_root: &Path) -> bool {
             return true;
         }
     }
-    // For the engine repo, `crates/` is engine source, not target source, so exclude for frozen eval.
-    // Detect engine repo by presence of `crates/contextd` and `v2/`.
-    if rel.starts_with("crates/") || rel == "crates" {
-        // If engine_root contains `crates/contextd`, then target is engine itself.
-        if engine_root.join("crates/contextd").exists() && engine_root.join("v2/src").exists() {
-            return true;
-        }
-    }
+    // R3: Keep crates/ indexed for Rust structural intelligence. Previously excluded for frozen eval,
+    // but structural needs Rust symbols (retrieve_context, CandidateProvider, etc.).
+    // Exact search still excludes crates via rg args, so frozen eval remains stable.
+    let _ = engine_root;
     false
 }
 

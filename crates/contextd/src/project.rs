@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use context_index::structural::StructuralIndex;
 use context_index::{ProjectIndex, ProjectRoot};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Cached project index for R1.
 /// Owns discovery, classification, hashing, and exact search.
@@ -21,21 +22,11 @@ impl ProjectCache {
     }
 
     /// Resolve current project root (env or cwd) and ensure index is built.
+    /// R3: always rediscover to detect new/deleted/changed files for structural index.
+    /// Structural build uses hash-based skip, so second build is cheap.
     pub async fn ensure(&self) -> Result<ProjectIndex, context_core::ContextError> {
-        // Fast path: if index exists and root hasn't changed, return clone.
-        // For R1, we clone the whole index (cheap, Vec<FileRecord> ~ few MB).
         let current_root = ProjectRoot::resolve(None)?;
-        {
-            let guard = self.root.read().await;
-            if let Some(cached_root) = guard.as_ref() {
-                if cached_root.path() == current_root.path() {
-                    if let Some(idx) = self.index.read().await.clone() {
-                        return Ok(idx);
-                    }
-                }
-            }
-        }
-        // Need rebuild
+        // Need rebuild — always rediscover for structural freshness (R3).
         let t0 = std::time::Instant::now();
         let idx = ProjectIndex::discover(&current_root)?;
         let elapsed = t0.elapsed();
@@ -47,6 +38,32 @@ impl ProjectCache {
             elapsed_ms = %elapsed.as_millis(),
             "project index built"
         );
+        // Build structural index incrementally (hash-based skip) — blocking, so spawn.
+        let root_clone = current_root.path().to_path_buf();
+        let idx_clone = idx.clone();
+        let structural_res = tokio::task::spawn_blocking(move || {
+            let si = StructuralIndex::for_path(root_clone);
+            si.build(&idx_clone)
+        })
+        .await;
+        match structural_res {
+            Ok(Ok(stats)) => {
+                info!(
+                    parsed = stats.files_parsed,
+                    skipped = stats.files_skipped,
+                    deleted = stats.files_deleted,
+                    symbols = stats.symbols,
+                    elapsed_ms = stats.elapsed_ms,
+                    "structural index built"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(error=%e, "structural index build failed, continuing with exact only");
+            }
+            Err(e) => {
+                warn!(error=%e, "structural index join failed");
+            }
+        }
         {
             let mut r = self.root.write().await;
             *r = Some(current_root);

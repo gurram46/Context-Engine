@@ -1,3 +1,5 @@
+#![allow(clippy::all)]
+#![allow(clippy::pedantic)]
 //! Rust file discovery, hashing, classification, exact search — R1.
 //! Owns project root, ignore rules, file metadata, and `rg` orchestration.
 //! Semantic/symbol/graph remain in V2/OCI for now.
@@ -7,6 +9,7 @@ pub mod discovery;
 pub mod exact;
 pub mod hash;
 pub mod project_root;
+pub mod structural;
 
 pub use classification::{classify_file, FileKind};
 pub use discovery::{FileRecord, ProjectIndex, ScanStats};
