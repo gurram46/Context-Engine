@@ -256,8 +256,8 @@ pub async fn exact_search(
             });
         }
 
-        // Wait for child with timeout
-        let status = tokio::time::timeout(Duration::from_millis(100), child.wait())
+        // Wait for child with timeout (rg should finish quickly after stdout closed)
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .map_err(|_| ContextError::Timeout("rg wait timeout".into()))?
             .map_err(|e| ContextError::Internal(format!("rg wait failed: {}", e)))?;
