@@ -24,6 +24,8 @@ const DEFAULT_IGNORES = [
   "coverage",
   ".next",
   ".nuxt",
+  "target",
+  "crates",
 ];
 
 function normalizeProjectRoot(root?: string): string {

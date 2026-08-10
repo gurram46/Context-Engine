@@ -1,0 +1,4 @@
+target/
+crates/
+.expo/
+.expo-shared/

@@ -42,10 +42,12 @@ fn resolve_v2_path() -> Result<PathBuf> {
             }
         }
     }
-    let manifest_cand =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../v2/dist/mcp/server.js");
-    if manifest_cand.exists() {
-        return Ok(manifest_cand.canonicalize().unwrap_or(manifest_cand));
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(ws) = manifest_dir.parent().and_then(|p| p.parent()) {
+        let manifest_cand = ws.join("v2/dist/mcp/server.js");
+        if manifest_cand.exists() {
+            return Ok(manifest_cand.canonicalize().unwrap_or(manifest_cand));
+        }
     }
     if let Ok(cwd) = std::env::current_dir() {
         let cand = cwd.join("v2/dist/mcp/server.js");
