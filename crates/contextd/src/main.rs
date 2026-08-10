@@ -1,11 +1,12 @@
 mod bridge;
-mod exact_shadow;
+mod pipeline;
 mod project;
 
 use bridge::V2Bridge;
 use context_core::{
     ContextSearchParams, DependencyTraceParams, SymbolLookupParams, TestLookupParams,
 };
+use pipeline::{retrieve_context, Providers};
 use project::ProjectCache;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -58,35 +59,49 @@ impl Contextd {
         if params.query.trim().is_empty() {
             return Err(McpError::invalid_params("query is required", None));
         }
-        let args = json!({
-            "query": params.query,
-            "budgetTokens": params.budgetTokens,
-            "maxResults": params.maxResults,
-            "debug": params.debug,
-        });
-        // Ensure project index (for shadow) — failures are non-fatal for R1
-        let project = self.project_cache.ensure().await.ok();
-        let v = self
-            .bridge
-            .call_json("context_search", args)
+        let project = self
+            .project_cache
+            .ensure()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        // Shadow mode: compare Rust exact vs V2 exact (non-EXACT queries still run shadow for metrics)
-        if let Some(idx) = project {
-            let v_evidence = v
-                .get("evidence")
-                .and_then(|e| e.as_array())
-                .cloned()
-                .unwrap_or_default();
-            // Run shadow in background (don't block response)
-            let q = params.query.clone();
-            tokio::spawn(async move {
-                let _ = exact_shadow::shadow_exact(&idx, &q, &v_evidence).await;
-            });
-        }
+        let providers = Providers {
+            v2: self.bridge.clone(),
+        };
+        let res = retrieve_context(
+            &params.query,
+            &project,
+            &providers,
+            params.budgetTokens.unwrap_or(10000) as usize,
+            params.maxResults.unwrap_or(10) as usize,
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let out = serde_json::json!({
+            "query": res.query,
+            "type": res.query_type.as_str(),
+            "context": res.packed.markdown,
+            "evidence": res.evidence.iter().map(|e| serde_json::json!({
+                "file": e.file,
+                "lines": e.start_line.map(|s| format!("{}-{}", s, e.end_line.unwrap_or(s))).unwrap_or_default(),
+                "symbol": e.symbol,
+                "relation": e.relation.map(|r| r.as_str()),
+                "source": e.source.as_str(),
+                "score": e.score,
+                "authorityScore": e.authority_score,
+                "finalScore": e.final_score,
+            })).collect::<Vec<_>>(),
+            "stats": {
+                "candidate_count": res.stats.candidate_count,
+                "evidence_count": res.stats.evidence_count,
+                "files_returned": res.stats.files_returned,
+                "packed_tokens": res.stats.packed_tokens,
+                "retrievers": res.stats.retrievers_used,
+                "elapsed_ms": res.stats.elapsed_ms,
+            }
+        });
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(
-                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+                serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()),
             ),
         ]))
     }
@@ -99,31 +114,39 @@ impl Contextd {
         if params.symbol.trim().is_empty() {
             return Err(McpError::invalid_params("symbol is required", None));
         }
-        let args = json!({
-            "symbol": params.symbol,
-            "budgetTokens": params.budgetTokens,
-            "debug": params.debug,
-        });
-        let project = self.project_cache.ensure().await.ok();
-        let v = self
-            .bridge
-            .call_json("symbol_lookup", args)
+        let project = self
+            .project_cache
+            .ensure()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        if let Some(idx) = project {
-            let v_evidence = v
-                .get("evidence")
-                .and_then(|e| e.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let sym = params.symbol.clone();
-            tokio::spawn(async move {
-                let _ = exact_shadow::shadow_exact(&idx, &sym, &v_evidence).await;
-            });
-        }
+        let providers = Providers {
+            v2: self.bridge.clone(),
+        };
+        let res = retrieve_context(
+            &params.symbol,
+            &project,
+            &providers,
+            params.budgetTokens.unwrap_or(10000) as usize,
+            10,
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let out = serde_json::json!({
+            "query": res.query,
+            "type": res.query_type.as_str(),
+            "context": res.packed.markdown,
+            "evidence": res.evidence.iter().map(|e| serde_json::json!({
+                "file": e.file,
+                "symbol": e.symbol,
+                "relation": e.relation.map(|r| r.as_str()),
+                "source": e.source.as_str(),
+                "finalScore": e.final_score,
+            })).collect::<Vec<_>>(),
+            "stats": res.stats,
+        });
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(
-                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+                serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()),
             ),
         ]))
     }
@@ -145,32 +168,38 @@ impl Contextd {
                 None,
             ));
         }
-        let args = json!({
-            "symbol": params.symbol,
-            "direction": dir,
-            "budgetTokens": params.budgetTokens,
-            "debug": params.debug,
-        });
-        let project = self.project_cache.ensure().await.ok();
-        let v = self
-            .bridge
-            .call_json("dependency_trace", args)
+        let project = self
+            .project_cache
+            .ensure()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        if let Some(idx) = project {
-            let v_evidence = v
-                .get("evidence")
-                .and_then(|e| e.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let sym = params.symbol.clone();
-            tokio::spawn(async move {
-                let _ = exact_shadow::shadow_exact(&idx, &sym, &v_evidence).await;
-            });
-        }
+        let providers = Providers {
+            v2: self.bridge.clone(),
+        };
+        let query = match dir.as_str() {
+            "callers" => format!("What calls {}?", params.symbol),
+            "callees" => format!("What does {} call?", params.symbol),
+            _ => format!("dependency of {}", params.symbol),
+        };
+        let res = retrieve_context(
+            &query,
+            &project,
+            &providers,
+            params.budgetTokens.unwrap_or(10000) as usize,
+            10,
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let out = serde_json::json!({
+            "query": res.query,
+            "type": res.query_type.as_str(),
+            "context": res.packed.markdown,
+            "evidence": res.evidence,
+            "stats": res.stats,
+        });
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(
-                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+                serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()),
             ),
         ]))
     }
@@ -183,31 +212,38 @@ impl Contextd {
         if params.query.trim().is_empty() {
             return Err(McpError::invalid_params("query is required", None));
         }
-        let args = json!({
-            "query": params.query,
-            "budgetTokens": params.budgetTokens,
-            "debug": params.debug,
-        });
-        let project = self.project_cache.ensure().await.ok();
-        let v = self
-            .bridge
-            .call_json("test_lookup", args)
+        let project = self
+            .project_cache
+            .ensure()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        if let Some(idx) = project {
-            let v_evidence = v
-                .get("evidence")
-                .and_then(|e| e.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let q = params.query.clone();
-            tokio::spawn(async move {
-                let _ = exact_shadow::shadow_exact(&idx, &q, &v_evidence).await;
-            });
-        }
+        let providers = Providers {
+            v2: self.bridge.clone(),
+        };
+        let q = if params.query.to_lowercase().contains("test") {
+            params.query.clone()
+        } else {
+            format!("What tests cover {}?", params.query)
+        };
+        let res = retrieve_context(
+            &q,
+            &project,
+            &providers,
+            params.budgetTokens.unwrap_or(10000) as usize,
+            10,
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let out = serde_json::json!({
+            "query": res.query,
+            "type": res.query_type.as_str(),
+            "context": res.packed.markdown,
+            "evidence": res.evidence,
+            "stats": res.stats,
+        });
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(
-                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+                serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()),
             ),
         ]))
     }
@@ -231,7 +267,7 @@ impl Contextd {
             obj.insert("rustVersion".to_string(), json!(env!("CARGO_PKG_VERSION")));
             obj.insert("pid".to_string(), json!(std::process::id()));
             obj.insert("projectRoot".to_string(), json!(project_root));
-            // R1: add Rust discovery stats if available
+            // R1/R2: Rust discovery stats
             if let Ok(idx) = self.project_cache.ensure().await {
                 obj.insert(
                     "rustDiscoveredFiles".to_string(),
@@ -243,6 +279,14 @@ impl Contextd {
                     json!(idx.root.display().to_string()),
                 );
             }
+            // R2: routing/ranking backends
+            obj.insert("routingBackend".to_string(), json!("rust"));
+            obj.insert("rankingBackend".to_string(), json!("rust"));
+            obj.insert("packingBackend".to_string(), json!("rust"));
+            obj.insert("exactBackend".to_string(), json!("rust-rg"));
+            obj.insert("semanticBackend".to_string(), json!("v2-oci"));
+            obj.insert("symbolBackend".to_string(), json!("v2-oci"));
+            obj.insert("graphBackend".to_string(), json!("v2-oci"));
         }
 
         Ok(CallToolResult::success(vec![

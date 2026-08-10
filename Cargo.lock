@@ -207,6 +207,7 @@ dependencies = [
  "anyhow",
  "context-core",
  "context-index",
+ "context-rank",
  "rmcp",
  "schemars",
  "serde",

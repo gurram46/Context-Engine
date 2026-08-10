@@ -34,7 +34,7 @@ impl Default for PackOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PackedResult {
     pub markdown: String,
     pub token_estimate: usize,
