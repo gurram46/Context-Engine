@@ -1,0 +1,19 @@
+[package]
+name = "context-rank"
+version = "0.1.0"
+edition = "2021"
+description = "Rust query classification, routing, authority, fusion, packing — R2"
+license = "MIT"
+
+[dependencies]
+context-core = { path = "../context-core" }
+context-index = { path = "../context-index" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+schemars = { workspace = true }
+tiktoken-rs = { workspace = true }
+regex = { workspace = true }
