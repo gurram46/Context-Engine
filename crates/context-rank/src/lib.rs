@@ -1,12 +1,3 @@
-#![allow(
-    clippy::explicit_counter_loop,
-    clippy::needless_borrow,
-    clippy::if_same_then_else,
-    clippy::regex_creation_in_loops,
-    clippy::collapsible_else_if,
-    clippy::useless_format
-)]
-
 pub mod authority;
 pub mod classify;
 pub mod fuse;

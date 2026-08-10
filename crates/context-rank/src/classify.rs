@@ -1,6 +1,15 @@
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::types::{ClassifiedQuery, QueryType};
+
+static DOCKERFILE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(Dockerfile|Makefile|Procfile|Justfile|Brewfile|Gemfile|Rakefile|go\.mod|go\.sum)$",
+    )
+    .unwrap()
+});
+static EXT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\.[a-z0-9]{1,5}$").unwrap());
 
 pub fn classify_query(raw: &str) -> ClassifiedQuery {
     let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -223,12 +232,7 @@ fn has_filename(q: &str) -> bool {
         if clean.is_empty() {
             continue;
         }
-        if Regex::new(
-            r"^(Dockerfile|Makefile|Procfile|Justfile|Brewfile|Gemfile|Rakefile|go\.mod|go\.sum)$",
-        )
-        .unwrap()
-        .is_match(&clean)
-        {
+        if DOCKERFILE_RE.is_match(&clean) {
             return true;
         }
         let ext = std::path::Path::new(&clean)
@@ -250,9 +254,7 @@ fn has_filename(q: &str) -> bool {
             if clean.contains('.')
                 && clean.len() < 40
                 && !clean.contains(' ')
-                && Regex::new(r"\.[a-z0-9]{1,5}$")
-                    .unwrap()
-                    .is_match(&clean.to_lowercase())
+                && EXT_RE.is_match(&clean.to_lowercase())
             {
                 return true;
             }

@@ -47,11 +47,11 @@ pub async fn retrieve_context(
     let mut candidates: Vec<Evidence> = Vec::new();
     let mut retrievers_used = Vec::new();
 
-    // Rust exact
+    // Rust exact — larger budget for bundle-like queries that hit many docs
     for eq in &plan.exact_queries {
         let t = Instant::now();
         let opts = ExactSearchOptions {
-            max_results: 20,
+            max_results: 50,
             ..Default::default()
         };
         let res = exact_search(project, eq.clone(), opts)

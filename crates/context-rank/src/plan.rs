@@ -44,19 +44,9 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
             }
         }
         QueryType::Symbol => {
-            let mut ordered = ids.clone();
-            if raw.to_lowercase().contains("bundle") {
-                ordered = vec!["bundle".to_string(), "_manual_fixed_bundle".to_string()]
-                    .into_iter()
-                    .chain(
-                        ids.into_iter()
-                            .filter(|id| id != "bundle" && id != "_manual_fixed_bundle"),
-                    )
-                    .collect();
-            }
-            symbol_queries = ordered.clone();
+            symbol_queries = ids.clone();
             // Also exact verify for symbol
-            if let Some(first) = ordered.first() {
+            if let Some(first) = ids.first() {
                 exact_queries.push(ExactQuery::Literal(first.clone()));
             }
         }
@@ -83,6 +73,13 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
             for id in ids.iter().take(2) {
                 test_queries.push(id.clone());
                 exact_queries.push(ExactQuery::Literal(id.clone()));
+                // Generic test file variant: test_<id>
+                let snake = to_snake_case(id);
+                if snake != *id {
+                    exact_queries.push(ExactQuery::Literal(format!("test_{}", snake)));
+                } else {
+                    exact_queries.push(ExactQuery::Literal(format!("test_{}", id.to_lowercase())));
+                }
             }
         }
         QueryType::Conceptual => {
@@ -95,18 +92,8 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
         }
         QueryType::Mixed => {
             semantic_queries.push(raw.to_string());
-            let mut ordered = ids.clone();
-            if raw.to_lowercase().contains("bundle") {
-                ordered = vec!["bundle".to_string(), "_manual_fixed_bundle".to_string()]
-                    .into_iter()
-                    .chain(
-                        ids.into_iter()
-                            .filter(|id| id != "bundle" && id != "_manual_fixed_bundle"),
-                    )
-                    .collect();
-            }
-            symbol_queries = ordered.clone();
-            for id in ordered.iter().take(3) {
+            symbol_queries = ids.clone();
+            for id in ids.iter().take(3) {
                 exact_queries.push(ExactQuery::Literal(id.clone()));
             }
             // Path-like
@@ -115,10 +102,6 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
                 .find(raw)
             {
                 exact_queries.push(ExactQuery::Path(m.as_str().to_string()));
-            }
-            if raw.to_lowercase().contains("bundle") {
-                semantic_queries.push("bundle generation bundle_command".to_string());
-                symbol_queries.push("_manual_fixed_bundle".to_string());
             }
         }
     }
@@ -131,6 +114,21 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
         graph_queries,
         test_queries,
     }
+}
+
+fn to_snake_case(s: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

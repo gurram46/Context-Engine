@@ -62,7 +62,6 @@ pub fn pack_evidence(
 
     let mut total_tokens = count_tokens(&lines.join("\n"));
     let mut files = Vec::new();
-    let mut added = 0;
 
     // Deterministic order: sort files by first evidence final_score
     let mut file_order: Vec<(String, Vec<Evidence>)> = by_file.into_iter().collect();
@@ -80,10 +79,7 @@ pub fn pack_evidence(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    for (file, mut items) in file_order {
-        if added >= max_files {
-            break;
-        }
+    for (file, mut items) in file_order.into_iter().take(max_files) {
         items.sort_by_key(|e| e.start_line.unwrap_or(0));
         let ranges = items
             .iter()
@@ -162,7 +158,6 @@ pub fn pack_evidence(
         lines.push(chunk);
         total_tokens += chunk_tokens;
         files.push(file);
-        added += 1;
     }
 
     let markdown = lines.join("\n");

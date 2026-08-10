@@ -254,18 +254,48 @@ impl CandidateProvider {
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    fn extract_candidates_from_tool_result(res: Value) -> Vec<Value> {
+        // res is CallToolResult { content: [{ type: "text", text: "{\"candidates\": [...]}" }], ... }
+        // Try direct {candidates} first (for backwards compat), then parse content[0].text
+        if let Some(arr) = res.get("candidates").and_then(|v| v.as_array()) {
+            return arr.clone();
+        }
+        if let Some(arr) = res.as_array() {
+            return arr.clone();
+        }
+        if let Some(content) = res.get("content").and_then(|v| v.as_array()) {
+            for item in content {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                        if let Some(arr) = parsed.get("candidates").and_then(|v| v.as_array()) {
+                            return arr.clone();
+                        }
+                        if let Some(arr) = parsed.as_array() {
+                            return arr.clone();
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: if result is object with text field
+        if let Some(text) = res.get("text").and_then(|t| t.as_str()) {
+            if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                if let Some(arr) = parsed.get("candidates").and_then(|v| v.as_array()) {
+                    return arr.clone();
+                }
+            }
+        }
+        vec![]
+    }
+
     pub async fn symbol_candidates(&self, symbol: &str) -> Result<Vec<Value>, ContextError> {
         let res = self
-            .call_raw("symbol_candidates", serde_json::json!({ "symbol": symbol }))
+            .call_raw(
+                "tools/call",
+                serde_json::json!({ "name": "symbol_candidates", "arguments": { "symbol": symbol } }),
+            )
             .await?;
-        // Expect { candidates: [...] }
-        if let Some(arr) = res.get("candidates").and_then(|v| v.as_array()) {
-            Ok(arr.clone())
-        } else if let Some(arr) = res.as_array() {
-            Ok(arr.clone())
-        } else {
-            Ok(vec![])
-        }
+        Ok(Self::extract_candidates_from_tool_result(res))
     }
 
     pub async fn semantic_candidates(
@@ -275,17 +305,11 @@ impl CandidateProvider {
     ) -> Result<Vec<Value>, ContextError> {
         let res = self
             .call_raw(
-                "semantic_candidates",
-                serde_json::json!({ "query": query, "limit": limit }),
+                "tools/call",
+                serde_json::json!({ "name": "semantic_candidates", "arguments": { "query": query, "limit": limit } }),
             )
             .await?;
-        if let Some(arr) = res.get("candidates").and_then(|v| v.as_array()) {
-            Ok(arr.clone())
-        } else if let Some(arr) = res.as_array() {
-            Ok(arr.clone())
-        } else {
-            Ok(vec![])
-        }
+        Ok(Self::extract_candidates_from_tool_result(res))
     }
 
     pub async fn graph_candidates(
@@ -295,29 +319,35 @@ impl CandidateProvider {
     ) -> Result<Vec<Value>, ContextError> {
         let res = self
             .call_raw(
-                "graph_candidates",
-                serde_json::json!({ "symbol": symbol, "direction": direction }),
+                "tools/call",
+                serde_json::json!({ "name": "graph_candidates", "arguments": { "symbol": symbol, "direction": direction } }),
             )
             .await?;
-        if let Some(arr) = res.get("candidates").and_then(|v| v.as_array()) {
-            Ok(arr.clone())
-        } else if let Some(arr) = res.as_array() {
-            Ok(arr.clone())
-        } else {
-            Ok(vec![])
-        }
+        Ok(Self::extract_candidates_from_tool_result(res))
     }
 
     pub async fn test_candidates(&self, query: &str) -> Result<Vec<Value>, ContextError> {
         let res = self
-            .call_raw("test_candidates", serde_json::json!({ "query": query }))
+            .call_raw(
+                "tools/call",
+                serde_json::json!({ "name": "test_candidates", "arguments": { "query": query } }),
+            )
             .await?;
-        if let Some(arr) = res.get("candidates").and_then(|v| v.as_array()) {
-            Ok(arr.clone())
-        } else if let Some(arr) = res.as_array() {
-            Ok(arr.clone())
+        Ok(Self::extract_candidates_from_tool_result(res))
+    }
+
+    pub async fn pid(&self) -> Option<u32> {
+        self.child.lock().await.as_ref().and_then(|c| c.id())
+    }
+
+    pub async fn is_alive(&self) -> bool {
+        if let Some(child) = self.child.lock().await.as_mut() {
+            match child.try_wait() {
+                Ok(None) => true,
+                _ => false,
+            }
         } else {
-            Ok(vec![])
+            false
         }
     }
 
@@ -326,6 +356,7 @@ impl CandidateProvider {
         let mut guard = self.child.lock().await;
         if let Some(mut child) = guard.take() {
             let _ = child.kill().await;
+            let _ = child.wait().await;
         }
     }
 }

@@ -1,10 +1,24 @@
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+static IDENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*(?:[.:]{1,2}[A-Za-z_][A-Za-z0-9_]*)*\b").unwrap()
+});
+static SCREAMING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Z]+_[A-Z0-9_]+$").unwrap());
+static CAMEL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z]+[A-Z][a-zA-Z0-9]*$").unwrap());
+static PASCAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Z][a-z]+(?:[A-Z][a-z0-9]*)+$").unwrap());
+static PASCAL_RE2: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Z][a-z0-9]*[A-Z][a-zA-Z0-9]*$").unwrap());
+static LOWER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z]{3,}$").unwrap());
 
 /// Extract identifiers from query, deterministic.
 /// Supports snake, camel, Pascal, SCREAMING, qualified.
 pub fn extract_identifiers(q: &str) -> Vec<String> {
-    let re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*(?:[.:]{1,2}[A-Za-z_][A-Za-z0-9_]*)*\b").unwrap();
+    let re = &*IDENT_RE;
     let mut raw_ids: Vec<String> = Vec::new();
     for m in re.find_iter(q) {
         let tok = m.as_str().to_string();
@@ -62,25 +76,17 @@ pub fn extract_identifiers(q: &str) -> Vec<String> {
             continue;
         }
         let is_snake = t.contains('_');
-        let is_screaming = Regex::new(r"^[A-Z]+_[A-Z0-9_]+$").unwrap().is_match(&t);
-        let is_camel = Regex::new(r"^[a-z]+[A-Z][a-zA-Z0-9]*$")
-            .unwrap()
-            .is_match(&t);
-        let is_pascal = Regex::new(r"^[A-Z][a-z]+(?:[A-Z][a-z0-9]*)+$")
-            .unwrap()
-            .is_match(&t)
-            || Regex::new(r"^[A-Z][a-z0-9]*[A-Z][a-zA-Z0-9]*$")
-                .unwrap()
-                .is_match(&t);
+        let is_screaming = SCREAMING_RE.is_match(&t);
+        let is_camel = CAMEL_RE.is_match(&t);
+        let is_pascal = PASCAL_RE.is_match(&t) || PASCAL_RE2.is_match(&t);
         let is_qualified = t.contains('.') || t.contains("::");
-        let is_lower_generic =
-            Regex::new(r"^[a-z]{3,}$").unwrap().is_match(&low) && !stop.contains(low.as_str());
+        let is_lower_generic = LOWER_RE.is_match(&low) && !stop.contains(low.as_str());
         if is_snake || is_screaming || is_camel || is_pascal || is_qualified || is_lower_generic {
             filtered.push(t);
         }
     }
 
-    // Dedup case-insensitive, keep first, prefer snake and Pascal
+    // Dedup case-insensitive, keep first, prefer snake and lower over Pascal
     let mut seen: HashMap<String, String> = HashMap::new();
     for t in filtered {
         let k = t.to_lowercase();
@@ -88,9 +94,9 @@ pub fn extract_identifiers(q: &str) -> Vec<String> {
             seen.insert(k, t);
         } else {
             let prev = seen.get(&k).unwrap().clone();
-            if t.contains('_') && !prev.contains('_') {
-                seen.insert(k, t);
-            } else if t == t.to_lowercase() && prev != prev.to_lowercase() {
+            let prefer_snake = t.contains('_') && !prev.contains('_');
+            let prefer_lower = t == t.to_lowercase() && prev != prev.to_lowercase();
+            if prefer_snake || prefer_lower {
                 seen.insert(k, t);
             }
         }

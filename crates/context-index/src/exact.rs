@@ -304,7 +304,12 @@ fn to_relative_posix(file_raw: &str, root: &Path) -> String {
     } else {
         p.to_path_buf()
     };
-    rel.to_string_lossy().replace('\\', "/")
+    let mut s = rel.to_string_lossy().replace('\\', "/");
+    // rg returns ./path when invoked with "." — strip leading ./ for parity with v2
+    while s.starts_with("./") || s.starts_with(".\\") {
+        s = s[2..].to_string();
+    }
+    s
 }
 
 #[cfg(test)]

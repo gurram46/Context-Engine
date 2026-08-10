@@ -1,9 +1,17 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use crate::authority::apply_authority;
 use crate::types::{Evidence, QueryType};
 use context_index::classify_file;
 use std::path::Path;
+
+static WANTS_IMPL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"implemented|generation|bundle|logic|validation|handler|router|service|enforced|ontology|pipeline|wired|scoring|delivery|isolation").unwrap()
+});
+static WANTS_DOC_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"documented|explain the architecture|docs|documentation").unwrap()
+});
 
 fn normalize_path(p: &str) -> String {
     p.replace('\\', "/").trim_start_matches("./").to_lowercase()
@@ -47,7 +55,7 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
 
     // 1. Authority
     let mut scored = apply_authority(evidence, opts.query_type, &opts.raw_query);
-    // 2. Sort by final_score desc, then score
+    // 2. Sort by final_score desc, then score, then file for determinism (stable)
     scored.sort_by(|a, b| {
         b.final_score
             .partial_cmp(&a.final_score)
@@ -57,10 +65,11 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            .then_with(|| a.file.cmp(&b.file))
     });
 
-    // 3. Dedup
-    let mut seen: HashMap<String, Evidence> = HashMap::new();
+    // 3. Dedup (deterministic via BTreeMap)
+    let mut seen: BTreeMap<String, Evidence> = BTreeMap::new();
     let mut deduped = 0;
     for e in scored {
         let key = format!(
@@ -82,8 +91,8 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
     }
     let deduped_list: Vec<Evidence> = seen.into_values().collect();
 
-    // 4. Collapse per file
-    let mut by_file: HashMap<String, Vec<Evidence>> = HashMap::new();
+    // 4. Collapse per file (deterministic via BTreeMap)
+    let mut by_file: BTreeMap<String, Vec<Evidence>> = BTreeMap::new();
     for e in deduped_list {
         let f = normalize_path(&e.file);
         by_file.entry(f).or_default().push(e);
@@ -105,9 +114,7 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
                 let kept_has_def = kept
                     .iter()
                     .any(|k| k.relation == Some(crate::types::EvidenceRelation::Definition));
-                if is_def && !kept_has_def {
-                    kept.push(e);
-                } else if kept.len() < 2 {
+                if (is_def && !kept_has_def) || kept.len() < 2 {
                     kept.push(e);
                 } else {
                     collapsed += 1;
@@ -136,6 +143,7 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
         b.final_score
             .partial_cmp(&a.final_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
     });
 
     // 5. Doc quota
@@ -144,12 +152,8 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
         opts.query_type,
         QueryType::Symbol | QueryType::Dependency | QueryType::Mixed
     ) || (opts.query_type == QueryType::Conceptual
-        && regex::Regex::new(r"implemented|generation|bundle|logic|validation|handler|router|service|enforced|ontology|pipeline|wired|scoring|delivery|isolation")
-            .unwrap()
-            .is_match(&lower_query));
-    let wants_doc = regex::Regex::new(r"documented|explain the architecture|docs|documentation")
-        .unwrap()
-        .is_match(&lower_query);
+        && WANTS_IMPL_RE.is_match(&lower_query));
+    let wants_doc = WANTS_DOC_RE.is_match(&lower_query);
     if wants_impl && !wants_doc {
         let mut doc_count = 0;
         let mut balanced = Vec::new();
@@ -169,6 +173,7 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
             b.final_score
                 .partial_cmp(&a.final_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.file.cmp(&b.file))
         });
     }
 
