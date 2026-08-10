@@ -1,29 +1,37 @@
 # contextd — Rust backend for Context Engine
 
-**Status:** R1 implemented — Rust owns file discovery, hashing, classification, exact search; `contextd.exe` is the backend; Zed / Codex / OpenCode are frontends. R0 shell verified.
+**Status:** R2 implemented — Rust owns file discovery, hashing, classification, exact search, query classification, routing, authority ranking, fusion, packing; `contextd.exe` is the backend; Zed / Codex / OpenCode are frontends. R0 shell and R1 `context-index` verified.
 
-## Current architecture (R1)
+## Current architecture (R2)
 
 ```
 Zed / Codex / OpenCode
         │  MCP stdio JSON-RPC (rmcp)
         ▼
    contextd.exe (Rust, tokio, rmcp server)
-        ├── ProjectCache (Rust) ──► ProjectIndex ──► discovery (ignore) ──► classification ──► hash (blake3) ──► exact_search (rg)
-        │                              │                         │
-        │                              ▼                         ▼
-        │                         V2/OCI TEMPORARY          Rust exact
-        │                         semantic/symbols/graph      (shadow + direct for EXACT)
-        │                              │                         │
-        └───────────┬──────────────────┘
-                    ▼
-               V2 ranking (temporary)
+        ├── ProjectCache (Rust) ──► ProjectIndex ──► discovery (ignore) ──► classification ──► hash (blake3)
+        │                              │
+        │                         classify / route (context-rank)
+        │                              │
+        │              ┌───────────────┴───────────────┐
+        │              ▼                               ▼
+        │         Rust exact (rg)          OCI raw candidates (candidateProvider.js)
+        │              │                     semantic / symbol / graph / test
+        │              └───────────┬───────────────────┘
+        │                          ▼
+        │                    Rust authority → Rust fuse → Rust pack (tiktoken)
+        │                          │
+        │                          ▼
+        │                         MCP
+        │
+        └── V2/OCI TEMP (candidateProvider.js) — NOT final ranking
 ```
 
 - **Implemented (R0):** Rust MCP contract, 5 tools, project-root forwarding, one persistent V2 child, graceful shutdown, single restart, tracing to stderr.
-- **Implemented (R1):** Rust `ProjectRoot` (canonical, env `CONTEXT_ENGINE_PROJECT_ROOT`), `ProjectIndex` (discovery via `ignore` crate, `FileKind` via extension, `blake3` streaming, 10 MB limit, `is_text_searchable`), `ExactQuery`/`ExactEvidence` via `rg` subprocess (literal/regex/identifier/filename/path, `tokio::process::Command`, bounded, `MAX_SEARCH_FILE_BYTES` 10 MB, `rg_available` check), filename/path <10ms, literal <100ms, `crates/`+`target/` handling via `ENGINE_INTERNAL_EXCLUDES` vs `TARGET_REPOSITORY_SEARCH_POLICY`.
-- **Current limitation (R1):** semantic/symbol/graph, router, ranking, fusion, packing still in V2/OCI. No `tantivy`, no `notify` watcher, no `usearch`, no `tree-sitter` yet.
-- **Planned (R2-R5):** R2 port `classifyQuery/router/authority/fuse`, R3 `context-store` (`rusqlite`, `tree-sitter`, `usearch` mmap), R4 vector/BM25 (`tantivy`, `ort` CodeRankEmbed, `notify`), R5 remove Node.
+- **Implemented (R1):** Rust `ProjectRoot`, `ProjectIndex`, `FileKind`, `blake3` (10 MB), `ExactQuery` via `rg` (`crates`/`target` handling via `ENGINE_INTERNAL_EXCLUDES`).
+- **Implemented (R2):** Rust `QueryType` (`classify_query`), `extract_identifiers`, `RetrievalPlan` (exact/symbol/semantic/graph/test), `Evidence` typed, `authority` (18 weights, `is_true_definition`, `FileKind`), `fuse` (dedup, overlap collapse 2–4/file, doc quota ≤2), `packer` (`tiktoken-rs` `cl100k_base`, budget 10k, `packed_tokens`), `PipelineStats` (`candidate_count`, `evidence_count`, `files_returned`, `packed_tokens`, `retrievers_used`, `elapsed_ms`), `candidate` provider (`symbol_candidates` via `implementation_lookup`, `semantic` via `peek`, `graph` via `call_graph`, all raw, no `authorityScore`).
+- **Current limitation (R2):** semantic/symbol/graph still via OCI (`candidateProvider.js` temporary), no `tree-sitter`/`usearch`/`tantivy`/`ort`/`notify`/`SQLite` yet.
+- **Planned (R3-R5):** R3 `context-store` (`rusqlite`, `tree-sitter`, `usearch` mmap), R4 `tantivy`/`ort`/`notify`, R5 remove Node.
 
 ## Process model
 
@@ -44,11 +52,13 @@ Zed / Codex / OpenCode
 
 Schemas are generated via `schemars` from `context-core` types and match V2 exactly (order may differ, required fields identical).
 
-## V2 compatibility bridge
+## V2 compatibility bridge (R2: raw candidate provider)
 
-- Location resolution order: `CONTEXTD_V2_PATH` env → exe-relative `v2/dist/mcp/server.js` → `CARGO_MANIFEST_DIR/../../v2/dist/mcp/server.js` → `cwd/v2/dist/mcp/server.js`.
-- Delegation: each Rust tool handler builds the same JSON arguments as V2 and calls `V2Bridge::call_json(name, args)`, which forwards via `TokioChildProcess` RMCP client `call_tool`. The V2 JSON string inside `CallToolResult` content is parsed and re-emitted as `CallToolResult::success(vec![ContentBlock::text(pretty_json)])`.
-- Error mapping: `ContextError::InvalidParams` → `McpError::invalid_params`, `ChildStart/ChildExited` → `internal_error`. No panics in request path.
+- **Candidate provider:** `v2/dist/candidateProvider.js` (new, internal, not exposed to Zed) — Node `StdioServer` with tools `symbol_candidates` (`implementation_lookup`), `semantic_candidates` (`codebase_peek`), `graph_candidates` (`call_graph`), `test_candidates` (`codebase_peek` filtered), `index_status`. Directly wraps `codeIndexClient` (`open-codebase-index` MCP) and returns `{candidates: Evidence[]}` raw (no `authorityScore`/`finalScore`/`packed`).
+- **V2 MCP (`v2/dist/mcp/server.js`)** still used for `context_status` only; **not** for `context_search`/`symbol_lookup`/`dependency_trace`/`test_lookup` final ranking. Rust `pipeline.rs` owns those via `candidateProvider` + Rust `exact` + Rust `authority`/`fuse`/`packer`.
+- Location: `CONTEXTD_V2_PATH` → exe-relative `v2/dist/candidateProvider.js` → `CARGO_MANIFEST_DIR/../../v2/dist/candidateProvider.js` → `cwd`.
+- `CandidateProvider` (`crates/contextd/src/candidate.rs`) — `TokioChildProcess` with `pending: Arc<Mutex<HashMap>>`, `current_root` check (respawn on `CONTEXT_ENGINE_PROJECT_ROOT` change), `initialize` handshake, `call_raw` with `timeout 15s`, single restart, `shutdown` kills child. Logs to `stderr`.
+- Production path: `classify` → `plan` → `Rust exact (rg)` + `OCI raw` → `Rust authority` → `Rust fuse` → `Rust pack` → `MCP`. No double-ranking.
 
 ## Project-root behavior
 
@@ -58,8 +68,8 @@ Schemas are generated via `schemars` from `context-core` types and match V2 exac
 ## R0 → R5 direction
 
 - R0: shell + bridge (done, `a91abac`).
-- **R1: `context-index` with `ignore` + `blake3` + `rg` (done, this doc).** Keeps Node semantic/symbol/graph, adds Rust exact + shadow.
-- R2: port `classifyQuery/router/authority/fuse/evidencePacker` → `context-rank`.
+- R1: `context-index` with `ignore` + `blake3` + `rg` (done, `386cf3e`).
+- **R2: `context-rank` with `classify`/`identifiers`/`plan`/`authority`/`fuse`/`packer` (done, this doc, `fbd437c`+`0640d22`).** `candidateProvider.js` temporary.
 - R3: `context-store` (`rusqlite`, `tree-sitter` symbols, `usearch` mmap read).
 - R4: vector/BM25 (`usearch` HNSW, `tantivy`, `ort` CodeRankEmbed, `notify`).
 - R5: remove Node/OCI, keep `v2/` as `reference/` for behavioral tests.
