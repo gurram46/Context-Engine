@@ -12,6 +12,7 @@ use crate::project_root::ProjectRoot;
 /// These are build/cache dirs, not user source.
 const ENGINE_INTERNAL_EXCLUDES: &[&str] = &[
     ".git",
+    ".context",
     ".opencode/index",
     "node_modules",
     "dist",

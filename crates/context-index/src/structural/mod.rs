@@ -54,6 +54,7 @@ impl StructuralIndex {
         Self { root, db_path }
     }
 
+    #[allow(clippy::doc_lazy_continuation)]
     /// Initial or incremental build.
     /// - For every structurally supported file (Language != Unknown), check hash vs DB.
     ///   * hash equal → SKIP PARSE
@@ -65,11 +66,11 @@ impl StructuralIndex {
     pub fn build(&self, project: &ProjectIndex) -> Result<IndexStats> {
         let t0 = Instant::now();
         let mut conn = store::open_db(&self.root)?;
-        let mut stats = IndexStats::default();
-
-        // Use direct structural walk (includes crates) merged with ProjectIndex for hashes
         let structural_files = collect_structural_files(&self.root, project);
-        stats.files_discovered = structural_files.len();
+        let mut stats = IndexStats {
+            files_discovered: structural_files.len(),
+            ..Default::default()
+        };
 
         // Load existing hashes
         let existing = store::list_files(&conn).unwrap_or_default();

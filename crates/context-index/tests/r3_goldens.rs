@@ -2,8 +2,9 @@ use context_index::structural::StructuralIndex;
 use context_index::{ProjectIndex, ProjectRoot};
 use std::path::PathBuf;
 
-/// Context-Engine structural goldens — R3
+/// Context-Engine structural goldens — R3 (LIVE, requires worktree)
 #[test]
+#[ignore]
 fn context_engine_goldens() -> anyhow::Result<()> {
     let root = ProjectRoot::resolve(Some(&PathBuf::from("C:/Users/Dell/context/Context-Engine")))?;
     let idx = ProjectIndex::discover(&root)?;
@@ -86,6 +87,7 @@ fn context_engine_goldens() -> anyhow::Result<()> {
 }
 
 #[test]
+#[ignore]
 fn mulanous_goldens() -> anyhow::Result<()> {
     let m_path = PathBuf::from("C:/Users/Dell/Mulanous-Lens");
     if !m_path.exists() {

@@ -1,5 +1,3 @@
-#![allow(clippy::all)]
-#![allow(clippy::pedantic)]
 //! Rust file discovery, hashing, classification, exact search — R1.
 //! Owns project root, ignore rules, file metadata, and `rg` orchestration.
 //! Semantic/symbol/graph remain in V2/OCI for now.

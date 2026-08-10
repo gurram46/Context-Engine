@@ -425,14 +425,9 @@ fn transaction_preserves_last_good_on_bad_update() -> Result<()> {
     si.build(&idx1).unwrap();
     let foo1 = si.find_definitions("foo").unwrap();
     assert!(!foo1.is_empty());
-    // Corrupt file with unreadable? Instead make file unreadable by removing and then quickly building with missing file?
-    // Simulate parse failure: write invalid syntax but should still store partial? For this test, ensure that if file becomes temporarily unreadable, previous symbols are not deleted.
-    // We test by making file empty and then restoring — but more importantly, if we write bad syntax, we still have symbol? Tree-sitter partial should keep foo.
     fs::write(tmp.path().join("a.py"), b"def foo(\n  !!!")?;
     let idx2 = ProjectIndex::discover(&root).unwrap();
     si.build(&idx2).unwrap();
-    // After bad parse, foo may still be present (partial) or parse_error, but we should not lose all symbols
-    // At least file should still exist in DB (not deleted)
     let conn = context_index::structural::store::open_db(tmp.path()).unwrap();
     let cnt: i64 = conn
         .query_row("SELECT COUNT(*) FROM files WHERE path='a.py'", [], |r| {
@@ -440,5 +435,287 @@ fn transaction_preserves_last_good_on_bad_update() -> Result<()> {
         })
         .unwrap();
     assert_eq!(cnt, 1, "file should still be in DB after bad parse");
+    Ok(())
+}
+
+#[test]
+fn nested_python_caller_ownership() -> Result<()> {
+    let content = "def outer():\n    first()\n    def nested():\n        inside()\n    after()\n";
+    let h = blake3::hash(content.as_bytes()).to_hex().to_string();
+    let pf = parse_file("a.py", content, &h);
+    // Find symbol ids
+    let outer = pf.symbols.iter().find(|s| s.name == "outer").unwrap();
+    let nested = pf.symbols.iter().find(|s| s.name == "nested").unwrap();
+    assert_eq!(nested.qualified_name, "outer.nested");
+    let first_ref = pf.references.iter().find(|r| r.name == "first").unwrap();
+    assert_eq!(
+        first_ref.parent_symbol.as_deref(),
+        Some(outer.id.as_str()),
+        "first caller should be outer"
+    );
+    let inside_ref = pf.references.iter().find(|r| r.name == "inside").unwrap();
+    assert_eq!(
+        inside_ref.parent_symbol.as_deref(),
+        Some(nested.id.as_str()),
+        "inside caller should be nested"
+    );
+    let after_ref = pf.references.iter().find(|r| r.name == "after").unwrap();
+    assert_eq!(
+        after_ref.parent_symbol.as_deref(),
+        Some(outer.id.as_str()),
+        "after caller should be outer, not nested"
+    );
+
+    // Persisted: build index and query via DB
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("a.py"), content.as_bytes())?;
+    let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+    let idx = ProjectIndex::discover(&root).unwrap();
+    let si = StructuralIndex::new(&root);
+    si.build(&idx).unwrap();
+    let callers_after = si.find_callers("after").unwrap();
+    // after is called by outer, so caller edge should have caller_symbol_id == outer.id
+    let outer_id = si.find_definitions("outer").unwrap()[0].id.clone();
+    assert!(
+        callers_after.iter().any(|e| e.caller_symbol_id == outer_id),
+        "persisted callers of after should be outer"
+    );
+    let callers_inside = si.find_callers("inside").unwrap();
+    let nested_id = si.find_definitions("nested").unwrap()[0].id.clone();
+    assert!(
+        callers_inside
+            .iter()
+            .any(|e| e.caller_symbol_id == nested_id),
+        "persisted callers of inside should be nested"
+    );
+    Ok(())
+}
+
+#[test]
+fn nested_rust_caller_ownership() -> Result<()> {
+    let content = "fn outer() {\n    first();\n    fn nested() {\n        inside();\n    }\n    after();\n}\n";
+    let h = blake3::hash(content.as_bytes()).to_hex().to_string();
+    let pf = parse_file("a.rs", content, &h);
+    let outer = pf
+        .symbols
+        .iter()
+        .find(|s| s.name == "outer")
+        .expect("outer");
+    let nested = pf
+        .symbols
+        .iter()
+        .find(|s| s.name == "nested")
+        .expect("nested");
+    // qualified may be outer::nested
+    assert!(
+        nested.qualified_name.contains("outer") && nested.qualified_name.contains("nested"),
+        "nested qualified {}",
+        nested.qualified_name
+    );
+    let first_ref = pf
+        .references
+        .iter()
+        .find(|r| r.name == "first")
+        .expect("first");
+    assert_eq!(first_ref.parent_symbol.as_deref(), Some(outer.id.as_str()));
+    let inside_ref = pf
+        .references
+        .iter()
+        .find(|r| r.name == "inside")
+        .expect("inside");
+    assert_eq!(
+        inside_ref.parent_symbol.as_deref(),
+        Some(nested.id.as_str())
+    );
+    let after_ref = pf
+        .references
+        .iter()
+        .find(|r| r.name == "after")
+        .expect("after");
+    assert_eq!(after_ref.parent_symbol.as_deref(), Some(outer.id.as_str()));
+    Ok(())
+}
+
+#[test]
+fn nested_typescript_caller_ownership() -> Result<()> {
+    let content = "function outer() {\n    first();\n    function nested() {\n        inside();\n    }\n    after();\n}\n";
+    let h = blake3::hash(content.as_bytes()).to_hex().to_string();
+    let pf = parse_file("a.ts", content, &h);
+    let outer = pf
+        .symbols
+        .iter()
+        .find(|s| s.name == "outer")
+        .expect("outer");
+    let nested = pf
+        .symbols
+        .iter()
+        .find(|s| s.name == "nested")
+        .expect("nested");
+    let first_ref = pf
+        .references
+        .iter()
+        .find(|r| r.name == "first")
+        .expect("first");
+    assert_eq!(first_ref.parent_symbol.as_deref(), Some(outer.id.as_str()));
+    let inside_ref = pf
+        .references
+        .iter()
+        .find(|r| r.name == "inside")
+        .expect("inside");
+    assert_eq!(
+        inside_ref.parent_symbol.as_deref(),
+        Some(nested.id.as_str())
+    );
+    let after_ref = pf
+        .references
+        .iter()
+        .find(|r| r.name == "after")
+        .expect("after");
+    assert_eq!(after_ref.parent_symbol.as_deref(), Some(outer.id.as_str()));
+    Ok(())
+}
+
+#[test]
+fn nested_javascript_caller_ownership() -> Result<()> {
+    let content = "function outer() {\n    first();\n    function nested() {\n        inside();\n    }\n    after();\n}\n";
+    let h = blake3::hash(content.as_bytes()).to_hex().to_string();
+    let pf = parse_file("a.js", content, &h);
+    let outer = pf.symbols.iter().find(|s| s.name == "outer").unwrap();
+    let nested = pf.symbols.iter().find(|s| s.name == "nested").unwrap();
+    let after_ref = pf.references.iter().find(|r| r.name == "after").unwrap();
+    assert_eq!(after_ref.parent_symbol.as_deref(), Some(outer.id.as_str()));
+    let inside_ref = pf.references.iter().find(|r| r.name == "inside").unwrap();
+    assert_eq!(
+        inside_ref.parent_symbol.as_deref(),
+        Some(nested.id.as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn class_method_helper_caller() -> Result<()> {
+    let content = "class Service {\n    run() {\n        helper();\n    }\n}\n";
+    let h = blake3::hash(content.as_bytes()).to_hex().to_string();
+    let pf = parse_file("a.ts", content, &h);
+    let run = pf.symbols.iter().find(|s| s.name == "run").expect("run");
+    assert_eq!(run.qualified_name, "Service.run");
+    let helper_ref = pf
+        .references
+        .iter()
+        .find(|r| r.name == "helper")
+        .expect("helper");
+    assert_eq!(
+        helper_ref.parent_symbol.as_deref(),
+        Some(run.id.as_str()),
+        "helper caller should be Service.run"
+    );
+    Ok(())
+}
+
+#[test]
+fn qualified_parents() -> Result<()> {
+    // Python Class.method
+    let py = "class Foo:\n    def bar(self):\n        pass\n";
+    let h = blake3::hash(py.as_bytes()).to_hex().to_string();
+    let pf = parse_file("a.py", py, &h);
+    let bar = pf.symbols.iter().find(|s| s.name == "bar").unwrap();
+    assert_eq!(bar.qualified_name, "Foo.bar");
+    assert_eq!(bar.parent.as_deref(), Some("Foo"));
+
+    // Go Server.Start
+    let go = "package main\ntype Server struct {}\nfunc (s *Server) Start() {}\n";
+    let h = blake3::hash(go.as_bytes()).to_hex().to_string();
+    let pf = parse_file("b.go", go, &h);
+    let start = pf.symbols.iter().find(|s| s.name == "Start").unwrap();
+    assert_eq!(start.qualified_name, "Server.Start");
+    assert_eq!(start.parent.as_deref(), Some("Server"));
+
+    // Rust ProjectIndex::discover
+    let rs = "struct ProjectIndex;\nimpl ProjectIndex { fn discover(&self) {} }\n";
+    let h = blake3::hash(rs.as_bytes()).to_hex().to_string();
+    let pf = parse_file("c.rs", rs, &h);
+    let disc = pf.symbols.iter().find(|s| s.name == "discover").unwrap();
+    assert!(
+        disc.qualified_name.contains("ProjectIndex") && disc.qualified_name.contains("discover")
+    );
+
+    // TS Class.method
+    let ts = "class Cls { method() {} }\n";
+    let h = blake3::hash(ts.as_bytes()).to_hex().to_string();
+    let pf = parse_file("d.ts", ts, &h);
+    let meth = pf.symbols.iter().find(|s| s.name == "method").unwrap();
+    assert_eq!(meth.qualified_name, "Cls.method");
+
+    // Nested outer::nested convention
+    let nested = "def outer():\n    def nested():\n        pass\n";
+    let h = blake3::hash(nested.as_bytes()).to_hex().to_string();
+    let pf = parse_file("e.py", nested, &h);
+    let n = pf.symbols.iter().find(|s| s.name == "nested").unwrap();
+    assert_eq!(n.qualified_name, "outer.nested");
+    Ok(())
+}
+
+#[test]
+fn go_receiver_method_ownership() -> Result<()> {
+    let content = "package main\ntype Server struct {}\nfunc (s *Server) Start() { helper() }\nfunc helper() {}\n";
+    let h = blake3::hash(content.as_bytes()).to_hex().to_string();
+    let pf = parse_file("a.go", content, &h);
+    let start = pf.symbols.iter().find(|s| s.name == "Start").unwrap();
+    assert_eq!(start.qualified_name, "Server.Start");
+    let helper_ref = pf.references.iter().find(|r| r.name == "helper").unwrap();
+    assert_eq!(
+        helper_ref.parent_symbol.as_deref(),
+        Some(start.id.as_str()),
+        "helper call should be inside Server.Start"
+    );
+    Ok(())
+}
+
+#[test]
+fn index_does_not_index_itself() -> Result<()> {
+    let tmp = TempDir::new().unwrap();
+    // create a.py
+    fs::write(tmp.path().join("a.py"), b"def foo(): pass")?;
+    let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+    let idx1 = ProjectIndex::discover(&root).unwrap();
+    let si = StructuralIndex::new(&root);
+    si.build(&idx1).unwrap();
+    // Now create the structural DB files explicitly and re-discover
+    // The DB is at .context/index/structural.db — ensure it exists
+    let db_path = context_index::structural::store::index_db_path(tmp.path());
+    assert!(db_path.exists(), "db should exist after build");
+    // Re-discover and rebuild — should not index .context files
+    let idx2 = ProjectIndex::discover(&root).unwrap();
+    let before = idx2.files.len();
+    // Ensure none of the indexed files are under .context/index
+    for f in &idx2.files {
+        assert!(
+            !f.relative_path.starts_with(".context/index/structural"),
+            "index should not contain itself: {}",
+            f.relative_path
+        );
+        assert!(
+            !f.relative_path.contains("structural.db"),
+            "db file should not be indexed"
+        );
+    }
+    // Also ensure structural walk doesn't include those
+    let si2 = StructuralIndex::new(&root);
+    let stats = si2.build(&idx2).unwrap();
+    // Check DB doesn't have entries for its own files
+    let conn = context_index::structural::store::open_db(tmp.path()).unwrap();
+    let cnt: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE path LIKE '.context/%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cnt, 0,
+        "structural store should not contain .context files, got {}",
+        cnt
+    );
+    let _ = (before, stats);
     Ok(())
 }

@@ -37,6 +37,7 @@ impl SymbolKind {
             Self::Unknown => "unknown",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "function" => Self::Function,
@@ -112,6 +113,7 @@ impl ReferenceKind {
             Self::Unknown => "unknown",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "call" => Self::Call,
