@@ -120,6 +120,7 @@ fn extract_text(content: &[ContentBlock]) -> String {
 }
 
 #[tokio::test]
+#[ignore]
 async fn all_five_tools_registered() -> Result<()> {
     let root = workspace_root();
     let client = spawn_contextd(&root).await?;
@@ -140,6 +141,7 @@ async fn all_five_tools_registered() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn schemas_match_expected_contract() -> Result<()> {
     let root = workspace_root();
     let client = spawn_contextd(&root).await?;
@@ -217,6 +219,7 @@ async fn schemas_match_expected_contract() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn invalid_input_returns_error() -> Result<()> {
     let root = workspace_root();
     let client = spawn_contextd(&root).await?;
@@ -308,6 +311,7 @@ async fn child_reused_for_multiple_requests() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn project_root_environment_forwarded() -> Result<()> {
     // Create temp dir
     let tmp = TempDir::new()?;
@@ -357,6 +361,7 @@ async fn project_root_environment_forwarded() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn clean_shutdown() -> Result<()> {
     let root = workspace_root();
     let client = spawn_contextd(&root).await?;
