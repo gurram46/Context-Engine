@@ -1,29 +1,29 @@
 # contextd — Rust backend for Context Engine
 
-**Status:** R0 implemented — Rust MCP shell over V2. `contextd.exe` is the backend; Zed / Codex / OpenCode are frontends.
+**Status:** R1 implemented — Rust owns file discovery, hashing, classification, exact search; `contextd.exe` is the backend; Zed / Codex / OpenCode are frontends. R0 shell verified.
 
-## Current architecture (R0)
+## Current architecture (R1)
 
 ```
 Zed / Codex / OpenCode
         │  MCP stdio JSON-RPC (rmcp)
         ▼
    contextd.exe (Rust, tokio, rmcp server)
-        │  MCP stdio (TokioChildProcess)
-        ▼
-   v2/dist/mcp/server.js (Node)
-        │  spawn
-        ▼
-   open-codebase-index MCP (Node, native addon)
-        ├── SQLite (chunks, symbols, branch_chunks)
-        ├── usearch mmap (vectors)
-        ├── Tree-sitter native (parsing)
-        └── Ollama (Go) → nomic-embed-text
+        ├── ProjectCache (Rust) ──► ProjectIndex ──► discovery (ignore) ──► classification ──► hash (blake3) ──► exact_search (rg)
+        │                              │                         │
+        │                              ▼                         ▼
+        │                         V2/OCI TEMPORARY          Rust exact
+        │                         semantic/symbols/graph      (shadow + direct for EXACT)
+        │                              │                         │
+        └───────────┬──────────────────┘
+                    ▼
+               V2 ranking (temporary)
 ```
 
 - **Implemented (R0):** Rust MCP contract, 5 tools, project-root forwarding, one persistent V2 child, graceful shutdown, single restart, tracing to stderr.
-- **Current limitation:** retrieval / ranking / indexing still run in Node. No Tantivy, no Tree-sitter in Rust, no notify watcher, no embedding in Rust.
-- **Planned (R1-R5):** port `fileClassifier`/`exactSearch` → `context-index`, port `router/authority/fuse` → `context-rank`, bring `rusqlite`+`usearch`+`tantivy`+`tree-sitter` into `context-store`, replace Ollama with `ort` ONNX, add `notify` watcher, then remove Node.
+- **Implemented (R1):** Rust `ProjectRoot` (canonical, env `CONTEXT_ENGINE_PROJECT_ROOT`), `ProjectIndex` (discovery via `ignore` crate, `FileKind` via extension, `blake3` streaming, 10 MB limit, `is_text_searchable`), `ExactQuery`/`ExactEvidence` via `rg` subprocess (literal/regex/identifier/filename/path, `tokio::process::Command`, bounded, `MAX_SEARCH_FILE_BYTES` 10 MB, `rg_available` check), filename/path <10ms, literal <100ms, `crates/`+`target/` handling via `ENGINE_INTERNAL_EXCLUDES` vs `TARGET_REPOSITORY_SEARCH_POLICY`.
+- **Current limitation (R1):** semantic/symbol/graph, router, ranking, fusion, packing still in V2/OCI. No `tantivy`, no `notify` watcher, no `usearch`, no `tree-sitter` yet.
+- **Planned (R2-R5):** R2 port `classifyQuery/router/authority/fuse`, R3 `context-store` (`rusqlite`, `tree-sitter`, `usearch` mmap), R4 vector/BM25 (`tantivy`, `ort` CodeRankEmbed, `notify`), R5 remove Node.
 
 ## Process model
 
@@ -57,9 +57,9 @@ Schemas are generated via `schemars` from `context-core` types and match V2 exac
 
 ## R0 → R5 direction
 
-- R0: shell + bridge (done).
-- R1: `context-index` with `ignore` + `blake3` + `rg` (keep Node semantic).
-- R2: port `classifyQuery/router/authority/fuse/evidencePacker`.
+- R0: shell + bridge (done, `a91abac`).
+- **R1: `context-index` with `ignore` + `blake3` + `rg` (done, this doc).** Keeps Node semantic/symbol/graph, adds Rust exact + shadow.
+- R2: port `classifyQuery/router/authority/fuse/evidencePacker` → `context-rank`.
 - R3: `context-store` (`rusqlite`, `tree-sitter` symbols, `usearch` mmap read).
 - R4: vector/BM25 (`usearch` HNSW, `tantivy`, `ort` CodeRankEmbed, `notify`).
 - R5: remove Node/OCI, keep `v2/` as `reference/` for behavioral tests.
