@@ -1,8 +1,10 @@
 mod bridge;
+mod candidate;
 mod pipeline;
 mod project;
 
 use bridge::V2Bridge;
+use candidate::CandidateProvider;
 use context_core::{
     ContextSearchParams, DependencyTraceParams, SymbolLookupParams, TestLookupParams,
 };
@@ -25,6 +27,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone)]
 pub struct Contextd {
     bridge: Arc<V2Bridge>,
+    candidate: Arc<CandidateProvider>,
     project_cache: Arc<ProjectCache>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
@@ -33,8 +36,14 @@ pub struct Contextd {
 #[tool_router]
 impl Contextd {
     pub fn new(bridge: Arc<V2Bridge>) -> Self {
+        let candidate = Arc::new(CandidateProvider::new().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "candidate provider failed, using dummy");
+            // Fallback: create with dummy path, will error on use but not crash
+            CandidateProvider::new().unwrap()
+        }));
         Self {
             bridge,
+            candidate,
             project_cache: Arc::new(ProjectCache::new()),
             tool_router: Self::tool_router(),
         }
@@ -42,8 +51,10 @@ impl Contextd {
 
     #[cfg(test)]
     pub fn with_cache(bridge: Arc<V2Bridge>, cache: Arc<ProjectCache>) -> Self {
+        let candidate = Arc::new(CandidateProvider::new().unwrap());
         Self {
             bridge,
+            candidate,
             project_cache: cache,
             tool_router: Self::tool_router(),
         }
@@ -65,7 +76,7 @@ impl Contextd {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let providers = Providers {
-            v2: self.bridge.clone(),
+            candidate: self.candidate.clone(),
         };
         let res = retrieve_context(
             &params.query,
@@ -120,7 +131,7 @@ impl Contextd {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let providers = Providers {
-            v2: self.bridge.clone(),
+            candidate: self.candidate.clone(),
         };
         let res = retrieve_context(
             &params.symbol,
@@ -174,7 +185,7 @@ impl Contextd {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let providers = Providers {
-            v2: self.bridge.clone(),
+            candidate: self.candidate.clone(),
         };
         let query = match dir.as_str() {
             "callers" => format!("What calls {}?", params.symbol),
@@ -218,7 +229,7 @@ impl Contextd {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let providers = Providers {
-            v2: self.bridge.clone(),
+            candidate: self.candidate.clone(),
         };
         let q = if params.query.to_lowercase().contains("test") {
             params.query.clone()

@@ -6,9 +6,9 @@ use context_rank::{
 };
 use std::time::Instant;
 
-/// Retrieval providers — for R2, V2/OCI provides semantic/symbol/graph candidates.
+/// Retrieval providers — for R2, V2/OCI provides semantic/symbol/graph candidates via raw candidate provider.
 pub struct Providers {
-    pub v2: std::sync::Arc<crate::bridge::V2Bridge>,
+    pub candidate: std::sync::Arc<crate::candidate::CandidateProvider>,
 }
 
 /// Context result after Rust pipeline.
@@ -80,149 +80,200 @@ pub async fn retrieve_context(
         let _ = t.elapsed();
     }
 
-    // V2 candidates: semantic, symbol, graph, test
-    // For each symbol query, call V2 symbol lookup
+    // Raw candidates from OCI via candidate provider (not V2 final ranking)
     for sym in &plan.symbol_queries {
         let t = Instant::now();
-        let v = providers
-            .v2
-            .call_json("symbol_lookup", serde_json::json!({ "symbol": sym }))
-            .await;
-        if let Ok(val) = v {
-            if let Some(arr) = val.get("evidence").and_then(|e| e.as_array()) {
-                for ev in arr.iter().take(5) {
-                    if let Some(file) = ev.get("file").and_then(|f| f.as_str()) {
-                        candidates.push(Evidence {
-                            source: context_rank::types::RetrievalSource::Symbol,
-                            file: file.to_string(),
-                            start_line: ev
-                                .get("startLine")
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32),
-                            end_line: ev.get("endLine").and_then(|v| v.as_u64()).map(|v| v as u32),
-                            symbol: ev
-                                .get("symbol")
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string()),
-                            symbol_kind: ev
-                                .get("symbolKind")
-                                .and_then(|k| k.as_str())
-                                .map(|k| k.to_string()),
-                            text: ev
-                                .get("text")
-                                .and_then(|t| t.as_str())
-                                .map(|t| t.to_string()),
-                            score: ev.get("score").and_then(|s| s.as_f64()),
-                            relation: Some(context_rank::types::EvidenceRelation::Definition),
-                            authority_score: None,
-                            final_score: None,
-                            provenance: Some("v2:symbol".into()),
-                            metadata: Some(ev.clone()),
-                        });
-                    }
+        let res = providers.candidate.symbol_candidates(sym).await;
+        if let Ok(arr) = res {
+            for ev in arr.iter().take(5) {
+                if let Some(file) = ev.get("file").and_then(|f| f.as_str()) {
+                    candidates.push(Evidence {
+                        source: context_rank::types::RetrievalSource::Symbol,
+                        file: file.to_string(),
+                        start_line: ev
+                            .get("startLine")
+                            .or_else(|| ev.get("start_line"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        end_line: ev
+                            .get("endLine")
+                            .or_else(|| ev.get("end_line"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        symbol: ev
+                            .get("symbol")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
+                        symbol_kind: ev
+                            .get("symbolKind")
+                            .or_else(|| ev.get("symbol_kind"))
+                            .and_then(|k| k.as_str())
+                            .map(|k| k.to_string()),
+                        text: ev
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|t| t.to_string()),
+                        score: ev.get("score").and_then(|s| s.as_f64()),
+                        relation: Some(context_rank::types::EvidenceRelation::Definition),
+                        authority_score: None,
+                        final_score: None,
+                        provenance: Some("oci:symbol".into()),
+                        metadata: Some(ev.clone()),
+                    });
                 }
             }
         }
-        retrievers_used.push(format!("v2-symbol:{}", sym));
+        retrievers_used.push(format!("oci-symbol:{}", sym));
         let _ = t.elapsed();
     }
 
-    // Semantic
+    // Semantic (raw peek/search)
     for sq in &plan.semantic_queries {
         let t = Instant::now();
-        let v = providers
-            .v2
-            .call_json("context_search", serde_json::json!({ "query": sq }))
-            .await;
-        if let Ok(val) = v {
-            if let Some(arr) = val.get("evidence").and_then(|e| e.as_array()) {
-                for ev in arr.iter().take(5) {
-                    if let Some(file) = ev.get("file").and_then(|f| f.as_str()) {
-                        candidates.push(Evidence {
-                            source: context_rank::types::RetrievalSource::Semantic,
-                            file: file.to_string(),
-                            start_line: ev
-                                .get("startLine")
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32),
-                            end_line: ev.get("endLine").and_then(|v| v.as_u64()).map(|v| v as u32),
-                            symbol: ev
-                                .get("symbol")
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string()),
-                            symbol_kind: ev
-                                .get("symbolKind")
-                                .and_then(|k| k.as_str())
-                                .map(|k| k.to_string()),
-                            text: ev
-                                .get("text")
-                                .and_then(|t| t.as_str())
-                                .map(|t| t.to_string()),
-                            score: ev.get("score").and_then(|s| s.as_f64()),
-                            relation: Some(context_rank::types::EvidenceRelation::Unknown),
-                            authority_score: None,
-                            final_score: None,
-                            provenance: Some("v2:semantic".into()),
-                            metadata: Some(ev.clone()),
-                        });
-                    }
+        let res = providers.candidate.semantic_candidates(sq, 5).await;
+        if let Ok(arr) = res {
+            for ev in arr.iter().take(5) {
+                if let Some(file) = ev.get("file").and_then(|f| f.as_str()) {
+                    candidates.push(Evidence {
+                        source: context_rank::types::RetrievalSource::Semantic,
+                        file: file.to_string(),
+                        start_line: ev
+                            .get("startLine")
+                            .or_else(|| ev.get("start_line"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        end_line: ev
+                            .get("endLine")
+                            .or_else(|| ev.get("end_line"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        symbol: ev
+                            .get("symbol")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
+                        symbol_kind: ev
+                            .get("symbolKind")
+                            .and_then(|k| k.as_str())
+                            .map(|k| k.to_string()),
+                        text: ev
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|t| t.to_string()),
+                        score: ev.get("score").and_then(|s| s.as_f64()),
+                        relation: Some(context_rank::types::EvidenceRelation::Unknown),
+                        authority_score: None,
+                        final_score: None,
+                        provenance: Some("oci:semantic".into()),
+                        metadata: Some(ev.clone()),
+                    });
                 }
             }
         }
         retrievers_used.push(format!(
-            "v2-semantic:{}",
+            "oci-semantic:{}",
             sq.chars().take(20).collect::<String>()
         ));
         let _ = t.elapsed();
     }
 
-    // Graph
+    // Graph (raw)
     for gq in &plan.graph_queries {
         let t = Instant::now();
-        let v = providers
-            .v2
-            .call_json(
-                "dependency_trace",
-                serde_json::json!({ "symbol": gq.symbol, "direction": gq.direction }),
-            )
+        let res = providers
+            .candidate
+            .graph_candidates(&gq.symbol, &gq.direction)
             .await;
-        if let Ok(val) = v {
-            if let Some(arr) = val.get("evidence").and_then(|e| e.as_array()) {
-                for ev in arr.iter().take(5) {
-                    if let Some(file) = ev.get("file").and_then(|f| f.as_str()) {
-                        candidates.push(Evidence {
-                            source: context_rank::types::RetrievalSource::Graph,
-                            file: file.to_string(),
-                            start_line: ev
-                                .get("startLine")
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32),
-                            end_line: ev.get("endLine").and_then(|v| v.as_u64()).map(|v| v as u32),
-                            symbol: ev
-                                .get("symbol")
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string()),
-                            symbol_kind: None,
-                            text: ev
-                                .get("text")
-                                .and_then(|t| t.as_str())
-                                .map(|t| t.to_string()),
-                            score: Some(0.9),
-                            relation: Some(if gq.direction == "callers" {
-                                context_rank::types::EvidenceRelation::Caller
-                            } else {
-                                context_rank::types::EvidenceRelation::Callee
-                            }),
-                            authority_score: None,
-                            final_score: None,
-                            provenance: Some(format!("v2:graph:{}", gq.direction)),
-                            metadata: Some(ev.clone()),
-                        });
-                    }
+        if let Ok(arr) = res {
+            for ev in arr.iter().take(5) {
+                if let Some(file) = ev.get("file").and_then(|f| f.as_str()) {
+                    candidates.push(Evidence {
+                        source: context_rank::types::RetrievalSource::Graph,
+                        file: file.to_string(),
+                        start_line: ev
+                            .get("startLine")
+                            .or_else(|| ev.get("start_line"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        end_line: ev
+                            .get("endLine")
+                            .or_else(|| ev.get("end_line"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        symbol: ev
+                            .get("symbol")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
+                        symbol_kind: ev
+                            .get("symbolKind")
+                            .or_else(|| ev.get("symbol_kind"))
+                            .and_then(|k| k.as_str())
+                            .map(|k| k.to_string()),
+                        text: ev
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|t| t.to_string()),
+                        score: ev.get("score").and_then(|s| s.as_f64()).or(Some(0.9)),
+                        relation: Some(if gq.direction == "callers" {
+                            context_rank::types::EvidenceRelation::Caller
+                        } else {
+                            context_rank::types::EvidenceRelation::Callee
+                        }),
+                        authority_score: None,
+                        final_score: None,
+                        provenance: Some(format!("oci:graph:{}", gq.direction)),
+                        metadata: Some(ev.clone()),
+                    });
                 }
             }
         }
-        retrievers_used.push(format!("v2-graph:{}", gq.symbol));
+        retrievers_used.push(format!("oci-graph:{}", gq.symbol));
+        let _ = t.elapsed();
+    }
+
+    // Test (raw)
+    for tq in &plan.test_queries {
+        let t = Instant::now();
+        let res = providers.candidate.test_candidates(tq).await;
+        if let Ok(arr) = res {
+            for ev in arr.iter().take(5) {
+                if let Some(file) = ev.get("file").and_then(|f| f.as_str()) {
+                    candidates.push(Evidence {
+                        source: context_rank::types::RetrievalSource::Test,
+                        file: file.to_string(),
+                        start_line: ev
+                            .get("startLine")
+                            .or_else(|| ev.get("start_line"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        end_line: ev
+                            .get("endLine")
+                            .or_else(|| ev.get("end_line"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
+                        symbol: ev
+                            .get("symbol")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
+                        symbol_kind: ev
+                            .get("symbolKind")
+                            .or_else(|| ev.get("symbol_kind"))
+                            .and_then(|k| k.as_str())
+                            .map(|k| k.to_string()),
+                        text: ev
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|t| t.to_string()),
+                        score: ev.get("score").and_then(|s| s.as_f64()),
+                        relation: Some(context_rank::types::EvidenceRelation::Test),
+                        authority_score: None,
+                        final_score: None,
+                        provenance: Some("oci:test".into()),
+                        metadata: Some(ev.clone()),
+                    });
+                }
+            }
+        }
+        retrievers_used.push(format!("oci-test:{}", tq));
         let _ = t.elapsed();
     }
 
