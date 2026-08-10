@@ -1,25 +1,22 @@
 [package]
-name = "contextd"
+name = "context-index"
 version = "0.1.0"
 edition = "2021"
-description = "Rust MCP compatibility shell over V2 backend — R0"
+description = "Rust file discovery, hashing, classification, exact search — R1"
 license = "MIT"
-
-[[bin]]
-name = "contextd"
-path = "src/main.rs"
 
 [dependencies]
 context-core = { path = "../context-core" }
-context-index = { path = "../context-index" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-rmcp = { workspace = true }
+ignore = { workspace = true }
+blake3 = { workspace = true }
+walkdir = { workspace = true }
+regex = { workspace = true }
 schemars = { workspace = true }
 
 [dev-dependencies]

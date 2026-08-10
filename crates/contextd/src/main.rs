@@ -1,9 +1,12 @@
 mod bridge;
+mod exact_shadow;
+mod project;
 
 use bridge::V2Bridge;
 use context_core::{
     ContextSearchParams, DependencyTraceParams, SymbolLookupParams, TestLookupParams,
 };
+use project::ProjectCache;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, ServerCapabilities, ServerInfo},
@@ -21,6 +24,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone)]
 pub struct Contextd {
     bridge: Arc<V2Bridge>,
+    project_cache: Arc<ProjectCache>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -30,6 +34,16 @@ impl Contextd {
     pub fn new(bridge: Arc<V2Bridge>) -> Self {
         Self {
             bridge,
+            project_cache: Arc::new(ProjectCache::new()),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_cache(bridge: Arc<V2Bridge>, cache: Arc<ProjectCache>) -> Self {
+        Self {
+            bridge,
+            project_cache: cache,
             tool_router: Self::tool_router(),
         }
     }
@@ -50,11 +64,26 @@ impl Contextd {
             "maxResults": params.maxResults,
             "debug": params.debug,
         });
+        // Ensure project index (for shadow) — failures are non-fatal for R1
+        let project = self.project_cache.ensure().await.ok();
         let v = self
             .bridge
             .call_json("context_search", args)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Shadow mode: compare Rust exact vs V2 exact (non-EXACT queries still run shadow for metrics)
+        if let Some(idx) = project {
+            let v_evidence = v
+                .get("evidence")
+                .and_then(|e| e.as_array())
+                .cloned()
+                .unwrap_or_default();
+            // Run shadow in background (don't block response)
+            let q = params.query.clone();
+            tokio::spawn(async move {
+                let _ = exact_shadow::shadow_exact(&idx, &q, &v_evidence).await;
+            });
+        }
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
@@ -75,11 +104,23 @@ impl Contextd {
             "budgetTokens": params.budgetTokens,
             "debug": params.debug,
         });
+        let project = self.project_cache.ensure().await.ok();
         let v = self
             .bridge
             .call_json("symbol_lookup", args)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let Some(idx) = project {
+            let v_evidence = v
+                .get("evidence")
+                .and_then(|e| e.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let sym = params.symbol.clone();
+            tokio::spawn(async move {
+                let _ = exact_shadow::shadow_exact(&idx, &sym, &v_evidence).await;
+            });
+        }
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
@@ -110,11 +151,23 @@ impl Contextd {
             "budgetTokens": params.budgetTokens,
             "debug": params.debug,
         });
+        let project = self.project_cache.ensure().await.ok();
         let v = self
             .bridge
             .call_json("dependency_trace", args)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let Some(idx) = project {
+            let v_evidence = v
+                .get("evidence")
+                .and_then(|e| e.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let sym = params.symbol.clone();
+            tokio::spawn(async move {
+                let _ = exact_shadow::shadow_exact(&idx, &sym, &v_evidence).await;
+            });
+        }
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
@@ -135,11 +188,23 @@ impl Contextd {
             "budgetTokens": params.budgetTokens,
             "debug": params.debug,
         });
+        let project = self.project_cache.ensure().await.ok();
         let v = self
             .bridge
             .call_json("test_lookup", args)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let Some(idx) = project {
+            let v_evidence = v
+                .get("evidence")
+                .and_then(|e| e.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let q = params.query.clone();
+            tokio::spawn(async move {
+                let _ = exact_shadow::shadow_exact(&idx, &q, &v_evidence).await;
+            });
+        }
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
@@ -166,6 +231,18 @@ impl Contextd {
             obj.insert("rustVersion".to_string(), json!(env!("CARGO_PKG_VERSION")));
             obj.insert("pid".to_string(), json!(std::process::id()));
             obj.insert("projectRoot".to_string(), json!(project_root));
+            // R1: add Rust discovery stats if available
+            if let Ok(idx) = self.project_cache.ensure().await {
+                obj.insert(
+                    "rustDiscoveredFiles".to_string(),
+                    json!(idx.stats.discovered),
+                );
+                obj.insert("rustSourceFiles".to_string(), json!(idx.stats.source));
+                obj.insert(
+                    "rustIndexRoot".to_string(),
+                    json!(idx.root.display().to_string()),
+                );
+            }
         }
 
         Ok(CallToolResult::success(vec![
