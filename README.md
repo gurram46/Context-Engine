@@ -1,7 +1,7 @@
 # Context Engine
 
 > **Frontend:** Zed / Codex / OpenCode (MCP stdio) — **Backend:** `contextd` (Rust) + V2 (TypeScript) bridge.
-> **Migration:** **R0** `contextd` MCP shell **implemented** (`rust/contextd-r0`, `a91abac`). **R1** Rust discovery/hashing/classification/exact search **implemented** (`rust/contextd-r1`, `context-index` + `rg`, 149 files). **R2** Rust routing/ranking/fusion/packing **implemented** (`rust/contextd-r2`, `context-rank` + `context-index`). **R3** Rust structural (**tree-sitter**, **SQLite**) **implemented** (`rust/contextd-r3`, `context-index::structural`, 141 files, 1033 symbols); semantic still OCI. See `docs/architecture/contextd.md`.
+> **Migration:** **R0** `contextd` MCP shell **implemented** (`rust/contextd-r0`, `a91abac`). **R1** Rust discovery/hashing/classification/exact search **implemented** (`rust/contextd-r1`, `context-index` + `rg`, 149 files). **R2** Rust routing/ranking/fusion/packing **implemented** (`rust/contextd-r2`, `context-rank` + `context-index`). **R3** Rust structural (**tree-sitter**, **SQLite**) **implemented** (`rust/contextd-r3`, `context-index::structural`, 141 files, 1033 symbols); semantic still OCI. **R4** Rust native retrieval (**BM25**, **vector**, **watcher**, **incremental graph**) **implemented** (`rust/contextd-r4`, `context-index::bm25` + `vector` + `watcher` + `embed`, structural incremental); OCI removed from production path. See `docs/architecture/contextd.md`.
 
 Context Engine is a hybrid CLI that tracks development sessions, generates summaries, and bundles project context for AI handoffs. The tool ships as two packages:
 

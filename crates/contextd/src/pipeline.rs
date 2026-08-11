@@ -5,11 +5,14 @@ use context_rank::{
     apply_authority, build_retrieval_plan, classify_query, fuse_evidence, pack_evidence,
     FuseOptions, PackOptions, QueryType,
 };
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-/// Retrieval providers — for R2, V2/OCI provides semantic/symbol/graph candidates via raw candidate provider.
+/// Retrieval providers — legacy V2/OCI, kept for reference but not used in production R4 path.
+/// Production retrieval must NOT call OCI semantic. CandidateProvider remains only for legacy comparison.
 pub struct Providers {
+    #[allow(dead_code)]
     pub candidate: std::sync::Arc<crate::candidate::CandidateProvider>,
 }
 
@@ -31,14 +34,171 @@ pub struct PipelineStats {
     pub packed_tokens: usize,
     pub retrievers_used: Vec<String>,
     pub elapsed_ms: u128,
+    pub exact_ms: u128,
+    pub structural_ms: u128,
+    pub bm25_ms: u128,
+    pub semantic_ms: u128,
+    pub rank_ms: u128,
+    pub pack_ms: u128,
 }
 
-/// Main Rust retrieval pipeline for R2.
-/// 1. classify, 2. plan, 3. Rust exact, 4. V2 candidates, 5. authority, 6. fuse, 7. pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceSufficiency {
+    Insufficient,
+    Adequate,
+    Strong,
+}
+
+/// Determine if we have sufficient evidence to skip heavier retrievers.
+/// Conservative deterministic signals — no invented confidence.
+fn sufficiency(
+    query_type: QueryType,
+    candidates: &[Evidence],
+    raw_query: &str,
+) -> EvidenceSufficiency {
+    // Helper to check definition presence
+    let has_strong_symbol = candidates.iter().any(|e| {
+        e.source == context_rank::types::RetrievalSource::Symbol
+            && e.relation == Some(context_rank::types::EvidenceRelation::Definition)
+            && e.file.to_lowercase().contains("src/")
+            || e.file.to_lowercase().contains("crates/")
+            || e.file.to_lowercase().contains("backend/")
+    });
+    let has_resolved_graph = candidates.iter().any(|e| {
+        e.source == context_rank::types::RetrievalSource::Graph
+            && e.relation == Some(context_rank::types::EvidenceRelation::Caller)
+            && e.provenance
+                .as_deref()
+                .map(|p| p.contains("resolved"))
+                .unwrap_or(false)
+    });
+    let has_exact = candidates
+        .iter()
+        .any(|e| e.source == context_rank::types::RetrievalSource::Exact);
+
+    match query_type {
+        QueryType::Symbol => {
+            // SYMBOL with exact definition + symbol definition + active source + high authority? Simplified: if we have symbol definition, we are Strong
+            if has_strong_symbol && has_exact {
+                return EvidenceSufficiency::Strong;
+            }
+            if has_strong_symbol {
+                return EvidenceSufficiency::Adequate;
+            }
+            EvidenceSufficiency::Insufficient
+        }
+        QueryType::Dependency => {
+            if has_resolved_graph && has_exact {
+                return EvidenceSufficiency::Strong;
+            }
+            if has_resolved_graph {
+                return EvidenceSufficiency::Adequate;
+            }
+            EvidenceSufficiency::Insufficient
+        }
+        QueryType::Test => {
+            // Test queries need at least some test evidence
+            let has_test = candidates
+                .iter()
+                .any(|e| e.source == context_rank::types::RetrievalSource::Test);
+            if has_test && candidates.len() >= 3 {
+                return EvidenceSufficiency::Strong;
+            }
+            if has_test {
+                return EvidenceSufficiency::Adequate;
+            }
+            EvidenceSufficiency::Insufficient
+        }
+        QueryType::Exact => EvidenceSufficiency::Strong, // exact already sufficient
+        QueryType::Conceptual => {
+            // Conceptual needs semantic; never strong without BM25/semantic
+            if !candidates.is_empty() && raw_query.to_lowercase().contains("test") {
+                // placeholder
+            }
+            EvidenceSufficiency::Insufficient
+        }
+        QueryType::Mixed => {
+            if has_strong_symbol && has_exact && has_resolved_graph {
+                return EvidenceSufficiency::Adequate;
+            }
+            EvidenceSufficiency::Insufficient
+        }
+    }
+}
+
+/// RRF fusion for BM25 + vector.
+/// Do NOT naively add BM25 score + cosine (scales differ). Use rank normalization.
+fn fuse_rrf(
+    bm25: Vec<(Evidence, usize, f64)>,
+    vector: Vec<(Evidence, usize, f64)>,
+    k: usize,
+) -> Vec<Evidence> {
+    let k = k as f64;
+    let mut map: HashMap<String, (Evidence, f64)> = HashMap::new(); // key = file::chunk_id or file::line
+    for (ev, rank, _score) in bm25 {
+        let key = format!(
+            "{}:{}:{:?}",
+            ev.file,
+            ev.symbol.clone().unwrap_or_default(),
+            ev.start_line.unwrap_or(0)
+        );
+        let rrf = 1.0 / (k + rank as f64);
+        let entry = map.entry(key.clone()).or_insert_with(|| (ev.clone(), 0.0));
+        entry.1 += rrf;
+        // Keep highest raw score provenance
+        if ev.score.unwrap_or(0.0) > entry.0.score.unwrap_or(0.0) {
+            entry.0.score = ev.score;
+        }
+    }
+    for (ev, rank, _score) in vector {
+        let key = format!(
+            "{}:{}:{:?}",
+            ev.file,
+            ev.symbol.clone().unwrap_or_default(),
+            ev.start_line.unwrap_or(0)
+        );
+        let rrf = 1.0 / (k + rank as f64);
+        let entry = map.entry(key.clone()).or_insert_with(|| (ev.clone(), 0.0));
+        entry.1 += rrf;
+        // Merge provenance to indicate fused
+        if let Some(existing) = map.get_mut(&key) {
+            if ev.provenance.as_deref() == Some("rust:semantic") {
+                existing.0.provenance = Some("rust:semantic+bm25".into());
+            }
+        }
+    }
+    // Convert to Evidence with RRF as score, preserve provenance
+    let mut fused: Vec<Evidence> = map
+        .into_values()
+        .map(|(mut ev, rrf)| {
+            ev.score = Some(rrf);
+            ev.provenance = Some(match ev.provenance.as_deref() {
+                Some(p) if p.contains("bm25") && p.contains("semantic") => {
+                    "rust:bm25+semantic".into()
+                }
+                Some(p) => p.to_string(),
+                None => "rust:bm25+semantic".into(),
+            });
+            // Source remains Bm25 or Semantic, but for fused we keep original source; authority will handle
+            ev
+        })
+        .collect();
+    // Sort by RRF desc
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    fused
+}
+
+/// Main Rust retrieval pipeline for R4.
+/// 1. classify, 2. plan, 3. Rust exact, 4. Rust structural, 5. BM25 + vector (fused), 6. authority, 7. fuse, 8. pack.
+#[allow(unused_assignments, unused_variables, clippy::too_many_lines)]
 pub async fn retrieve_context(
     query: &str,
     project: &ProjectIndex,
-    providers: &Providers,
+    _providers: &Providers,
     budget_tokens: usize,
     max_results: usize,
 ) -> Result<ContextResult, anyhow::Error> {
@@ -49,9 +209,9 @@ pub async fn retrieve_context(
     let mut candidates: Vec<Evidence> = Vec::new();
     let mut retrievers_used = Vec::new();
 
-    // Rust exact — larger budget for bundle-like queries that hit many docs
+    // Rust exact
+    let t_exact = Instant::now();
     for eq in &plan.exact_queries {
-        let t = Instant::now();
         let opts = ExactSearchOptions {
             max_results: 50,
             ..Default::default()
@@ -60,7 +220,6 @@ pub async fn retrieve_context(
             .await
             .unwrap_or_default();
         let cnt = res.len();
-        // Convert ExactEvidence to Evidence
         for ev in res {
             candidates.push(Evidence {
                 source: context_rank::types::RetrievalSource::Exact,
@@ -79,14 +238,13 @@ pub async fn retrieve_context(
             });
         }
         retrievers_used.push(format!("rust-exact:{}", cnt));
-        let _ = t.elapsed();
     }
+    let exact_ms = t_exact.elapsed().as_millis();
 
-    // Native Rust structural symbol candidates (R3) — replaces OCI implementation_lookup
+    // Native Rust structural symbol candidates (R3)
+    let t_struct = Instant::now();
     for sym in &plan.symbol_queries {
-        let t = Instant::now();
         let mut added = 0usize;
-        // Open DB per query; cheap
         if let Ok(conn) = structural_store::open_db(&project.root) {
             if let Ok(defs) = structural_store::find_definitions(&conn, sym) {
                 for def in defs.iter().take(5) {
@@ -109,7 +267,6 @@ pub async fn retrieve_context(
                     added += 1;
                 }
             }
-            // Fallback: if no exact, try prefix
             if added == 0 {
                 if let Ok(pref) = structural_store::find_symbol_prefix(&conn, sym) {
                     for def in pref.iter().take(5) {
@@ -134,83 +291,25 @@ pub async fn retrieve_context(
                 }
             }
         }
-        // Shadow OCI for debug comparison (not used in ranking) — kept behind feature if needed
-        // For R3, OCI symbol is not authoritative; we intentionally don't call it in prod path.
         retrievers_used.push(format!("rust-symbol:{}:{}", sym, added));
-        let _ = t.elapsed();
     }
 
-    // Semantic (raw peek/search)
-    for sq in &plan.semantic_queries {
-        let t = Instant::now();
-        let res = providers.candidate.semantic_candidates(sq, 5).await;
-        if let Ok(arr) = res {
-            for ev in arr.iter().take(5) {
-                if let Some(file) = ev.get("file").and_then(|f| f.as_str()) {
-                    candidates.push(Evidence {
-                        source: context_rank::types::RetrievalSource::Semantic,
-                        file: file.to_string(),
-                        start_line: ev
-                            .get("startLine")
-                            .or_else(|| ev.get("start_line"))
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as u32),
-                        end_line: ev
-                            .get("endLine")
-                            .or_else(|| ev.get("end_line"))
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as u32),
-                        symbol: ev
-                            .get("symbol")
-                            .and_then(|s| s.as_str())
-                            .map(|s| s.to_string()),
-                        symbol_kind: ev
-                            .get("symbolKind")
-                            .and_then(|k| k.as_str())
-                            .map(|k| k.to_string()),
-                        text: ev
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .map(|t| t.to_string()),
-                        score: ev.get("score").and_then(|s| s.as_f64()),
-                        relation: Some(context_rank::types::EvidenceRelation::Unknown),
-                        authority_score: None,
-                        final_score: None,
-                        provenance: Some("oci:semantic".into()),
-                        metadata: Some(ev.clone()),
-                    });
-                }
-            }
-        }
-        retrievers_used.push(format!(
-            "oci-semantic:{}",
-            sq.chars().take(20).collect::<String>()
-        ));
-        let _ = t.elapsed();
-    }
-
-    // Native Rust structural graph + exact fallback (R3)
+    // Native Rust structural graph
     for gq in &plan.graph_queries {
-        let t = Instant::now();
         let mut added = 0usize;
         if let Ok(conn) = structural_store::open_db(&project.root) {
             if gq.direction == "callers" || gq.direction == "both" {
                 if let Ok(callers) = structural_store::find_callers(&conn, &gq.symbol) {
                     for edge in callers.iter().take(5) {
-                        // Caller evidence: file where call occurs
                         let caller_sym = edge.resolved_symbol_id.as_deref().and_then(|id| {
                             structural_store::find_symbol_by_id(&conn, id)
                                 .ok()
                                 .flatten()
                         });
-                        // Try to load text for caller context
                         let text = caller_sym
                             .as_ref()
                             .map(|s| load_symbol_snippet(&project.root, s))
-                            .or_else(|| {
-                                // fallback to call site snippet
-                                load_file_snippet(&project.root, &edge.file, edge.line)
-                            });
+                            .or_else(|| load_file_snippet(&project.root, &edge.file, edge.line));
                         candidates.push(Evidence {
                             source: context_rank::types::RetrievalSource::Graph,
                             file: edge.file.clone(),
@@ -237,17 +336,10 @@ pub async fn retrieve_context(
                         added += 1;
                     }
                 }
-                // Exact fallback for callers is already covered by plan.exact_queries (Reference)
-                // But we add explicit reference fallback if graph returned nothing
-                if added == 0 {
-                    // Use exact reference search as fallback (already in exact candidates, but we tag)
-                    // No extra work: exact already provides caller references
-                }
             }
             if gq.direction == "callees" || gq.direction == "both" {
                 if let Ok(callees) = structural_store::find_callees(&conn, &gq.symbol) {
                     for edge in callees.iter().take(5) {
-                        // Resolve callee symbol to its definition location
                         let callee_sym = edge
                             .resolved_symbol_id
                             .as_deref()
@@ -284,7 +376,6 @@ pub async fn retrieve_context(
                             });
                             added += 1;
                         } else {
-                            // Unresolved callee: still provide caller context
                             candidates.push(Evidence {
                                 source: context_rank::types::RetrievalSource::Graph,
                                 file: edge.file.clone(),
@@ -307,12 +398,10 @@ pub async fn retrieve_context(
             }
         }
         retrievers_used.push(format!("rust-graph:{}:{}", gq.symbol, added));
-        let _ = t.elapsed();
     }
 
-    // Native Rust structural test lookup + exact fallback (R3)
+    // Native Rust structural test lookup
     for tq in &plan.test_queries {
-        let t = Instant::now();
         let mut added = 0usize;
         if let Ok(conn) = structural_store::open_db(&project.root) {
             if let Ok(tests) = structural_store::find_tests_related(&conn, tq) {
@@ -336,9 +425,7 @@ pub async fn retrieve_context(
                     added += 1;
                 }
             }
-            // Also consider file-kind test files via discovery: find tests by filename pattern via ProjectIndex
             if added == 0 {
-                // Use ProjectIndex to find test files matching query
                 let lower = tq.to_lowercase();
                 for f in project
                     .files
@@ -373,59 +460,225 @@ pub async fn retrieve_context(
                 }
             }
         }
-        // Keep OCI test as optional shadow for semantic fuzzy until R4; not used for ranking in R3 unless native empty
-        // We could call OCI semantic for fuzzy test intent as fallback, but per R3 spec semantic OCI remains optional
-        // For now, if native added ==0, try OCI test candidates as semantic fallback (low score)
-        if added == 0 {
-            if let Ok(arr) = providers.candidate.test_candidates(tq).await {
-                for ev in arr.iter().take(2) {
-                    if let Some(file) = ev.get("file").and_then(|f| f.as_str()) {
-                        candidates.push(Evidence {
-                            source: context_rank::types::RetrievalSource::Test,
-                            file: file.to_string(),
-                            start_line: ev
-                                .get("startLine")
-                                .or_else(|| ev.get("start_line"))
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32),
-                            end_line: ev
-                                .get("endLine")
-                                .or_else(|| ev.get("end_line"))
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32),
-                            symbol: ev
-                                .get("symbol")
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string()),
-                            symbol_kind: ev
-                                .get("symbolKind")
-                                .or_else(|| ev.get("symbol_kind"))
-                                .and_then(|k| k.as_str())
-                                .map(|k| k.to_string()),
-                            text: ev
-                                .get("text")
-                                .and_then(|t| t.as_str())
-                                .map(|t| t.to_string()),
-                            score: ev.get("score").and_then(|s| s.as_f64()),
-                            relation: Some(context_rank::types::EvidenceRelation::Test),
-                            authority_score: None,
-                            final_score: None,
-                            provenance: Some("oci:test:fallback".into()),
-                            metadata: Some(ev.clone()),
-                        });
-                        added += 1;
+        retrievers_used.push(format!("rust-test:{}:{}", tq, added));
+    }
+    let structural_ms = t_struct.elapsed().as_millis();
+
+    // Determine sufficiency before heavy retrieval
+    let suff = sufficiency(classified.query_type, &candidates, query);
+    // For R4, BM25+semantic for CONCEPTUAL, MIXED, TEST; for others only if insufficient
+    let run_bm25 = match classified.query_type {
+        QueryType::Conceptual | QueryType::Mixed | QueryType::Test => true,
+        QueryType::Symbol | QueryType::Dependency if suff == EvidenceSufficiency::Insufficient => {
+            true
+        }
+        QueryType::Exact => false,
+        _ => suff == EvidenceSufficiency::Insufficient,
+    };
+    let run_semantic = match classified.query_type {
+        QueryType::Conceptual | QueryType::Mixed => true,
+        QueryType::Test => false, // semantic only if useful for test — we skip for now
+        QueryType::Symbol if suff == EvidenceSufficiency::Insufficient => true,
+        _ => suff == EvidenceSufficiency::Insufficient && run_bm25,
+    };
+
+    let mut bm25_candidates: Vec<(Evidence, usize, f64)> = Vec::new();
+    let mut vector_candidates: Vec<(Evidence, usize, f64)> = Vec::new();
+    let mut bm25_ms: u128 = 0;
+    let mut semantic_ms: u128 = 0;
+
+    // BM25 native
+    if run_bm25 {
+        let t_bm25 = Instant::now();
+        if let Ok(conn) = structural_store::open_db(&project.root) {
+            for sq in &plan.semantic_queries {
+                match context_index::bm25::search_bm25(&conn, sq, 10) {
+                    Ok(results) => {
+                        for (rank, bm) in results.into_iter().enumerate() {
+                            let text = load_chunk_snippet(&project.root, &bm);
+                            let ev = Evidence {
+                                source: context_rank::types::RetrievalSource::Bm25,
+                                file: bm.file.clone(),
+                                start_line: Some(bm.start_line),
+                                end_line: Some(bm.end_line),
+                                symbol: bm.symbol.clone(),
+                                symbol_kind: None,
+                                text: Some(text),
+                                score: Some(bm.score),
+                                relation: Some(context_rank::types::EvidenceRelation::Unknown),
+                                authority_score: None,
+                                final_score: None,
+                                provenance: Some("rust:bm25".into()),
+                                metadata: None,
+                            };
+                            bm25_candidates.push((ev, rank + 1, bm.score));
+                        }
+                        retrievers_used.push(format!(
+                            "rust-bm25:{}:{}",
+                            sq.chars().take(15).collect::<String>(),
+                            bm25_candidates.len()
+                        ));
+                        break; // only first semantic query for BM25
+                    }
+                    Err(e) => {
+                        tracing::debug!(error=%e, "bm25 search failed");
+                        retrievers_used.push("rust-bm25:0".into());
+                    }
+                }
+            }
+            // Also BM25 for test queries if needed
+            if bm25_candidates.is_empty() && !plan.test_queries.is_empty() {
+                for tq in &plan.test_queries {
+                    if let Ok(res) = context_index::bm25::search_bm25(&conn, tq, 5) {
+                        for (rank, bm) in res.into_iter().enumerate() {
+                            let ev = Evidence {
+                                source: context_rank::types::RetrievalSource::Bm25,
+                                file: bm.file.clone(),
+                                start_line: Some(bm.start_line),
+                                end_line: Some(bm.end_line),
+                                symbol: bm.symbol.clone(),
+                                symbol_kind: None,
+                                text: load_chunk_snippet(&project.root, &bm).into(),
+                                score: Some(bm.score),
+                                relation: Some(context_rank::types::EvidenceRelation::Test),
+                                authority_score: None,
+                                final_score: None,
+                                provenance: Some("rust:bm25".into()),
+                                metadata: None,
+                            };
+                            bm25_candidates.push((ev, rank + 1, bm.score));
+                        }
+                        if !bm25_candidates.is_empty() {
+                            break;
+                        }
                     }
                 }
             }
         }
-        retrievers_used.push(format!("rust-test:{}:{}", tq, added));
-        let _ = t.elapsed();
+        bm25_ms = t_bm25.elapsed().as_millis();
+    } else {
+        bm25_ms = 0;
+        retrievers_used.push("rust-bm25:skipped".into());
+    }
+
+    // Native vector retrieval
+    if run_semantic {
+        let t_sem = Instant::now();
+        // Choose embedder: prefer Ollama if env indicates, else fake for deterministic offline
+        let use_ollama = std::env::var("CONTEXTD_USE_OLLAMA")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        // For R4, we keep nomic-embed-text baseline via Ollama if available, else fake. Winner selection handled in docs.
+        let embedder: std::sync::Arc<dyn context_index::embed::Embedder> = if use_ollama {
+            std::sync::Arc::new(context_index::embed::OllamaEmbedder::nomic())
+        } else {
+            // ponytail: fake deterministic for offline tests; Ollama when available. No extra deps.
+            std::sync::Arc::new(context_index::embed::FakeEmbedder::new(
+                "nomic-embed-text",
+                768,
+            ))
+        };
+        let fp = embedder.fingerprint();
+        // Check model change invalidation
+        if let Ok(conn) = structural_store::open_db(&project.root) {
+            let _ = context_index::vector::invalidate_stale_model(&conn, &fp);
+        }
+        for sq in &plan.semantic_queries {
+            let q = sq.clone();
+            // Embed query without holding DB connection (Connection is !Send)
+            let qvec = {
+                let cached = context_index::embed::QUERY_CACHE
+                    .get(fp.model_id.as_str(), &q)
+                    .await;
+                if let Some(v) = cached {
+                    v
+                } else {
+                    match embedder.embed_query(&q).await {
+                        Ok(v) => {
+                            context_index::embed::QUERY_CACHE
+                                .insert(fp.model_id.as_str(), &q, v.clone())
+                                .await;
+                            v
+                        }
+                        Err(e) => {
+                            tracing::debug!(error=%e, "query embed failed");
+                            retrievers_used.push("rust-semantic:0".into());
+                            continue;
+                        }
+                    }
+                }
+            };
+            // Now open DB for brute search (sync, no await)
+            let conn = match structural_store::open_db(&project.root) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(error=%e, "open_db failed for vector");
+                    retrievers_used.push("rust-semantic:0".into());
+                    continue;
+                }
+            };
+            let cnt = context_index::vector::count_vectors(&conn, &fp).unwrap_or(0);
+            if cnt == 0 {
+                tracing::debug!("no vectors for model {}, skipping semantic", fp.model_id);
+                retrievers_used.push(format!("rust-semantic:0:{}", fp.model_id));
+                continue;
+            }
+            match context_index::vector::search_brute(&conn, &qvec, &fp, 10) {
+                Ok(results) => {
+                    for (rank, vc) in results.into_iter().enumerate() {
+                        let text = load_file_snippet(&project.root, &vc.file, vc.start_line)
+                            .unwrap_or_else(|| {
+                                format!("{} {}", vc.file, vc.symbol.clone().unwrap_or_default())
+                            });
+                        let ev = Evidence {
+                            source: context_rank::types::RetrievalSource::Semantic,
+                            file: vc.file.clone(),
+                            start_line: Some(vc.start_line),
+                            end_line: Some(vc.end_line),
+                            symbol: vc.symbol.clone(),
+                            symbol_kind: None,
+                            text: Some(text),
+                            score: Some(vc.score),
+                            relation: Some(context_rank::types::EvidenceRelation::Unknown),
+                            authority_score: None,
+                            final_score: None,
+                            provenance: Some("rust:semantic".into()),
+                            metadata: None,
+                        };
+                        vector_candidates.push((ev, rank + 1, vc.score));
+                    }
+                    retrievers_used.push(format!(
+                        "rust-semantic:{}:{}",
+                        q.chars().take(15).collect::<String>(),
+                        vector_candidates.len()
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(error=%e, "vector search failed");
+                    retrievers_used.push("rust-semantic:0".into());
+                }
+            }
+        }
+        semantic_ms = t_sem.elapsed().as_millis();
+    } else {
+        retrievers_used.push("rust-semantic:skipped".into());
+    }
+
+    // Fuse BM25 + vector via RRF (rank-normalized)
+    if !bm25_candidates.is_empty() || !vector_candidates.is_empty() {
+        let fused = fuse_rrf(bm25_candidates, vector_candidates, 60);
+        // Add fused evidences — high semantic docs must not auto-beat verified definitions, but RRF already rank-normalized
+        // Authority will still penalize docs when impl wanted, so we keep.
+        for ev in fused {
+            candidates.push(ev);
+        }
     }
 
     // Authority
     let t_auth = Instant::now();
     let scored = apply_authority(candidates, classified.query_type, query);
-    let auth_ms = t_auth.elapsed().as_millis();
+    let rank_ms = t_auth.elapsed().as_millis();
 
     // Fuse
     let t_fuse = Instant::now();
@@ -454,7 +707,6 @@ pub async fn retrieve_context(
 
     let elapsed_ms = t0.elapsed().as_millis();
 
-    // Token metrics
     let candidate_count = fused.ranked.len() + fused.deduped + fused.collapsed;
     let stats = PipelineStats {
         candidate_count,
@@ -464,12 +716,22 @@ pub async fn retrieve_context(
         retrievers_used: retrievers_used
             .into_iter()
             .chain(vec![
-                format!("authority:{}", auth_ms),
+                format!("authority:{}", rank_ms),
                 format!("fuse:{}", fuse_ms),
                 format!("pack:{}", pack_ms),
+                format!("exact_ms:{}", exact_ms),
+                format!("structural_ms:{}", structural_ms),
+                format!("bm25_ms:{}", bm25_ms),
+                format!("semantic_ms:{}", semantic_ms),
             ])
             .collect(),
         elapsed_ms,
+        exact_ms,
+        structural_ms,
+        bm25_ms,
+        semantic_ms,
+        rank_ms,
+        pack_ms,
     };
 
     Ok(ContextResult {
@@ -489,11 +751,9 @@ fn load_symbol_snippet(root: &Path, sym: &context_index::structural::types::Symb
         let end = sym.end_byte.min(bytes.len());
         if end > start {
             let slice = &content[start..end];
-            // Take first 400 chars, single line-ish
             let txt: String = slice.chars().take(400).collect();
             return txt.trim().to_string();
         }
-        // fallback to line
         if let Some(line) = content
             .lines()
             .nth((sym.start_line as usize).saturating_sub(1))
@@ -512,4 +772,21 @@ fn load_file_snippet(root: &Path, file: &str, line: u32) -> Option<String> {
         }
     }
     None
+}
+
+fn load_chunk_snippet(root: &Path, bm: &context_index::bm25::Bm25Candidate) -> String {
+    let path = root.join(&bm.file);
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let lines: Vec<&str> = content.lines().collect();
+        let start = (bm.start_line as usize).saturating_sub(1);
+        let end = (bm.end_line as usize).min(lines.len());
+        if start < end {
+            let slice = lines[start..end].join("\n");
+            return slice.chars().take(600).collect();
+        }
+        if let Some(l) = lines.get(start) {
+            return l.chars().take(400).collect();
+        }
+    }
+    format!("{}:{}", bm.file, bm.start_line)
 }

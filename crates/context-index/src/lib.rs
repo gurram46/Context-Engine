@@ -2,12 +2,16 @@
 //! Owns project root, ignore rules, file metadata, and `rg` orchestration.
 //! Semantic/symbol/graph remain in V2/OCI for now.
 
+pub mod bm25;
 pub mod classification;
 pub mod discovery;
+pub mod embed;
 pub mod exact;
 pub mod hash;
 pub mod project_root;
 pub mod structural;
+pub mod vector;
+pub mod watcher;
 
 pub use classification::{classify_file, FileKind};
 pub use discovery::{FileRecord, ProjectIndex, ScanStats};

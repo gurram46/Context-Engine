@@ -24,3 +24,5 @@ tree-sitter-go = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"
 rusqlite = { version = "0.32", features = ["bundled"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

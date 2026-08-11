@@ -6,7 +6,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Index location — worktree-safe.
 /// Chooses `<repo>/.context/index/structural.db`
@@ -141,6 +141,58 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_edges_caller ON call_edges(caller_symbol_id);
         CREATE INDEX IF NOT EXISTS idx_edges_callee ON call_edges(callee_name);
         CREATE INDEX IF NOT EXISTS idx_edges_resolved ON call_edges(resolved_symbol_id);
+
+        CREATE TABLE IF NOT EXISTS structural_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        -- R4 BM25 native lexical index
+        CREATE TABLE IF NOT EXISTS bm25_documents (
+            doc_id TEXT PRIMARY KEY,
+            chunk_id TEXT NOT NULL,
+            file TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            length INTEGER NOT NULL,
+            symbol TEXT,
+            start_line INTEGER,
+            end_line INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_bm25_docs_file ON bm25_documents(file);
+        CREATE INDEX IF NOT EXISTS idx_bm25_docs_hash ON bm25_documents(content_hash);
+
+        CREATE TABLE IF NOT EXISTS bm25_postings (
+            term TEXT NOT NULL,
+            doc_id TEXT NOT NULL,
+            tf INTEGER NOT NULL,
+            PRIMARY KEY(term, doc_id),
+            FOREIGN KEY(doc_id) REFERENCES bm25_documents(doc_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_bm25_post_term ON bm25_postings(term);
+        CREATE INDEX IF NOT EXISTS idx_bm25_post_doc ON bm25_postings(doc_id);
+
+        CREATE TABLE IF NOT EXISTS bm25_terms (
+            term TEXT PRIMARY KEY,
+            df INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS bm25_stats (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        -- R4D native vector store (content-hash keyed for reuse)
+        CREATE TABLE IF NOT EXISTS vectors (
+            content_hash TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            vector BLOB NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(content_hash, model_id, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_vectors_model ON vectors(model_id, version);
+        CREATE INDEX IF NOT EXISTS idx_vectors_hash ON vectors(content_hash);
         "#,
     )?;
 
@@ -553,7 +605,7 @@ pub fn find_symbol_by_id(conn: &Connection, id: &str) -> Result<Option<Symbol>> 
 
 pub fn upsert_call_edges(conn: &mut Connection, edges: &[CallEdge]) -> Result<()> {
     let tx = conn.transaction()?;
-    tx.execute("DELETE FROM call_edges", [])?; // For simplicity, rebuild all edges each indexing run
+    tx.execute("DELETE FROM call_edges", [])?; // For simplicity, rebuild all edges each indexing run (legacy)
     for e in edges {
         tx.execute(
             "INSERT INTO call_edges (caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -569,6 +621,214 @@ pub fn upsert_call_edges(conn: &mut Connection, edges: &[CallEdge]) -> Result<()
     }
     tx.commit()?;
     Ok(())
+}
+
+pub fn insert_call_edges(conn: &mut Connection, edges: &[CallEdge]) -> Result<usize> {
+    if edges.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    let mut inserted = 0usize;
+    for e in edges {
+        tx.execute(
+            "INSERT INTO call_edges (caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                e.caller_symbol_id,
+                e.callee_name,
+                e.resolved_symbol_id,
+                e.confidence.as_str(),
+                e.file,
+                e.line
+            ],
+        )?;
+        inserted += 1;
+    }
+    tx.commit()?;
+    Ok(inserted)
+}
+
+pub fn delete_call_edges_for_files(conn: &Connection, files: &[String]) -> Result<usize> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = files.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("DELETE FROM call_edges WHERE file IN ({})", placeholders);
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        files.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    Ok(stmt.execute(params.as_slice())?)
+}
+
+pub fn delete_call_edges_for_callee_names_excluding_files(
+    conn: &Connection,
+    names: &[String],
+    exclude_files: &[String],
+) -> Result<usize> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let name_placeholders = names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut sql = format!(
+        "DELETE FROM call_edges WHERE callee_name IN ({})",
+        name_placeholders
+    );
+    let mut all_params: Vec<String> = names.to_vec();
+    if !exclude_files.is_empty() {
+        let file_placeholders = exclude_files
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND file NOT IN ({})", file_placeholders));
+        all_params.extend(exclude_files.iter().cloned());
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let params_refs: Vec<&dyn rusqlite::ToSql> = all_params
+        .iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .collect();
+    Ok(stmt.execute(params_refs.as_slice())?)
+}
+
+pub fn load_symbols_for_file(conn: &Connection, file: &str) -> Result<Vec<Symbol>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent FROM symbols WHERE file=?1",
+    )?;
+    let rows = stmt.query_map(params![file], |row| {
+        Ok(Symbol {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            qualified_name: row.get(2)?,
+            kind: SymbolKind::from_str(&row.get::<_, String>(3)?),
+            file: row.get(4)?,
+            language: Language::from_str(&row.get::<_, String>(5)?),
+            start_line: row.get(6)?,
+            end_line: row.get(7)?,
+            start_byte: row.get::<_, i64>(8)? as usize,
+            end_byte: row.get::<_, i64>(9)? as usize,
+            visibility: match row.get::<_, String>(10)?.as_str() {
+                "public" => Visibility::Public,
+                "private" => Visibility::Private,
+                _ => Visibility::Unknown,
+            },
+            parent: row.get(11)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn load_refs_for_file(conn: &Connection, file: &str) -> Result<Vec<Reference>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, file, line, parent_symbol, kind, start_byte, end_byte FROM refs WHERE file=?1",
+    )?;
+    let rows = stmt.query_map(params![file], |row| {
+        Ok(Reference {
+            name: row.get(0)?,
+            file: row.get(1)?,
+            line: row.get(2)?,
+            parent_symbol: row.get(3)?,
+            kind: ReferenceKind::from_str(&row.get::<_, String>(4)?),
+            start_byte: row.get::<_, i64>(5)? as usize,
+            end_byte: row.get::<_, i64>(6)? as usize,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn load_refs_by_callee_names_excluding_files(
+    conn: &Connection,
+    names: &[String],
+    exclude_files: &[String],
+) -> Result<Vec<Reference>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let name_placeholders = names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut sql = format!(
+        "SELECT name, file, line, parent_symbol, kind, start_byte, end_byte FROM refs WHERE kind='call' AND name IN ({})",
+        name_placeholders
+    );
+    let mut all_params: Vec<String> = names.to_vec();
+    if !exclude_files.is_empty() {
+        let file_placeholders = exclude_files
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND file NOT IN ({})", file_placeholders));
+        all_params.extend(exclude_files.iter().cloned());
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let params_refs: Vec<&dyn rusqlite::ToSql> = all_params
+        .iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt.query_map(params_refs.as_slice(), |row| {
+        Ok(Reference {
+            name: row.get(0)?,
+            file: row.get(1)?,
+            line: row.get(2)?,
+            parent_symbol: row.get(3)?,
+            kind: ReferenceKind::from_str(&row.get::<_, String>(4)?),
+            start_byte: row.get::<_, i64>(5)? as usize,
+            end_byte: row.get::<_, i64>(6)? as usize,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn count_call_edges(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))?)
+}
+
+pub fn get_generation(conn: &Connection) -> Result<u64> {
+    let opt: Option<String> = conn
+        .query_row(
+            "SELECT value FROM structural_meta WHERE key='generation'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(opt.and_then(|s| s.parse().ok()).unwrap_or(0))
+}
+
+pub fn set_generation(conn: &Connection, gen: u64) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO structural_meta (key, value) VALUES ('generation', ?1)",
+        params![gen.to_string()],
+    )?;
+    Ok(())
+}
+
+pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO structural_meta (key, value) VALUES (?1, ?2)",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let opt: Option<String> = conn
+        .query_row(
+            "SELECT value FROM structural_meta WHERE key=?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(opt)
 }
 
 #[cfg(test)]

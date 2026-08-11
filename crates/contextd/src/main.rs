@@ -8,6 +8,7 @@ use candidate::CandidateProvider;
 use context_core::{
     ContextSearchParams, DependencyTraceParams, SymbolLookupParams, TestLookupParams,
 };
+use context_index::embed::Embedder;
 use pipeline::{retrieve_context, Providers};
 use project::ProjectCache;
 use rmcp::{
@@ -261,13 +262,13 @@ impl Contextd {
 
     #[tool(description = "Diagnostics: version, branch, index, rg, node.")]
     async fn context_status(&self) -> Result<CallToolResult, McpError> {
-        let v = self
-            .bridge
-            .call_json("context_status", json!({}))
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // R4: try V2 status but don't require it (Node may be stopped)
+        let v = match self.bridge.call_json("context_status", json!({})).await {
+            Ok(val) => val,
+            Err(_) => json!({}),
+        };
 
-        let mut merged = v.clone();
+        let mut merged = if v.is_object() { v.clone() } else { json!({}) };
         if let Some(obj) = merged.as_object_mut() {
             let project_root = std::env::var("CONTEXT_ENGINE_PROJECT_ROOT").unwrap_or_else(|_| {
                 std::env::current_dir()
@@ -290,15 +291,27 @@ impl Contextd {
                     json!(idx.root.display().to_string()),
                 );
             }
-            // R3: backends
+            // R4: backends — production retrieval no longer requires Node/OCI
             obj.insert("routingBackend".to_string(), json!("rust"));
             obj.insert("rankingBackend".to_string(), json!("rust"));
             obj.insert("packingBackend".to_string(), json!("rust"));
             obj.insert("exactBackend".to_string(), json!("rust-rg"));
-            obj.insert("semanticBackend".to_string(), json!("v2-oci"));
+            obj.insert("structuralBackend".to_string(), json!("rust-tree-sitter"));
             obj.insert("symbolBackend".to_string(), json!("rust"));
             obj.insert("graphBackend".to_string(), json!("rust"));
-            obj.insert("structuralBackend".to_string(), json!("rust-tree-sitter"));
+            obj.insert("bm25Backend".to_string(), json!("rust"));
+            obj.insert("semanticBackend".to_string(), json!("rust"));
+            let embedding_runtime = if std::env::var("CONTEXTD_USE_OLLAMA")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false)
+            {
+                // Check if Ollama reachable? For status we just report configured
+                json!("ollama")
+            } else {
+                json!("fake") // ponytail: deterministic fake for offline; Ollama when CONTEXTD_USE_OLLAMA=1
+            };
+            obj.insert("embeddingRuntime".to_string(), embedding_runtime);
+            obj.insert("watcherBackend".to_string(), json!("rust-notify"));
             // structural stats if available
             if let Ok(root) = context_index::ProjectRoot::resolve(None) {
                 let si = context_index::structural::StructuralIndex::new(&root);
@@ -311,6 +324,29 @@ impl Contextd {
                         .display()
                         .to_string()),
                 );
+                // freshness
+                if let Ok(conn) = context_index::structural::store::open_db(root.path()) {
+                    if let Ok(gen) = context_index::structural::store::get_generation(&conn) {
+                        obj.insert("structuralGeneration".to_string(), json!(gen));
+                    }
+                    if let Ok(bm25_cnt) = context_index::bm25::count_bm25_docs(&conn) {
+                        obj.insert("bm25Documents".to_string(), json!(bm25_cnt));
+                    }
+                    // vector count for current model
+                    let fp = if std::env::var("CONTEXTD_USE_OLLAMA")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                    {
+                        context_index::embed::OllamaEmbedder::nomic().fingerprint()
+                    } else {
+                        context_index::embed::FakeEmbedder::new("nomic-embed-text", 768)
+                            .fingerprint()
+                    };
+                    if let Ok(vcnt) = context_index::vector::count_vectors(&conn, &fp) {
+                        obj.insert("vectorCount".to_string(), json!(vcnt));
+                        obj.insert("embeddingModel".to_string(), json!(fp.model_id));
+                    }
+                }
             }
         }
 

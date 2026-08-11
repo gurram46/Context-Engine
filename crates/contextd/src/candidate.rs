@@ -299,6 +299,7 @@ impl CandidateProvider {
         Ok(Self::extract_candidates_from_tool_result(res))
     }
 
+    #[allow(dead_code)]
     pub async fn semantic_candidates(
         &self,
         query: &str,
@@ -328,6 +329,7 @@ impl CandidateProvider {
         Ok(Self::extract_candidates_from_tool_result(res))
     }
 
+    #[allow(dead_code)]
     pub async fn test_candidates(&self, query: &str) -> Result<Vec<Value>, ContextError> {
         let res = self
             .call_raw(

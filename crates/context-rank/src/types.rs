@@ -7,6 +7,7 @@ pub enum RetrievalSource {
     Semantic,
     Graph,
     Test,
+    Bm25,
 }
 
 impl RetrievalSource {
@@ -17,6 +18,7 @@ impl RetrievalSource {
             Self::Semantic => "semantic",
             Self::Graph => "graph",
             Self::Test => "test",
+            Self::Bm25 => "bm25",
         }
     }
 }
