@@ -487,11 +487,20 @@ pub async fn retrieve_context(
     let mut bm25_ms: u128 = 0;
     let mut semantic_ms: u128 = 0;
 
-    // BM25 native
+    // BM25 native — for SYMBOL/DEPENDENCY insufficient, fallback to raw query if no semantic_queries
     if run_bm25 {
         let t_bm25 = Instant::now();
         if let Ok(conn) = structural_store::open_db(&project.root) {
-            for sq in &plan.semantic_queries {
+            let bm25_queries: Vec<String> = if !plan.semantic_queries.is_empty() {
+                plan.semantic_queries.clone()
+            } else if classified.query_type == QueryType::Symbol
+                || classified.query_type == QueryType::Dependency
+            {
+                vec![query.to_string()]
+            } else {
+                vec![]
+            };
+            for sq in &bm25_queries {
                 match context_index::bm25::search_bm25(&conn, sq, 10) {
                     Ok(results) => {
                         for (rank, bm) in results.into_iter().enumerate() {
@@ -587,7 +596,16 @@ pub async fn retrieve_context(
         if let Ok(conn) = structural_store::open_db(&project.root) {
             let _ = context_index::vector::invalidate_stale_model(&conn, &fp);
         }
-        for sq in &plan.semantic_queries {
+        let semantic_queries: Vec<String> = if !plan.semantic_queries.is_empty() {
+            plan.semantic_queries.clone()
+        } else if classified.query_type == QueryType::Symbol
+            && suff == EvidenceSufficiency::Insufficient
+        {
+            vec![query.to_string()]
+        } else {
+            vec![]
+        };
+        for sq in &semantic_queries {
             let q = sq.clone();
             // Embed query without holding DB connection (Connection is !Send)
             let qvec = {
