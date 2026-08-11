@@ -48,12 +48,14 @@ pub trait Embedder: Send + Sync {
 /// Deterministic fake embedder for tests and fallback.
 /// Produces fixed vectors via blake3 hash, normalized.
 /// Not for quality benchmarking, but for incremental reuse and unit tests.
+#[cfg(test)]
 pub struct FakeEmbedder {
     model: String,
     dim: usize,
     version: String,
 }
 
+#[cfg(test)]
 impl FakeEmbedder {
     pub fn new(model: &str, dim: usize) -> Self {
         Self {
@@ -81,6 +83,7 @@ impl FakeEmbedder {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl Embedder for FakeEmbedder {
     fn model_id(&self) -> &str {
@@ -94,6 +97,46 @@ impl Embedder for FakeEmbedder {
     }
     async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
         Ok(self.hash_to_vec(query))
+    }
+}
+
+/// SlowTestEmbedder — deterministic slow embedder for async freshness test.
+/// Wraps FakeEmbedder and sleeps 2s per embedding to prove structural/exact not blocked.
+#[cfg(test)]
+pub struct SlowTestEmbedder {
+    inner: FakeEmbedder,
+    delay_ms: u64,
+}
+
+#[cfg(test)]
+impl SlowTestEmbedder {
+    pub fn new(delay_ms: u64) -> Self {
+        Self {
+            inner: FakeEmbedder::new("slow-test", 8),
+            delay_ms,
+        }
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Embedder for SlowTestEmbedder {
+    fn model_id(&self) -> &str {
+        "slow-test"
+    }
+    fn dimension(&self) -> usize {
+        8
+    }
+    fn version(&self) -> &str {
+        "slow-v1"
+    }
+    async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        self.inner.embed_query(query).await
+    }
+    async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        self.inner.embed_documents(texts).await
     }
 }
 

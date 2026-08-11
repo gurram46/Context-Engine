@@ -258,6 +258,7 @@ dependencies = [
  "context-core",
  "context-index",
  "context-rank",
+ "reqwest",
  "rmcp",
  "schemars",
  "serde",

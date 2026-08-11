@@ -561,22 +561,26 @@ pub async fn retrieve_context(
         retrievers_used.push("rust-bm25:skipped".into());
     }
 
-    // Native vector retrieval
+    // Native vector retrieval — REAL semantic only, FakeEmbedder is test-only
     if run_semantic {
         let t_sem = Instant::now();
-        // Choose embedder: prefer Ollama if env indicates, else fake for deterministic offline
-        let use_ollama = std::env::var("CONTEXTD_USE_OLLAMA")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
-        // For R4, we keep nomic-embed-text baseline via Ollama if available, else fake. Winner selection handled in docs.
-        let embedder: std::sync::Arc<dyn context_index::embed::Embedder> = if use_ollama {
-            std::sync::Arc::new(context_index::embed::OllamaEmbedder::nomic())
-        } else {
-            // ponytail: fake deterministic for offline tests; Ollama when available. No extra deps.
-            std::sync::Arc::new(context_index::embed::FakeEmbedder::new(
-                "nomic-embed-text",
-                768,
-            ))
+        // Production uses genuine Ollama embedding; Fake is test-only and never used here
+        // Selected winner from real benchmark: all-minilm (384d, Apache-2.0) beats nomic on R@1/MRR with lower memory/disk
+        let embedder: std::sync::Arc<dyn context_index::embed::Embedder> = {
+            let model =
+                std::env::var("CONTEXTD_EMBED_MODEL").unwrap_or_else(|_| "all-minilm".to_string());
+            if model == "nomic-embed-text" {
+                std::sync::Arc::new(context_index::embed::OllamaEmbedder::nomic())
+            } else if model == "all-minilm" {
+                std::sync::Arc::new(context_index::embed::OllamaEmbedder::with_model(
+                    "all-minilm",
+                    384,
+                ))
+            } else {
+                std::sync::Arc::new(context_index::embed::OllamaEmbedder::with_model(
+                    &model, 768,
+                ))
+            }
         };
         let fp = embedder.fingerprint();
         // Check model change invalidation

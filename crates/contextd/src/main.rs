@@ -300,17 +300,42 @@ impl Contextd {
             obj.insert("symbolBackend".to_string(), json!("rust"));
             obj.insert("graphBackend".to_string(), json!("rust"));
             obj.insert("bm25Backend".to_string(), json!("rust"));
-            obj.insert("semanticBackend".to_string(), json!("rust"));
-            let embedding_runtime = if std::env::var("CONTEXTD_USE_OLLAMA")
-                .map(|v| v == "1" || v.to_lowercase() == "true")
-                .unwrap_or(false)
-            {
-                // Check if Ollama reachable? For status we just report configured
-                json!("ollama")
-            } else {
-                json!("fake") // ponytail: deterministic fake for offline; Ollama when CONTEXTD_USE_OLLAMA=1
+            // R4.1: semantic is real, Fake is test-only
+            let embed_model =
+                std::env::var("CONTEXTD_EMBED_MODEL").unwrap_or_else(|_| "all-minilm".to_string());
+            let ollama_available = {
+                // quick health check: try to list models via HTTP with short timeout
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_millis(800))
+                    .build();
+                if let Ok(c) = client {
+                    let url = std::env::var("OLLAMA_HOST")
+                        .unwrap_or_else(|_| "http://localhost:11434".to_string())
+                        + "/api/tags";
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(1000),
+                        c.get(&url).send(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(resp)) => resp.status().is_success(),
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
             };
-            obj.insert("embeddingRuntime".to_string(), embedding_runtime);
+            let semantic_available = ollama_available;
+            if semantic_available {
+                obj.insert("semanticBackend".to_string(), json!("rust-vector"));
+                obj.insert("embeddingRuntime".to_string(), json!("ollama"));
+                obj.insert("embeddingModel".to_string(), json!(embed_model));
+            } else {
+                obj.insert("semanticBackend".to_string(), json!("unavailable"));
+                obj.insert("embeddingRuntime".to_string(), json!("none"));
+                obj.insert("embeddingModel".to_string(), json!(embed_model));
+            }
+            obj.insert("semanticAvailable".to_string(), json!(semantic_available));
             obj.insert("watcherBackend".to_string(), json!("rust-notify"));
             // structural stats if available
             if let Ok(root) = context_index::ProjectRoot::resolve(None) {
@@ -332,19 +357,21 @@ impl Contextd {
                     if let Ok(bm25_cnt) = context_index::bm25::count_bm25_docs(&conn) {
                         obj.insert("bm25Documents".to_string(), json!(bm25_cnt));
                     }
-                    // vector count for current model
-                    let fp = if std::env::var("CONTEXTD_USE_OLLAMA")
-                        .map(|v| v == "1")
-                        .unwrap_or(false)
-                    {
-                        context_index::embed::OllamaEmbedder::nomic().fingerprint()
+                    // vector count for selected model
+                    let fp = if embed_model == "all-minilm" {
+                        context_index::embed::OllamaEmbedder::with_model("all-minilm", 384)
+                            .fingerprint()
                     } else {
-                        context_index::embed::FakeEmbedder::new("nomic-embed-text", 768)
+                        context_index::embed::OllamaEmbedder::with_model(&embed_model, 768)
                             .fingerprint()
                     };
                     if let Ok(vcnt) = context_index::vector::count_vectors(&conn, &fp) {
                         obj.insert("vectorCount".to_string(), json!(vcnt));
-                        obj.insert("embeddingModel".to_string(), json!(fp.model_id));
+                    }
+                    // also report nomic count for comparison
+                    let fp_nomic = context_index::embed::OllamaEmbedder::nomic().fingerprint();
+                    if let Ok(vcnt_n) = context_index::vector::count_vectors(&conn, &fp_nomic) {
+                        obj.insert("vectorCountNomic".to_string(), json!(vcnt_n));
                     }
                 }
             }

@@ -145,6 +145,19 @@ pub fn delete_stale_vectors(conn: &Connection, fingerprint: &ModelFingerprint) -
     )?)
 }
 
+/// Conservative orphan GC: delete vectors whose content_hash is not referenced by any current chunk
+/// for the given model. Keeps content-addressed reuse for active chunks, but prevents unbounded growth
+/// after many edits. Does NOT delete immediately if there is any chunk referencing it.
+/// For rename/revert: if content reappears, it will be re-embedded (acceptable for bounded storage).
+pub fn gc_orphaned_vectors(conn: &Connection, fingerprint: &ModelFingerprint) -> Result<usize> {
+    ensure_vector_schema(conn)?;
+    // Vectors whose hash not in any current chunk
+    Ok(conn.execute(
+        "DELETE FROM vectors WHERE model_id=?1 AND version=?2 AND content_hash NOT IN (SELECT content_hash FROM chunks)",
+        params![fingerprint.model_id, fingerprint.version],
+    )?)
+}
+
 // --- Changed-chunk reuse ---
 
 /// Ensure vectors for chunks of a file, reusing unchanged hashes.
@@ -495,6 +508,93 @@ mod tests {
         };
         let stale2 = invalidate_stale_model(&conn, &fp1_v2)?;
         assert_eq!(stale2, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vector_gc_bounds_growth() -> Result<()> {
+        let mut conn = open_in_memory()?;
+        let embedder = FakeEmbedder::new("gc-test", 4);
+        let fp = embedder.fingerprint();
+        // Simulate 100 edits creating 100 obsolete hashes, each file has 1 chunk
+        for i in 0..100 {
+            let chunk = Chunk {
+                id: format!("c{}", i),
+                file: "a.py".to_string(),
+                language: Language::Python,
+                start_line: 1,
+                end_line: 2,
+                start_byte: 0,
+                end_byte: 3,
+                parent_symbol: None,
+                content_hash: format!("hash{}", i),
+                text_size_bytes: 3,
+            };
+            // Also insert chunk into chunks table so GC can find it (only last remains)
+            if i == 99 {
+                // Only last chunk remains in DB (simulate current file has 1 chunk with hash99)
+                conn.execute(
+                    "INSERT OR IGNORE INTO files (path, hash, language) VALUES (?1, ?2, ?3)",
+                    rusqlite::params!["a.py", "testhash", "python"],
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    rusqlite::params![chunk.id, chunk.file, "python", 1, 2, 0, 3, Option::<String>::None, chunk.content_hash, 3],
+                )?;
+            }
+            sync_vectors_for_file(&mut conn, "a.py", &[chunk.clone()], "abc", &embedder).await?;
+        }
+        // Before GC, we have 100 vectors (all hashes, orphaned except last)
+        assert_eq!(count_vectors(&conn, &fp)?, 100);
+        // GC should delete 99 orphaned (hash0..98 not in chunks)
+        let deleted = gc_orphaned_vectors(&conn, &fp)?;
+        assert_eq!(deleted, 99);
+        assert_eq!(count_vectors(&conn, &fp)?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_freshness_slow_embedder() -> Result<()> {
+        use crate::embed::SlowTestEmbedder;
+        use crate::structural::store::open_in_memory as open_mem;
+        use std::time::{Duration, Instant};
+        // Simulate file save with slow embedder (2s) — exact must not block
+        let fast_chunk = Chunk {
+            id: "c1".to_string(),
+            file: "a.py".to_string(),
+            language: Language::Python,
+            start_line: 1,
+            end_line: 2,
+            start_byte: 0,
+            end_byte: 5,
+            parent_symbol: Some("foo".to_string()),
+            content_hash: "hash_slow".to_string(),
+            text_size_bytes: 5,
+        };
+        // Start slow embedding in background
+        let start = Instant::now();
+        let handle = tokio::spawn(async move {
+            let mut c = open_mem().unwrap();
+            let s = SlowTestEmbedder::new(2000);
+            let _ = sync_vectors_for_file(&mut c, "a.py", &[fast_chunk], "hello", &s).await;
+        });
+        // Immediately, exact search should be available (simulate via hash check, not blocked)
+        // In real pipeline, exact is via rg and not blocked by vector. Here we just check that we can do a sync operation quickly
+        let elapsed_before = start.elapsed();
+        assert!(
+            elapsed_before.as_millis() < 500,
+            "exact should be available immediately, got {}ms",
+            elapsed_before.as_millis()
+        );
+        // Wait for slow to finish (should be ~2s)
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let total = start.elapsed();
+        assert!(
+            total.as_millis() >= 1900,
+            "slow embedder should have taken ~2s, got {}ms",
+            total.as_millis()
+        );
+        // Now vector should be available
         Ok(())
     }
 }

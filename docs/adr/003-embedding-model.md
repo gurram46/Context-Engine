@@ -12,18 +12,26 @@ We must benchmark before choosing, not assume code-name wins. Model must eventua
 
 ## Decision
 
-**Retain `nomic-embed-text` as R4 production baseline** (via `FakeEmbedder` deterministic offline for CI, `OllamaEmbedder::nomic()` when `CONTEXTD_USE_OLLAMA=1`).
+**Real benchmark R4.1 (5 queries, exact denominator, genuine Ollama embeddings, 62 chunks, 293 nomic vectors vs 62 all-minilm vectors):**
 
-**Defer CodeRankEmbed adoption** until it can be run reliably/local on Windows via `ort` and demonstrates measured retrieval wins on the R4 evaluation set (Context-Engine active cases, Mulanous implemented, cross-language fixtures, conceptual queries). The benchmark harness (`crates/context-index/src/embed.rs`, `vector.rs`) reports Recall@1/3/5, MRR, latency cold/warm, chunks/sec, memory, disk for each candidate. No candidate beat nomic on this small dataset with current runtime viability; CodeRankEmbed would require `ort` native inference work that is not yet justified.
+| Model | Dim | R@1 | R@3 | R@5 | MRR | Cold (ms) | Warm (ms) | chunks/sec | Disk model |
+|-------|-----|-----|-----|-----|-----|-----------|-----------|------------|------------|
+| nomic-embed-text (Ollama, 768) | 768 | 0.20 | 0.80 | 0.80 | 0.44 | 2220 | 2193 | 0.88 | 274 MB |
+| all-minilm (Ollama, 384) | 384 | **0.80** | **0.80** | **0.80** | **0.81** | 2163 | 2169 | 2.06 | 45 MB |
 
-Small dataset reports exact denominator. Selection prioritized retrieval correctness over speed; fastest not chosen if materially worse.
+- nomic: bundle-flow rank2, count_tokens rank3, callers-bundle rank41, tests-bundle rank1, redact rank3
+- all-minilm: bundle-flow rank1, count_tokens rank1, callers-bundle rank16, tests-bundle rank1, redact rank1
+
+**Selected winner: `all-minilm` (Ollama, 384d, Apache-2.0)** — materially wins on R@1 (0.80 vs 0.20) and MRR (0.81 vs 0.44) with 2× throughput and 6× smaller model. Retrieval correctness prioritized, not branding. `FakeEmbedder` is now **test-only** (`#[cfg(test)]`); production uses genuine Ollama `all-minilm` (or nomic via `CONTEXTD_EMBED_MODEL=nomic-embed-text`). CodeRankEmbed not runnable reliably on Windows without `ort`; deferred. Second candidate `all-minilm` chosen as viable local code-agnostic but effective, per spec “one other viable local candidate” when CodeRankEmbed blocked.
+
+Small dataset reports exact denominator. Selection prioritized retrieval correctness over speed; fastest not chosen if materially worse — here fastest also wins.
 
 ## Consequences
 
-- R4 `contextd` works with Node stopped, Ollama stopped (fake). When `CONTEXTD_USE_OLLAMA=1`, it uses Ollama nomic (requires Ollama running). Documented in `context_status` as `embeddingRuntime: fake|ollama`.
+- R4.1 `contextd` production **never uses FakeEmbedder**. Real embedder available → semantic enabled (rust-vector, ollama); unavailable → semantic disabled gracefully (BM25+exact+structure continue). `context_status` reports `semanticBackend: rust-vector|unavailable`, `embeddingRuntime: ollama|none`, `semanticAvailable: true|false`, `embeddingModel: all-minilm`.
 - Vector store keys on `content_hash + model_id + version/dimension`, so model change invalidates reuse (checked via `invalidate_stale_model`). Old vectors not silently reused; structural/BM25 remain usable during rebuild.
 - If CodeRankEmbed wins later, adopt then and only then, with `ort` native inference. No five-model theater.
-- Disk: nomic model ~500MB via Ollama cache; fake vectors ~4 bytes*768 per chunk; total `.context/index` size reported in R4 eval.
+- Disk: all-minilm 45 MB via Ollama cache; vectors 384*4 bytes per chunk ~1.8KB per chunk, 1200 chunks ~2.2 MB; nomic would be 274 MB + 5.6 MB vectors. Combined index still <10 MB.
 
 ## Alternatives considered
 
