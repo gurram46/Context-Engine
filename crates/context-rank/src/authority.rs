@@ -11,10 +11,11 @@ pub const AUTHORITY_WEIGHTS: &[(&str, i32)] = &[
     ("graphRelation", 20),
     ("callerReference", 35),
     ("sameLanguageImpl", 10),
-    ("testWhenAsked", 15),
+    ("testWhenAsked", 25),
     ("publicOverPrivate", 8),
     ("activeReference", 7),
     ("docWhenImplAsked", -15),
+    ("docWhenTestAsked", -20),
     ("generated", -20),
     ("duplicateOverlap", -10),
     ("broadContextMatch", -8),
@@ -331,6 +332,11 @@ pub fn score_authority(
         let w = get_weight("docWhenImplAsked");
         score += w;
         reasons.push(format!("{} doc when impl wanted", w));
+    }
+    if query_type == QueryType::Test && kind == FileKind::Doc {
+        let w = get_weight("docWhenTestAsked");
+        score += w;
+        reasons.push(format!("{} doc when test asked", w));
     }
     if wants_impl && file.starts_with("v2/") && !lower_query.contains("v2") {
         score -= 12;
