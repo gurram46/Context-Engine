@@ -11,7 +11,7 @@ pub const AUTHORITY_WEIGHTS: &[(&str, i32)] = &[
     ("graphRelation", 20),
     ("callerReference", 35),
     ("sameLanguageImpl", 10),
-    ("testWhenAsked", 25),
+    ("testWhenAsked", 38), // ponytail: 25→38 after crates added; keep, generic Test-vs-Exact tie broken by sourceWhenTestAsked below
     ("publicOverPrivate", 8),
     ("activeReference", 7),
     ("docWhenImplAsked", -15),
@@ -20,6 +20,7 @@ pub const AUTHORITY_WEIGHTS: &[(&str, i32)] = &[
     ("duplicateOverlap", -10),
     ("broadContextMatch", -8),
     ("testWhenImplAsked", -12),
+    ("sourceWhenTestAsked", -12), // ponytail: symmetric to testWhenImplAsked; prevents exact+source tie from beating genuine Test when Test asked
     ("staleDoc", -30),
     ("shadowPenalty", -12),
     ("legacyScriptPenalty", -10),
@@ -346,6 +347,11 @@ pub fn score_authority(
         let w = get_weight("testWhenImplAsked");
         score += w;
         reasons.push(format!("{} test when impl wanted", w));
+    }
+    if query_type == QueryType::Test && kind == FileKind::Source {
+        let w = get_weight("sourceWhenTestAsked");
+        score += w;
+        reasons.push(format!("{} source when test asked", w));
     }
     if evidence.symbol.as_deref() == Some("_ensure_context_dir")
         || evidence.symbol.as_deref() == Some("ContextEngineCLI")
