@@ -1,5 +1,7 @@
-//! V2 child bridge — one persistent Node process.
-//! For R0 we delegate to the existing TypeScript backend.
+#![allow(dead_code, unused_imports, clippy::all)]
+//! LEGACY / HISTORICAL — V2 child bridge — one persistent Node process.
+//! For R0-R4 we delegated to TypeScript backend. R5 production does NOT use V2.
+//! Kept for MCP legacy adapter comparison only, not required for native CLI.
 //! Handles lifecycle, project-root forwarding, single restart, clean shutdown.
 
 use anyhow::{Context, Result};

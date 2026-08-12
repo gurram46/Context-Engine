@@ -77,6 +77,7 @@ impl ProjectCache {
 
     /// For tests: get current index if any.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub async fn get(&self) -> Option<ProjectIndex> {
         self.index.read().await.clone()
     }

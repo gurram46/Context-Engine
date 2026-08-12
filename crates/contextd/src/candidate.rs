@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, clippy::all)]
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -9,6 +10,8 @@ use tokio::sync::Mutex;
 
 use context_core::ContextError;
 
+/// LEGACY / HISTORICAL / BENCHMARK — NOT used in production R5 retrieval.
+/// Production uses native Rust pipeline only. Kept for archaeology/benchmark comparison.
 /// Raw candidate provider — talks directly to `open-codebase-index` via `codeIndexClient` methods,
 /// not via V2's `context_search` etc which already do ranking.
 /// Spawns a Node child running `v2/dist/candidateProvider.js` (new) that directly calls

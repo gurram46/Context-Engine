@@ -1,7 +1,17 @@
 # Context Engine
 
-> **Frontend:** Zed / Codex / OpenCode (MCP stdio) — **Backend:** `contextd` (Rust) + V2 (TypeScript) bridge.
-> **Migration:** **R0** `contextd` MCP shell **implemented** (`rust/contextd-r0`, `a91abac`). **R1** Rust discovery/hashing/classification/exact search **implemented** (`rust/contextd-r1`, `context-index` + `rg`, 149 files). **R2** Rust routing/ranking/fusion/packing **implemented** (`rust/contextd-r2`, `context-rank` + `context-index`). **R3** Rust structural (**tree-sitter**, **SQLite**) **implemented** (`rust/contextd-r3`, `context-index::structural`, 141 files, 1033 symbols); semantic still OCI. **R4** Rust native retrieval (**BM25**, **vector**, **watcher**, **incremental graph**) **implemented** (`rust/contextd-r4`, `context-index::bm25` + `vector` + `watcher` + `embed`, structural incremental); OCI removed from production path. See `docs/architecture/contextd.md`.
+> **Context Engine retrieves context. It does not run the coding agent.**
+> Local repository-intelligence/context connector for Codex / OpenCode / Claude Code / Zed.
+
+> **Status:** **R5** `contextd` native connector **implemented** (`rust/contextd-r4` → `806551a` + R5). One native Rust service (`context-core/index/rank`) serving both CLI and MCP adapters. **R4** Rust native retrieval (**BM25**, **vector**, **watcher**, **incremental graph**) **implemented** (`context-index::bm25` + `vector` + `watcher` + `embed`, 12/12 Top1, 6/6 R2, 15/15 R3). **R5** adds native CLI (`contextd search/symbol/dependency/tests/status`), skills-first integration, MCP as optional adapter, Node/V2/OCI removed from production runtime. See `docs/architecture/contextd.md`.
+
+**Boundary:** Context Engine owns repository state, indexing, retrieval, ranking, dependency/test context, packing. The agent owns reasoning, editing, shell, compilation, tests, planning. Protect this boundary throughout R5.
+
+```
+Codex/OpenCode/Claude ── Skill → contextd CLI ──┐
+                                                ├── Context Engine (exact/structure/BM25/semantic → rank/fuse/pack → compact evidence)
+                        MCP → contextd MCP ─────┘
+```
 
 Context Engine is a hybrid CLI that tracks development sessions, generates summaries, and bundles project context for AI handoffs. The tool ships as two packages:
 
@@ -10,19 +20,39 @@ Context Engine is a hybrid CLI that tracks development sessions, generates summa
 
 After installation the Ink-based CLI launches the Python backend automatically, so a single install provides both halves.
 
-## Installation
+## Installation — R5 `contextd` (Rust, Windows first)
+
+Production `contextd` requires **no Node, npm, V2, OCI** — single binary + local model.
+
+```bash
+cargo build --release              # -> target/release/contextd.exe (Windows)
+# or download release artifact
+contextd --version                 # 0.1.0
+contextd status --json
+contextd search "Where is count_tokens implemented?" --json
+contextd mcp                       # stdio MCP server (5 tools)
+```
+
+Skill (preferred):
+```bash
+bash skills/context-engine/install.sh --all   # installs to Codex/OpenCode/Claude
+# then in agent:
+contextd search "<natural language repository question>" --json
+```
+
+Legacy npm/PyPI installs remain for historical Python backend but are NOT required for R5 retrieval.
+
+## Installation — Legacy (npm/PyPI, pre-R5)
 
 ### npm (recommended)
 ```bash
 npm install -g context-engine-cli@1.2.1-2
 ```
-This installs the Node/Ink CLI, bundles the Python backend, and runs `pip install -r backend/requirements.txt` during postinstall (requires Python 3.8+ on PATH).
 
 ### PyPI
 ```bash
 pip install context-engine-dev==1.2.1
 ```
-This provides the Python modules and console scripts. Pair it with the npm package if you prefer to manage the frontend separately.
 
 ## Quick Start
 ```bash

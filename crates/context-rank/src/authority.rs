@@ -21,6 +21,7 @@ pub const AUTHORITY_WEIGHTS: &[(&str, i32)] = &[
     ("broadContextMatch", -8),
     ("testWhenImplAsked", -12),
     ("sourceWhenTestAsked", -12), // ponytail: symmetric to testWhenImplAsked; prevents exact+source tie from beating genuine Test when Test asked
+    ("symbolInFilePath", 8), // ponytail: for SYMBOL queries, file path containing target symbol (underscore-insensitive) — fixes session tracker vs ai_summary tie without repo hardcode
     ("staleDoc", -30),
     ("shadowPenalty", -12),
     ("legacyScriptPenalty", -10),
@@ -352,6 +353,17 @@ pub fn score_authority(
         let w = get_weight("sourceWhenTestAsked");
         score += w;
         reasons.push(format!("{} source when test asked", w));
+    }
+    if query_type == QueryType::Symbol {
+        if let Some(target) = &target_sym {
+            let file_norm = file.to_lowercase().replace(['_', '-'], "");
+            let target_norm = target.to_lowercase().replace(['_', '-'], "");
+            if !target_norm.is_empty() && file_norm.contains(&target_norm) {
+                let w = get_weight("symbolInFilePath");
+                score += w;
+                reasons.push(format!("+{} symbol in file path", w));
+            }
+        }
     }
     if evidence.symbol.as_deref() == Some("_ensure_context_dir")
         || evidence.symbol.as_deref() == Some("ContextEngineCLI")

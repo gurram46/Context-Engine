@@ -9,12 +9,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-/// Retrieval providers — legacy V2/OCI, kept for reference but not used in production R4 path.
-/// Production retrieval must NOT call OCI semantic. CandidateProvider remains only for legacy comparison.
-pub struct Providers {
-    #[allow(dead_code)]
-    pub candidate: std::sync::Arc<crate::candidate::CandidateProvider>,
-}
+/// Retrieval providers — R5 production uses no V2/OCI providers.
+/// Kept as empty struct for API compatibility; legacy CandidateProvider is LEGACY only.
+pub struct Providers {}
 
 /// Context result after Rust pipeline.
 #[derive(Debug, Clone, serde::Serialize)]
