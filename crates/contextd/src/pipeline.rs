@@ -213,9 +213,13 @@ pub async fn retrieve_context(
             max_results: 50,
             ..Default::default()
         };
-        let res = exact_search(project, eq.clone(), opts)
-            .await
-            .unwrap_or_default();
+        let res = match exact_search(project, eq.clone(), opts).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, query = %eq.as_str(), "exact_search failed");
+                Vec::new()
+            }
+        };
         let cnt = res.len();
         for ev in res {
             candidates.push(Evidence {
@@ -242,10 +246,32 @@ pub async fn retrieve_context(
     let t_struct = Instant::now();
     for sym in &plan.symbol_queries {
         let mut added = 0usize;
-        if let Ok(conn) = structural_store::open_db(&project.root) {
-            if let Ok(defs) = structural_store::find_definitions(&conn, sym) {
-                for def in defs.iter().take(5) {
-                    let text = load_symbol_snippet(&project.root, def);
+        let conn = structural_store::open_db_async(project.root.clone()).await?;
+        if let Ok(defs) = structural_store::find_definitions(&conn, sym) {
+            for def in defs.iter().take(5) {
+                let text = load_symbol_snippet(&project.root, def).await;
+                candidates.push(Evidence {
+                    source: context_rank::types::RetrievalSource::Symbol,
+                    file: def.file.clone(),
+                    start_line: Some(def.start_line),
+                    end_line: Some(def.end_line),
+                    symbol: Some(def.name.clone()),
+                    symbol_kind: Some(def.kind.as_str().to_string()),
+                    text: Some(text),
+                    score: Some(1.0),
+                    relation: Some(context_rank::types::EvidenceRelation::Definition),
+                    authority_score: None,
+                    final_score: None,
+                    provenance: Some("rust:symbol".into()),
+                    metadata: None,
+                });
+                added += 1;
+            }
+        }
+        if added == 0 {
+            if let Ok(pref) = structural_store::find_symbol_prefix(&conn, sym) {
+                for def in pref.iter().take(5) {
+                    let text = load_symbol_snippet(&project.root, def).await;
                     candidates.push(Evidence {
                         source: context_rank::types::RetrievalSource::Symbol,
                         file: def.file.clone(),
@@ -254,37 +280,14 @@ pub async fn retrieve_context(
                         symbol: Some(def.name.clone()),
                         symbol_kind: Some(def.kind.as_str().to_string()),
                         text: Some(text),
-                        score: Some(1.0),
+                        score: Some(0.9),
                         relation: Some(context_rank::types::EvidenceRelation::Definition),
                         authority_score: None,
                         final_score: None,
-                        provenance: Some("rust:symbol".into()),
+                        provenance: Some("rust:symbol:prefix".into()),
                         metadata: None,
                     });
                     added += 1;
-                }
-            }
-            if added == 0 {
-                if let Ok(pref) = structural_store::find_symbol_prefix(&conn, sym) {
-                    for def in pref.iter().take(5) {
-                        let text = load_symbol_snippet(&project.root, def);
-                        candidates.push(Evidence {
-                            source: context_rank::types::RetrievalSource::Symbol,
-                            file: def.file.clone(),
-                            start_line: Some(def.start_line),
-                            end_line: Some(def.end_line),
-                            symbol: Some(def.name.clone()),
-                            symbol_kind: Some(def.kind.as_str().to_string()),
-                            text: Some(text),
-                            score: Some(0.9),
-                            relation: Some(context_rank::types::EvidenceRelation::Definition),
-                            authority_score: None,
-                            final_score: None,
-                            provenance: Some("rust:symbol:prefix".into()),
-                            metadata: None,
-                        });
-                        added += 1;
-                    }
                 }
             }
         }
@@ -294,102 +297,105 @@ pub async fn retrieve_context(
     // Native Rust structural graph
     for gq in &plan.graph_queries {
         let mut added = 0usize;
-        if let Ok(conn) = structural_store::open_db(&project.root) {
-            if gq.direction == "callers" || gq.direction == "both" {
-                if let Ok(callers) = structural_store::find_callers(&conn, &gq.symbol) {
-                    for edge in callers.iter().take(5) {
-                        let caller_sym = edge.resolved_symbol_id.as_deref().and_then(|id| {
+        let conn = structural_store::open_db_async(project.root.clone()).await?;
+        if gq.direction == "callers" || gq.direction == "both" {
+            if let Ok(callers) = structural_store::find_callers(&conn, &gq.symbol) {
+                for edge in callers.iter().take(5) {
+                    let caller_sym = edge.resolved_symbol_id.as_deref().and_then(|id| {
+                        structural_store::find_symbol_by_id(&conn, id)
+                            .ok()
+                            .flatten()
+                    });
+                    let text = if let Some(s) = caller_sym.as_ref() {
+                        Some(load_symbol_snippet(&project.root, s).await)
+                    } else {
+                        load_file_snippet(&project.root, &edge.file, edge.line).await
+                    };
+                    candidates.push(Evidence {
+                        source: context_rank::types::RetrievalSource::Graph,
+                        file: edge.file.clone(),
+                        start_line: Some(edge.line),
+                        end_line: Some(edge.line),
+                        symbol: Some(edge.callee_name.clone()),
+                        symbol_kind: caller_sym.map(|s| s.kind.as_str().to_string()),
+                        text,
+                        score: Some(match edge.confidence {
+                            context_index::structural::types::CallConfidence::Resolved => 1.0,
+                            context_index::structural::types::CallConfidence::Probable => 0.8,
+                            context_index::structural::types::CallConfidence::Unresolved => 0.6,
+                        }),
+                        relation: Some(context_rank::types::EvidenceRelation::Caller),
+                        authority_score: None,
+                        final_score: None,
+                        provenance: Some(format!(
+                            "rust:graph:{}:{}",
+                            gq.direction,
+                            edge.confidence.as_str()
+                        )),
+                        metadata: None,
+                    });
+                    added += 1;
+                }
+            }
+        }
+        if gq.direction == "callees" || gq.direction == "both" {
+            if let Ok(callees) = structural_store::find_callees(&conn, &gq.symbol) {
+                for edge in callees.iter().take(5) {
+                    let callee_sym = edge
+                        .resolved_symbol_id
+                        .as_deref()
+                        .and_then(|id| {
                             structural_store::find_symbol_by_id(&conn, id)
                                 .ok()
                                 .flatten()
+                        })
+                        .or_else(|| {
+                            structural_store::find_definitions(&conn, &edge.callee_name)
+                                .ok()
+                                .and_then(|v| v.into_iter().next())
                         });
-                        let text = caller_sym
-                            .as_ref()
-                            .map(|s| load_symbol_snippet(&project.root, s))
-                            .or_else(|| load_file_snippet(&project.root, &edge.file, edge.line));
+                    if let Some(sym) = callee_sym {
+                        let text = load_symbol_snippet(&project.root, &sym).await;
+                        candidates.push(Evidence {
+                            source: context_rank::types::RetrievalSource::Graph,
+                            file: sym.file.clone(),
+                            start_line: Some(sym.start_line),
+                            end_line: Some(sym.end_line),
+                            symbol: Some(sym.name.clone()),
+                            symbol_kind: Some(sym.kind.as_str().to_string()),
+                            text: Some(text),
+                            score: Some(match edge.confidence {
+                                context_index::structural::types::CallConfidence::Resolved => 1.0,
+                                context_index::structural::types::CallConfidence::Probable => 0.8,
+                                context_index::structural::types::CallConfidence::Unresolved => 0.6,
+                            }),
+                            relation: Some(context_rank::types::EvidenceRelation::Callee),
+                            authority_score: None,
+                            final_score: None,
+                            provenance: Some(format!(
+                                "rust:graph:callees:{}",
+                                edge.confidence.as_str()
+                            )),
+                            metadata: None,
+                        });
+                        added += 1;
+                    } else {
                         candidates.push(Evidence {
                             source: context_rank::types::RetrievalSource::Graph,
                             file: edge.file.clone(),
                             start_line: Some(edge.line),
                             end_line: Some(edge.line),
                             symbol: Some(edge.callee_name.clone()),
-                            symbol_kind: caller_sym.map(|s| s.kind.as_str().to_string()),
-                            text,
-                            score: Some(match edge.confidence {
-                                context_index::structural::types::CallConfidence::Resolved => 1.0,
-                                context_index::structural::types::CallConfidence::Probable => 0.8,
-                                context_index::structural::types::CallConfidence::Unresolved => 0.6,
-                            }),
-                            relation: Some(context_rank::types::EvidenceRelation::Caller),
+                            symbol_kind: None,
+                            text: load_file_snippet(&project.root, &edge.file, edge.line).await,
+                            score: Some(0.6),
+                            relation: Some(context_rank::types::EvidenceRelation::Callee),
                             authority_score: None,
                             final_score: None,
-                            provenance: Some(format!(
-                                "rust:graph:{}:{}",
-                                gq.direction,
-                                edge.confidence.as_str()
-                            )),
+                            provenance: Some("rust:graph:callees:unresolved".into()),
                             metadata: None,
                         });
                         added += 1;
-                    }
-                }
-            }
-            if gq.direction == "callees" || gq.direction == "both" {
-                if let Ok(callees) = structural_store::find_callees(&conn, &gq.symbol) {
-                    for edge in callees.iter().take(5) {
-                        let callee_sym = edge
-                            .resolved_symbol_id
-                            .as_deref()
-                            .and_then(|id| {
-                                structural_store::find_symbol_by_id(&conn, id)
-                                    .ok()
-                                    .flatten()
-                            })
-                            .or_else(|| {
-                                structural_store::find_definitions(&conn, &edge.callee_name)
-                                    .ok()
-                                    .and_then(|v| v.into_iter().next())
-                            });
-                        if let Some(sym) = callee_sym {
-                            let text = load_symbol_snippet(&project.root, &sym);
-                            candidates.push(Evidence {
-                                source: context_rank::types::RetrievalSource::Graph,
-                                file: sym.file.clone(),
-                                start_line: Some(sym.start_line),
-                                end_line: Some(sym.end_line),
-                                symbol: Some(sym.name.clone()),
-                                symbol_kind: Some(sym.kind.as_str().to_string()),
-                                text: Some(text),
-                                score: Some(match edge.confidence {
-                                    context_index::structural::types::CallConfidence::Resolved => 1.0,
-                                    context_index::structural::types::CallConfidence::Probable => 0.8,
-                                    context_index::structural::types::CallConfidence::Unresolved => 0.6,
-                                }),
-                                relation: Some(context_rank::types::EvidenceRelation::Callee),
-                                authority_score: None,
-                                final_score: None,
-                                provenance: Some(format!("rust:graph:callees:{}", edge.confidence.as_str())),
-                                metadata: None,
-                            });
-                            added += 1;
-                        } else {
-                            candidates.push(Evidence {
-                                source: context_rank::types::RetrievalSource::Graph,
-                                file: edge.file.clone(),
-                                start_line: Some(edge.line),
-                                end_line: Some(edge.line),
-                                symbol: Some(edge.callee_name.clone()),
-                                symbol_kind: None,
-                                text: load_file_snippet(&project.root, &edge.file, edge.line),
-                                score: Some(0.6),
-                                relation: Some(context_rank::types::EvidenceRelation::Callee),
-                                authority_score: None,
-                                final_score: None,
-                                provenance: Some("rust:graph:callees:unresolved".into()),
-                                metadata: None,
-                            });
-                            added += 1;
-                        }
                     }
                 }
             }
@@ -400,59 +406,58 @@ pub async fn retrieve_context(
     // Native Rust structural test lookup
     for tq in &plan.test_queries {
         let mut added = 0usize;
-        if let Ok(conn) = structural_store::open_db(&project.root) {
-            if let Ok(tests) = structural_store::find_tests_related(&conn, tq) {
-                for sym in tests.iter().take(5) {
-                    let text = load_symbol_snippet(&project.root, sym);
+        let conn = structural_store::open_db_async(project.root.clone()).await?;
+        if let Ok(tests) = structural_store::find_tests_related(&conn, tq) {
+            for sym in tests.iter().take(5) {
+                let text = load_symbol_snippet(&project.root, sym).await;
+                candidates.push(Evidence {
+                    source: context_rank::types::RetrievalSource::Test,
+                    file: sym.file.clone(),
+                    start_line: Some(sym.start_line),
+                    end_line: Some(sym.end_line),
+                    symbol: Some(sym.name.clone()),
+                    symbol_kind: Some(sym.kind.as_str().to_string()),
+                    text: Some(text),
+                    score: Some(1.0),
+                    relation: Some(context_rank::types::EvidenceRelation::Test),
+                    authority_score: None,
+                    final_score: None,
+                    provenance: Some("rust:test".into()),
+                    metadata: None,
+                });
+                added += 1;
+            }
+        }
+        if added == 0 {
+            let lower = tq.to_lowercase();
+            for f in project
+                .files
+                .iter()
+                .filter(|r| r.kind == context_index::FileKind::Test)
+            {
+                if f.relative_path.to_lowercase().contains(&lower)
+                    || f.relative_path
+                        .to_lowercase()
+                        .contains(&format!("test_{}", lower))
+                {
                     candidates.push(Evidence {
                         source: context_rank::types::RetrievalSource::Test,
-                        file: sym.file.clone(),
-                        start_line: Some(sym.start_line),
-                        end_line: Some(sym.end_line),
-                        symbol: Some(sym.name.clone()),
-                        symbol_kind: Some(sym.kind.as_str().to_string()),
-                        text: Some(text),
-                        score: Some(1.0),
+                        file: f.relative_path.clone(),
+                        start_line: Some(1),
+                        end_line: Some(1),
+                        symbol: Some(tq.clone()),
+                        symbol_kind: None,
+                        text: Some(format!("Test file: {}", f.relative_path)),
+                        score: Some(0.8),
                         relation: Some(context_rank::types::EvidenceRelation::Test),
                         authority_score: None,
                         final_score: None,
-                        provenance: Some("rust:test".into()),
+                        provenance: Some("rust:test:file".into()),
                         metadata: None,
                     });
                     added += 1;
-                }
-            }
-            if added == 0 {
-                let lower = tq.to_lowercase();
-                for f in project
-                    .files
-                    .iter()
-                    .filter(|r| r.kind == context_index::FileKind::Test)
-                {
-                    if f.relative_path.to_lowercase().contains(&lower)
-                        || f.relative_path
-                            .to_lowercase()
-                            .contains(&format!("test_{}", lower))
-                    {
-                        candidates.push(Evidence {
-                            source: context_rank::types::RetrievalSource::Test,
-                            file: f.relative_path.clone(),
-                            start_line: Some(1),
-                            end_line: Some(1),
-                            symbol: Some(tq.clone()),
-                            symbol_kind: None,
-                            text: Some(format!("Test file: {}", f.relative_path)),
-                            score: Some(0.8),
-                            relation: Some(context_rank::types::EvidenceRelation::Test),
-                            authority_score: None,
-                            final_score: None,
-                            provenance: Some("rust:test:file".into()),
-                            metadata: None,
-                        });
-                        added += 1;
-                        if added >= 5 {
-                            break;
-                        }
+                    if added >= 5 {
+                        break;
                     }
                 }
             }
@@ -487,76 +492,76 @@ pub async fn retrieve_context(
     // BM25 native — for SYMBOL/DEPENDENCY insufficient, fallback to raw query if no semantic_queries
     if run_bm25 {
         let t_bm25 = Instant::now();
-        if let Ok(conn) = structural_store::open_db(&project.root) {
-            let bm25_queries: Vec<String> = if !plan.semantic_queries.is_empty() {
-                plan.semantic_queries.clone()
-            } else if classified.query_type == QueryType::Symbol
-                || classified.query_type == QueryType::Dependency
-            {
-                vec![query.to_string()]
-            } else {
-                vec![]
-            };
-            for sq in &bm25_queries {
-                match context_index::bm25::search_bm25(&conn, sq, 10) {
-                    Ok(results) => {
-                        for (rank, bm) in results.into_iter().enumerate() {
-                            let text = load_chunk_snippet(&project.root, &bm);
-                            let ev = Evidence {
-                                source: context_rank::types::RetrievalSource::Bm25,
-                                file: bm.file.clone(),
-                                start_line: Some(bm.start_line),
-                                end_line: Some(bm.end_line),
-                                symbol: bm.symbol.clone(),
-                                symbol_kind: None,
-                                text: Some(text),
-                                score: Some(bm.score),
-                                relation: Some(context_rank::types::EvidenceRelation::Unknown),
-                                authority_score: None,
-                                final_score: None,
-                                provenance: Some("rust:bm25".into()),
-                                metadata: None,
-                            };
-                            bm25_candidates.push((ev, rank + 1, bm.score));
-                        }
-                        retrievers_used.push(format!(
-                            "rust-bm25:{}:{}",
-                            sq.chars().take(15).collect::<String>(),
-                            bm25_candidates.len()
-                        ));
-                        break; // only first semantic query for BM25
+        let conn = structural_store::open_db_async(project.root.clone()).await?;
+        let bm25_queries: Vec<String> = if !plan.semantic_queries.is_empty() {
+            plan.semantic_queries.clone()
+        } else if classified.query_type == QueryType::Symbol
+            || classified.query_type == QueryType::Dependency
+        {
+            vec![query.to_string()]
+        } else {
+            vec![]
+        };
+        for sq in &bm25_queries {
+            match context_index::bm25::search_bm25(&conn, sq, 10) {
+                Ok(results) => {
+                    for (rank, bm) in results.into_iter().enumerate() {
+                        let text = load_chunk_snippet(&project.root, &bm).await;
+                        let ev = Evidence {
+                            source: context_rank::types::RetrievalSource::Bm25,
+                            file: bm.file.clone(),
+                            start_line: Some(bm.start_line),
+                            end_line: Some(bm.end_line),
+                            symbol: bm.symbol.clone(),
+                            symbol_kind: None,
+                            text: Some(text),
+                            score: Some(bm.score),
+                            relation: Some(context_rank::types::EvidenceRelation::Unknown),
+                            authority_score: None,
+                            final_score: None,
+                            provenance: Some("rust:bm25".into()),
+                            metadata: None,
+                        };
+                        bm25_candidates.push((ev, rank + 1, bm.score));
                     }
-                    Err(e) => {
-                        tracing::debug!(error=%e, "bm25 search failed");
-                        retrievers_used.push("rust-bm25:0".into());
-                    }
+                    retrievers_used.push(format!(
+                        "rust-bm25:{}:{}",
+                        sq.chars().take(15).collect::<String>(),
+                        bm25_candidates.len()
+                    ));
+                    break; // only first semantic query for BM25
+                }
+                Err(e) => {
+                    tracing::debug!(error=%e, "bm25 search failed");
+                    retrievers_used.push("rust-bm25:0".into());
                 }
             }
-            // Also BM25 for test queries if needed
-            if bm25_candidates.is_empty() && !plan.test_queries.is_empty() {
-                for tq in &plan.test_queries {
-                    if let Ok(res) = context_index::bm25::search_bm25(&conn, tq, 5) {
-                        for (rank, bm) in res.into_iter().enumerate() {
-                            let ev = Evidence {
-                                source: context_rank::types::RetrievalSource::Bm25,
-                                file: bm.file.clone(),
-                                start_line: Some(bm.start_line),
-                                end_line: Some(bm.end_line),
-                                symbol: bm.symbol.clone(),
-                                symbol_kind: None,
-                                text: load_chunk_snippet(&project.root, &bm).into(),
-                                score: Some(bm.score),
-                                relation: Some(context_rank::types::EvidenceRelation::Test),
-                                authority_score: None,
-                                final_score: None,
-                                provenance: Some("rust:bm25".into()),
-                                metadata: None,
-                            };
-                            bm25_candidates.push((ev, rank + 1, bm.score));
-                        }
-                        if !bm25_candidates.is_empty() {
-                            break;
-                        }
+        }
+        // Also BM25 for test queries if needed
+        if bm25_candidates.is_empty() && !plan.test_queries.is_empty() {
+            for tq in &plan.test_queries {
+                if let Ok(res) = context_index::bm25::search_bm25(&conn, tq, 5) {
+                    for (rank, bm) in res.into_iter().enumerate() {
+                        let text = load_chunk_snippet(&project.root, &bm).await;
+                        let ev = Evidence {
+                            source: context_rank::types::RetrievalSource::Bm25,
+                            file: bm.file.clone(),
+                            start_line: Some(bm.start_line),
+                            end_line: Some(bm.end_line),
+                            symbol: bm.symbol.clone(),
+                            symbol_kind: None,
+                            text: Some(text),
+                            score: Some(bm.score),
+                            relation: Some(context_rank::types::EvidenceRelation::Test),
+                            authority_score: None,
+                            final_score: None,
+                            provenance: Some("rust:bm25".into()),
+                            metadata: None,
+                        };
+                        bm25_candidates.push((ev, rank + 1, bm.score));
+                    }
+                    if !bm25_candidates.is_empty() {
+                        break;
                     }
                 }
             }
@@ -590,9 +595,8 @@ pub async fn retrieve_context(
         };
         let fp = embedder.fingerprint();
         // Check model change invalidation
-        if let Ok(conn) = structural_store::open_db(&project.root) {
-            let _ = context_index::vector::invalidate_stale_model(&conn, &fp);
-        }
+        let conn = structural_store::open_db_async(project.root.clone()).await?;
+        let _ = context_index::vector::invalidate_stale_model(&conn, &fp);
         let semantic_queries: Vec<String> = if !plan.semantic_queries.is_empty() {
             plan.semantic_queries.clone()
         } else if classified.query_type == QueryType::Symbol
@@ -627,15 +631,8 @@ pub async fn retrieve_context(
                     }
                 }
             };
-            // Now open DB for brute search (sync, no await)
-            let conn = match structural_store::open_db(&project.root) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(error=%e, "open_db failed for vector");
-                    retrievers_used.push("rust-semantic:0".into());
-                    continue;
-                }
-            };
+            // Now open DB for brute search (moved off async executor thread)
+            let conn = structural_store::open_db_async(project.root.clone()).await?;
             let cnt = context_index::vector::count_vectors(&conn, &fp).unwrap_or(0);
             if cnt == 0 {
                 tracing::debug!("no vectors for model {}, skipping semantic", fp.model_id);
@@ -646,6 +643,7 @@ pub async fn retrieve_context(
                 Ok(results) => {
                     for (rank, vc) in results.into_iter().enumerate() {
                         let text = load_file_snippet(&project.root, &vc.file, vc.start_line)
+                            .await
                             .unwrap_or_else(|| {
                                 format!("{} {}", vc.file, vc.symbol.clone().unwrap_or_default())
                             });
@@ -762,52 +760,73 @@ pub async fn retrieve_context(
     })
 }
 
-fn load_symbol_snippet(root: &Path, sym: &context_index::structural::types::Symbol) -> String {
-    let path = root.join(&sym.file);
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        let bytes = content.as_bytes();
-        let start = sym.start_byte.min(bytes.len());
-        let end = sym.end_byte.min(bytes.len());
-        if end > start {
-            let slice = &content[start..end];
-            let txt: String = slice.chars().take(400).collect();
-            return txt.trim().to_string();
+async fn load_symbol_snippet(
+    root: &Path,
+    sym: &context_index::structural::types::Symbol,
+) -> String {
+    let root = root.to_path_buf();
+    let sym = sym.clone();
+    tokio::task::spawn_blocking(move || {
+        let path = root.join(&sym.file);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let bytes = content.as_bytes();
+            let start = sym.start_byte.min(bytes.len());
+            let end = sym.end_byte.min(bytes.len());
+            if end > start {
+                let slice = &content[start..end];
+                let txt: String = slice.chars().take(400).collect();
+                return txt.trim().to_string();
+            }
+            if let Some(line) = content
+                .lines()
+                .nth((sym.start_line as usize).saturating_sub(1))
+            {
+                return line.chars().take(400).collect();
+            }
         }
-        if let Some(line) = content
-            .lines()
-            .nth((sym.start_line as usize).saturating_sub(1))
-        {
-            return line.chars().take(400).collect();
-        }
-    }
-    format!("{} {}", sym.kind.as_str(), sym.qualified_name)
+        format!("{} {}", sym.kind.as_str(), sym.qualified_name)
+    })
+    .await
+    .unwrap()
 }
 
-fn load_file_snippet(root: &Path, file: &str, line: u32) -> Option<String> {
-    let path = root.join(file);
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        if let Some(l) = content.lines().nth((line as usize).saturating_sub(1)) {
-            return Some(l.chars().take(400).collect());
+async fn load_file_snippet(root: &Path, file: &str, line: u32) -> Option<String> {
+    let root = root.to_path_buf();
+    let file = file.to_string();
+    tokio::task::spawn_blocking(move || {
+        let path = root.join(&file);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Some(l) = content.lines().nth((line as usize).saturating_sub(1)) {
+                return Some(l.chars().take(400).collect());
+            }
         }
-    }
-    None
+        None
+    })
+    .await
+    .unwrap()
 }
 
-fn load_chunk_snippet(root: &Path, bm: &context_index::bm25::Bm25Candidate) -> String {
-    let path = root.join(&bm.file);
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        let lines: Vec<&str> = content.lines().collect();
-        let start = (bm.start_line as usize).saturating_sub(1);
-        let end = (bm.end_line as usize).min(lines.len());
-        if start < end {
-            let slice = lines[start..end].join("\n");
-            return slice.chars().take(600).collect();
+async fn load_chunk_snippet(root: &Path, bm: &context_index::bm25::Bm25Candidate) -> String {
+    let root = root.to_path_buf();
+    let bm = bm.clone();
+    tokio::task::spawn_blocking(move || {
+        let path = root.join(&bm.file);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = (bm.start_line as usize).saturating_sub(1);
+            let end = (bm.end_line as usize).min(lines.len());
+            if start < end {
+                let slice = lines[start..end].join("\n");
+                return slice.chars().take(600).collect();
+            }
+            if let Some(l) = lines.get(start) {
+                return l.chars().take(400).collect();
+            }
         }
-        if let Some(l) = lines.get(start) {
-            return l.chars().take(400).collect();
-        }
-    }
-    format!("{}:{}", bm.file, bm.start_line)
+        format!("{}:{}", bm.file, bm.start_line)
+    })
+    .await
+    .unwrap()
 }
 
 #[cfg(test)]

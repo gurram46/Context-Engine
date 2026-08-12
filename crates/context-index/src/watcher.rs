@@ -204,6 +204,7 @@ impl StructuralWatcher {
 impl Drop for StructuralWatcher {
     fn drop(&mut self) {
         self.shutdown.notify_waiters();
+        self._worker.abort();
     }
 }
 

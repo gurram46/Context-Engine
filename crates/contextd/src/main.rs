@@ -1,4 +1,6 @@
+#[cfg(feature = "legacy-v2")]
 mod bridge;
+#[cfg(feature = "legacy-v2")]
 mod candidate;
 mod cli;
 mod config;

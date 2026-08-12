@@ -127,11 +127,13 @@ impl ContextService {
         // Incremental structural build (hash skip) — spawn_blocking
         let root_path = root.path().to_path_buf();
         let idx_clone = idx.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let si = context_index::structural::StructuralIndex::for_path(root_path);
-            let _ = si.build(&idx_clone);
+            si.build(&idx_clone)
         })
-        .await;
+        .await
+        .map_err(|e| ContextError::Internal(format!("structural build panicked: {e}")))?
+        .map_err(|e| ContextError::Internal(format!("structural build failed: {e}")))?;
         let elapsed = t0.elapsed().as_millis();
         Ok(ReconcileStats {
             discovered: idx.stats.discovered,
@@ -154,11 +156,13 @@ impl ContextService {
         // Ensure structural DB is ready (reconcile already did, but ensure again for safety)
         let root_path = root.path().to_path_buf();
         let idx_clone = project.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let si = context_index::structural::StructuralIndex::for_path(root_path);
-            let _ = si.build(&idx_clone);
+            si.build(&idx_clone)
         })
-        .await;
+        .await
+        .map_err(|e| ContextError::Internal(format!("structural build panicked: {e}")))?
+        .map_err(|e| ContextError::Internal(format!("structural build failed: {e}")))?;
         let providers = Providers {};
         retrieve_context(
             query,
@@ -246,22 +250,27 @@ impl ContextService {
             }
         }
 
-        // git branch cheap
-        let git_branch = std::process::Command::new("git")
-            .arg("rev-parse")
-            .arg("--abbrev-ref")
-            .arg("HEAD")
-            .current_dir(&self.root)
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8(o.stdout).ok()
-                } else {
-                    None
-                }
-            })
-            .map(|s| s.trim().to_string());
+        // git branch cheap — moved off async executor thread
+        let root = self.root.clone();
+        let git_branch = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("git")
+                .arg("rev-parse")
+                .arg("--abbrev-ref")
+                .arg("HEAD")
+                .current_dir(&root)
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        String::from_utf8(o.stdout).ok()
+                    } else {
+                        None
+                    }
+                })
+                .map(|s| s.trim().to_string())
+        })
+        .await
+        .map_err(|e| ContextError::Internal(format!("git branch capture panicked: {e}")))?;
 
         let model =
             std::env::var("CONTEXTD_EMBED_MODEL").unwrap_or_else(|_| "all-minilm".to_string());

@@ -163,7 +163,7 @@ pub async fn exact_search(
         "dist",
         "build",
         "target",
-        "crates", // for engine repo frozen eval, hidden via discovery but also here for safety
+        "crates", // engine-repo-specific: avoids indexing the Rust implementation itself during frozen eval
         "__pycache__",
         ".pytest_cache",
         "coverage",
@@ -232,12 +232,15 @@ pub async fn exact_search(
                 continue;
             }
             // rg --column gives file:line:column:text
-            let mut parts = raw_line.splitn(4, ':');
-            let file_raw = parts.next().unwrap_or("");
+            // Convert to a relative POSIX path FIRST so drive letters (e.g. "C:")
+            // on Windows don't corrupt the `:` split below.
+            let rel = to_relative_posix(raw_line, root);
+            let mut parts = rel.splitn(4, ':');
+            let file = parts.next().unwrap_or("");
             let line_str = parts.next().unwrap_or("0");
             let _col = parts.next().unwrap_or("0");
             let text = parts.next().unwrap_or("").to_string();
-            let rel = to_relative_posix(file_raw, root);
+            let rel = file.to_string();
             // Skip if file is too large (check via ProjectIndex)
             if let Some(rec) = project.files.iter().find(|f| f.relative_path == rel) {
                 if rec.size_bytes > MAX_SEARCH_FILE_BYTES {
@@ -369,5 +372,27 @@ mod tests {
         .unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].file, "go.mod");
+    }
+
+    #[test]
+    fn relative_posix_strips_leading_dot_slash() {
+        let tmp = std::env::temp_dir();
+        assert_eq!(to_relative_posix("./src/main.rs", &tmp), "src/main.rs");
+        assert_eq!(to_relative_posix("src/main.rs", &tmp), "src/main.rs");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_path_parsed_correctly() {
+        // Simulate rg output on Windows: the path is absolute before conversion.
+        let root = Path::new(r"C:\repo");
+        let raw = r"C:\repo\src\main.rs:10:5:hello";
+        let rel = to_relative_posix(raw, root);
+        assert_eq!(rel, "src/main.rs:10:5:hello");
+        let mut parts = rel.splitn(4, ':');
+        assert_eq!(parts.next().unwrap(), "src/main.rs");
+        assert_eq!(parts.next().unwrap(), "10");
+        assert_eq!(parts.next().unwrap(), "5");
+        assert_eq!(parts.next().unwrap(), "hello");
     }
 }

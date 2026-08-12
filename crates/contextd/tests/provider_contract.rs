@@ -1,5 +1,6 @@
 //! Raw OCI provider live contract — verifies Rust uses raw OCI, not V2 final ranking.
 //! Requires healthy OCI index (ollama + nomic-embed-text). Run with -- --ignored --test-threads=1
+#![cfg(feature = "legacy-v2")]
 
 use contextd::candidate::CandidateProvider;
 

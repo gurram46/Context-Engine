@@ -47,6 +47,16 @@ pub fn open_in_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Async wrapper for [`open_db`] that runs the filesystem/locking work on a
+/// blocking thread. `contextd` uses this so SQLite open syscalls do not stall
+/// the async executor.
+pub async fn open_db_async(project_root: PathBuf) -> Result<Connection> {
+    tokio::task::spawn_blocking(move || open_db(&project_root))
+        .await
+        .map_err(|e| anyhow::anyhow!("open_db panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("open_db failed: {e}"))
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
