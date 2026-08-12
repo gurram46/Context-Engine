@@ -35,18 +35,22 @@ fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-fn blob_to_vec(blob: &[u8], dim: usize) -> Vec<f32> {
+fn blob_to_vec(blob: &[u8], dim: usize) -> Result<Vec<f32>> {
+    let expected = dim * 4;
+    if blob.len() != expected {
+        anyhow::bail!(
+            "vector blob length mismatch: expected {} bytes for dim {}, got {}",
+            expected,
+            dim,
+            blob.len()
+        );
+    }
     let mut out = Vec::with_capacity(dim);
     for chunk in blob.chunks_exact(4) {
         let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
         out.push(f32::from_le_bytes(arr));
     }
-    // If blob truncated, pad
-    while out.len() < dim {
-        out.push(0.0);
-    }
-    out.truncate(dim);
-    out
+    Ok(out)
 }
 
 // --- Store helpers ---
@@ -107,7 +111,7 @@ pub fn get_vector(
         },
     );
     match row {
-        Ok((blob, dim)) => Ok(Some(blob_to_vec(&blob, dim))),
+        Ok((blob, dim)) => Ok(Some(blob_to_vec(&blob, dim)?)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -242,7 +246,13 @@ pub fn search_brute(
     let mut scored: Vec<(String, f32)> = Vec::new();
     for r in rows {
         let (hash, blob, dim) = r?;
-        let vec = blob_to_vec(&blob, dim);
+        let vec = match blob_to_vec(&blob, dim) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, content_hash = %hash, "skipping corrupted vector row");
+                continue;
+            }
+        };
         if vec.len() != query_vec.len() {
             continue;
         }
@@ -334,7 +344,7 @@ pub async fn update_vectors_for_parsed(
 #[allow(clippy::cloned_ref_to_slice_refs)]
 mod tests {
     use super::*;
-    use crate::embed::FakeEmbedder;
+    use crate::embed::{FakeEmbedder, ModelFingerprint};
     use crate::structural::language::Language;
     use crate::structural::store::open_in_memory;
     use crate::structural::types::Chunk;
@@ -595,6 +605,31 @@ mod tests {
             total.as_millis()
         );
         // Now vector should be available
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wrong_length_blob_returns_error() -> Result<()> {
+        let conn = open_in_memory()?;
+        ensure_vector_schema(&conn)?;
+        let fp = ModelFingerprint {
+            model_id: "test".to_string(),
+            version: "v1".to_string(),
+            dimension: 4,
+        };
+        // 3 bytes for a 4-dim vector (expected 16)
+        conn.execute(
+            "INSERT OR REPLACE INTO vectors (content_hash, model_id, version, dimension, vector) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params!["hash1", fp.model_id, fp.version, fp.dimension as i64, vec![0u8, 1, 2]],
+        )?;
+        let res = get_vector(&conn, "hash1", &fp);
+        assert!(res.is_err(), "expected error for malformed vector blob");
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("length mismatch"),
+            "error should mention length mismatch: {}",
+            err
+        );
         Ok(())
     }
 }

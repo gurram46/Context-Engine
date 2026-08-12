@@ -135,7 +135,7 @@ pub fn pack_evidence(
             let text = e
                 .text
                 .as_deref()
-                .map(|t| format!(" — {}", &t[..t.len().min(120)]))
+                .map(|t| format!(" — {}", t.chars().take(120).collect::<String>()))
                 .unwrap_or_default();
             body_lines.push(format!(
                 "- {} {} {} ({}){} [{}]",
@@ -203,5 +203,38 @@ mod tests {
             },
         );
         assert!(packed.token_estimate <= 100);
+    }
+
+    #[test]
+    fn utf8_text_near_120_does_not_panic() {
+        // 118 ASCII chars + 5 emoji (4 bytes each). The old byte-slice would index
+        // byte 120 inside an emoji and panic; char iteration must stay valid.
+        let text = format!("{}{}", "x".repeat(118), "🎉".repeat(5));
+        let ev = Evidence {
+            source: RetrievalSource::Exact,
+            file: "x.rs".into(),
+            start_line: Some(1),
+            end_line: Some(1),
+            symbol: None,
+            symbol_kind: None,
+            text: Some(text),
+            score: Some(1.0),
+            relation: None,
+            authority_score: None,
+            final_score: Some(1.0),
+            provenance: None,
+            metadata: None,
+        };
+        let packed = pack_evidence(
+            &[ev],
+            "test",
+            QueryType::Symbol,
+            PackOptions {
+                budget: 10000,
+                max_files: 10,
+            },
+        );
+        assert!(packed.markdown.contains('🎉'));
+        // String is valid UTF-8 by construction; the real assertion is that we did not panic.
     }
 }

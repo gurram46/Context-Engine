@@ -57,9 +57,9 @@ fn sufficiency(
     let has_strong_symbol = candidates.iter().any(|e| {
         e.source == context_rank::types::RetrievalSource::Symbol
             && e.relation == Some(context_rank::types::EvidenceRelation::Definition)
-            && e.file.to_lowercase().contains("src/")
-            || e.file.to_lowercase().contains("crates/")
-            || e.file.to_lowercase().contains("backend/")
+            && (e.file.to_lowercase().contains("src/")
+                || e.file.to_lowercase().contains("crates/")
+                || e.file.to_lowercase().contains("backend/"))
     });
     let has_resolved_graph = candidates.iter().any(|e| {
         e.source == context_rank::types::RetrievalSource::Graph
@@ -808,4 +808,30 @@ fn load_chunk_snippet(root: &Path, bm: &context_index::bm25::Bm25Candidate) -> S
         }
     }
     format!("{}:{}", bm.file, bm.start_line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_symbol_crates_path_is_not_strong_symbol() {
+        let candidates = vec![Evidence {
+            source: context_rank::types::RetrievalSource::Exact,
+            file: "crates/foo/src/lib.rs".into(),
+            start_line: None,
+            end_line: None,
+            symbol: None,
+            symbol_kind: None,
+            text: None,
+            score: None,
+            relation: Some(context_rank::types::EvidenceRelation::Definition),
+            authority_score: None,
+            final_score: None,
+            provenance: None,
+            metadata: None,
+        }];
+        let suff = sufficiency(QueryType::Symbol, &candidates, "Foo");
+        assert_eq!(suff, EvidenceSufficiency::Insufficient);
+    }
 }
