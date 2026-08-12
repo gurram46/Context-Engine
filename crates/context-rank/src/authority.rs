@@ -1,8 +1,25 @@
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 use crate::types::{Evidence, EvidenceRelation, QueryType, RetrievalSource};
 use context_index::{classify_file, FileKind};
-use std::path::Path;
+
+static TARGET_SYMBOL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").unwrap());
+static PASCAL_PREFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Z][a-z]+[A-Z]").unwrap());
+static IMPL_WORDS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"implemented|generation|bundle|logic|validation|handler|router|service|enforced|ontology|pipeline",
+    )
+    .unwrap()
+});
+static CALLER_QUERY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(what calls|who calls|callers|used by|what breaks if)\b").unwrap()
+});
 
 pub const AUTHORITY_WEIGHTS: &[(&str, i32)] = &[
     ("exactLiteralMatch", 28),
@@ -43,7 +60,6 @@ fn is_stale_doc(file: &str) -> bool {
 }
 
 fn get_target_symbol(raw_query: &str) -> Option<String> {
-    let re = regex::Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").unwrap();
     let stop: std::collections::HashSet<&str> = [
         "where",
         "what",
@@ -78,7 +94,7 @@ fn get_target_symbol(raw_query: &str) -> Option<String> {
     .into_iter()
     .collect();
     let mut ids: Vec<String> = Vec::new();
-    for m in re.find_iter(raw_query) {
+    for m in TARGET_SYMBOL_RE.find_iter(raw_query) {
         let t = m.as_str().to_string();
         if stop.contains(t.to_lowercase().as_str()) {
             continue;
@@ -110,23 +126,16 @@ fn get_target_symbol(raw_query: &str) -> Option<String> {
         if a_snake != b_snake {
             return a_snake.cmp(&b_snake);
         }
-        let a_pascal = if regex::Regex::new(r"^[A-Z][a-z]+[A-Z]").unwrap().is_match(a) {
-            0
-        } else {
-            1
-        };
-        let b_pascal = if regex::Regex::new(r"^[A-Z][a-z]+[A-Z]").unwrap().is_match(b) {
-            0
-        } else {
-            1
-        };
+        let a_pascal = if PASCAL_PREFIX_RE.is_match(a) { 0 } else { 1 };
+        let b_pascal = if PASCAL_PREFIX_RE.is_match(b) { 0 } else { 1 };
         if a_pascal != b_pascal {
             return a_pascal.cmp(&b_pascal);
         }
         b.len().cmp(&a.len())
     });
     uniq.first().cloned().map(|s| s.to_lowercase()).or_else(|| {
-        re.find_iter(raw_query)
+        TARGET_SYMBOL_RE
+            .find_iter(raw_query)
             .map(|m| m.as_str().to_string())
             .find(|t| !stop.contains(t.to_lowercase().as_str()) && t.len() >= 3)
             .map(|s| s.to_lowercase())
@@ -210,7 +219,10 @@ fn is_true_definition(evidence: &Evidence, raw_query: &str) -> bool {
         format!("enum {}", target),
         format!("trait {}", target),
     ];
-    if text.contains(&format!("func {}(", target)) || text.contains(&format!("func ({}", target)) {
+    if target.len() >= 3
+        && (text.contains(&format!("func {}(", target))
+            || text.contains(&format!("func ({}", target)))
+    {
         let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(&target))).unwrap();
         if re.is_match(&text) {
             return true;
@@ -325,11 +337,11 @@ pub fn score_authority(
         score += w;
         reasons.push(format!("{} stale", w));
     }
-    let wants_impl = matches!(query_type, QueryType::Symbol | QueryType::Dependency | QueryType::Mixed)
-        || (query_type == QueryType::Conceptual
-            && regex::Regex::new(r"implemented|generation|bundle|logic|validation|handler|router|service|enforced|ontology|pipeline")
-                .unwrap()
-                .is_match(&lower_query));
+    let wants_impl = matches!(
+        query_type,
+        QueryType::Symbol | QueryType::Dependency | QueryType::Mixed
+    ) || (query_type == QueryType::Conceptual
+        && IMPL_WORDS_RE.is_match(&lower_query));
     if wants_impl && kind == FileKind::Doc {
         let w = get_weight("docWhenImplAsked");
         score += w;
@@ -380,10 +392,7 @@ pub fn score_authority(
         score -= 5;
         reasons.push("-5 scripts when core exists".to_string());
     }
-    let is_caller_query =
-        regex::Regex::new(r"(?i)\b(what calls|who calls|callers|used by|what breaks if)\b")
-            .unwrap()
-            .is_match(raw_query);
+    let is_caller_query = CALLER_QUERY_RE.is_match(raw_query);
     if query_type == QueryType::Dependency && is_caller_query {
         let is_reference = evidence.source == RetrievalSource::Exact
             && evidence.relation == Some(EvidenceRelation::Reference)

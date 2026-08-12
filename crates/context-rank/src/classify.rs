@@ -11,17 +11,58 @@ static DOCKERFILE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static EXT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\.[a-z0-9]{1,5}$").unwrap());
 
+static TEST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(tests? for|where is .* tested|what tests cover|test coverage|specs? for)\b")
+        .unwrap()
+});
+static DEP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(who calls|what calls|callers|callees|depends on|what breaks if|impact of|used by|transitive|calls?)\b").unwrap()
+});
+static SYM_DEF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(where is|where's|defined|implementation|implemented|define)\b").unwrap()
+});
+static CONCEPT_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"enforced|responsible|logic|handle|prevent|validate|implemented|ontology|pipeline|wired",
+    )
+    .unwrap()
+});
+static SINGLE_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_:]*$").unwrap());
+
+static SNAKE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[a-z]+_[a-z_0-9]*\b").unwrap());
+static UPPER_SNAKE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Z]+_[A-Z_0-9]*\b").unwrap());
+static CAMEL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[a-z]+[A-Z][a-zA-Z0-9]*\b").unwrap());
+static PASCAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Z][a-z]+[A-Z][a-zA-Z0-9]*\b").unwrap());
+static PASCAL_ALT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+$").unwrap());
+static SCREAMING_SNAKE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Z]+_[A-Z0-9_]+\b").unwrap());
+static QUALIFIED_SYMBOL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[a-zA-Z_][\w]*[.:]{1,2}[a-zA-Z_][\w]*").unwrap());
+static LOOKS_LIKE_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_:]*(\.[A-Za-z_][A-Za-z0-9_]*)*$").unwrap());
+static LOOKS_LIKE_ID_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:function|class|method|symbol|struct|interface|type|func)\s+([A-Za-z_][A-Za-z0-9_:]*)\b")
+        .unwrap()
+});
+static IDENTIFIER_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap());
+static HAS_IDENTIFIER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Za-z_][A-Za-z0-9_:]*\b").unwrap());
+static PATH_LIKE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\/\\].+\.\w+").unwrap());
+static PATH_LIKE_SLASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\w+/\w+").unwrap());
+
 pub fn classify_query(raw: &str) -> ClassifiedQuery {
     let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let lower = normalized.to_lowercase();
     let mut hints = Vec::new();
 
     // Test
-    let test_re = Regex::new(
-        r"(?i)\b(tests? for|where is .* tested|what tests cover|test coverage|specs? for)\b",
-    )
-    .unwrap();
-    if test_re.is_match(&lower) {
+    if TEST_RE.is_match(&lower) {
         hints.push("test".to_string());
         return ClassifiedQuery {
             query_type: QueryType::Test,
@@ -30,8 +71,7 @@ pub fn classify_query(raw: &str) -> ClassifiedQuery {
             hints,
         };
     }
-    let dep_re = Regex::new(r"(?i)\b(who calls|what calls|callers|callees|depends on|what breaks if|impact of|used by|transitive|calls?)\b").unwrap();
-    if dep_re.is_match(&lower) {
+    if DEP_RE.is_match(&lower) {
         hints.push("dependency".to_string());
         return ClassifiedQuery {
             query_type: QueryType::Dependency,
@@ -83,10 +123,7 @@ pub fn classify_query(raw: &str) -> ClassifiedQuery {
     }
 
     if looks_like_identifier(&normalized)
-        || (Regex::new(r"(?i)\b(where is|where's|defined|implementation|implemented|define)\b")
-            .unwrap()
-            .is_match(&lower)
-            && has_identifier(&normalized))
+        || (SYM_DEF_RE.is_match(&lower) && has_identifier(&normalized))
     {
         let tokens: Vec<&str> = normalized.split_whitespace().collect();
         let has_id = tokens.iter().any(|t| {
@@ -113,10 +150,7 @@ pub fn classify_query(raw: &str) -> ClassifiedQuery {
         }
     }
 
-    let sym_def_re =
-        Regex::new(r"(?i)\b(where is|where's|defined|implementation|implemented|define)\b")
-            .unwrap();
-    if sym_def_re.is_match(&lower) {
+    if SYM_DEF_RE.is_match(&lower) {
         let ids: Vec<&str> = normalized
             .split_whitespace()
             .filter(|t| t.chars().any(|c| c.is_alphanumeric()))
@@ -141,12 +175,7 @@ pub fn classify_query(raw: &str) -> ClassifiedQuery {
         || lower.starts_with("how")
         || normalized.contains('?');
     let word_count = normalized.split_whitespace().count();
-    if word_count >= 4
-        && (is_question
-            || Regex::new(r"enforced|responsible|logic|handle|prevent|validate|implemented|ontology|pipeline|wired")
-                .unwrap()
-                .is_match(&lower))
-    {
+    if word_count >= 4 && (is_question || CONCEPT_HINT_RE.is_match(&lower)) {
         hints.push("conceptual".to_string());
         return ClassifiedQuery {
             query_type: QueryType::Conceptual,
@@ -156,12 +185,7 @@ pub fn classify_query(raw: &str) -> ClassifiedQuery {
         };
     }
 
-    if single
-        && Regex::new(r"^[A-Za-z_][A-Za-z0-9_:]*$")
-            .unwrap()
-            .is_match(&normalized)
-        && has_identifier(&normalized)
-    {
+    if single && SINGLE_ID_RE.is_match(&normalized) && has_identifier(&normalized) {
         return ClassifiedQuery {
             query_type: QueryType::Symbol,
             raw: raw.to_string(),
@@ -209,8 +233,7 @@ fn is_quoted_literal(q: &str) -> bool {
 }
 
 fn has_path_like(q: &str) -> bool {
-    let re = Regex::new(r"[\/\\].+\.\w+").unwrap();
-    re.is_match(q) || Regex::new(r"\b\w+/\w+").unwrap().is_match(q)
+    PATH_LIKE_RE.is_match(q) || PATH_LIKE_SLASH_RE.is_match(q)
 }
 
 fn has_filename(q: &str) -> bool {
@@ -264,35 +287,23 @@ fn has_filename(q: &str) -> bool {
 }
 
 fn is_snake_case(q: &str) -> bool {
-    Regex::new(r"\b[a-z]+_[a-z_0-9]*\b").unwrap().is_match(q)
-        || Regex::new(r"\b[A-Z]+_[A-Z_0-9]*\b").unwrap().is_match(q)
+    SNAKE_RE.is_match(q) || UPPER_SNAKE_RE.is_match(q)
 }
 fn is_camel_case(q: &str) -> bool {
-    Regex::new(r"\b[a-z]+[A-Z][a-zA-Z0-9]*\b")
-        .unwrap()
-        .is_match(q)
+    CAMEL_RE.is_match(q)
 }
 fn is_pascal_case(q: &str) -> bool {
-    Regex::new(r"\b[A-Z][a-z]+[A-Z][a-zA-Z0-9]*\b")
-        .unwrap()
-        .is_match(q)
-        || Regex::new(r"^[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+$")
-            .unwrap()
-            .is_match(q)
+    PASCAL_RE.is_match(q) || PASCAL_ALT_RE.is_match(q)
 }
 fn is_screaming_snake(q: &str) -> bool {
-    Regex::new(r"\b[A-Z]+_[A-Z0-9_]+\b").unwrap().is_match(q)
+    SCREAMING_SNAKE_RE.is_match(q)
 }
 fn has_qualified_symbol(q: &str) -> bool {
-    Regex::new(r"[a-zA-Z_][\w]*[.:]{1,2}[a-zA-Z_][\w]*")
-        .unwrap()
-        .is_match(q)
-        || q.contains("::")
+    QUALIFIED_SYMBOL_RE.is_match(q) || q.contains("::")
 }
 fn looks_like_identifier(q: &str) -> bool {
     let t = q.trim();
-    let re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_:]*(\.[A-Za-z_][A-Za-z0-9_]*)*$").unwrap();
-    if re.is_match(t)
+    if LOOKS_LIKE_ID_RE.is_match(t)
         && (is_snake_case(t)
             || is_camel_case(t)
             || is_pascal_case(t)
@@ -302,16 +313,14 @@ fn looks_like_identifier(q: &str) -> bool {
     {
         return true;
     }
-    let m = Regex::new(r"(?i)\b(?:function|class|method|symbol|struct|interface|type|func)\s+([A-Za-z_][A-Za-z0-9_:]*)\b").unwrap();
-    m.is_match(t)
+    LOOKS_LIKE_ID_KEYWORD_RE.is_match(t)
 }
 fn is_identifier_token(t: &str) -> bool {
-    Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap().is_match(t)
+    IDENTIFIER_TOKEN_RE.is_match(t)
         && (is_snake_case(t) || is_camel_case(t) || is_pascal_case(t) || is_screaming_snake(t))
 }
 fn has_identifier(q: &str) -> bool {
-    let re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_:]*\b").unwrap();
-    for m in re.find_iter(q) {
+    for m in HAS_IDENTIFIER_RE.find_iter(q) {
         let tok = m.as_str();
         let base = tok.split(['.', ':']).next_back().unwrap_or(tok);
         if is_identifier_token(base) || has_qualified_symbol(tok) {
