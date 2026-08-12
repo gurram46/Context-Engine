@@ -284,7 +284,7 @@ pub fn count_bm25_docs(conn: &Connection) -> Result<i64> {
 }
 
 /// Search BM25.
-/// Typed Rust API: search_bm25(query, limit) -> Vec<Bm25Candidate>
+/// Typed Rust API: `search_bm25(query, limit) -> Vec<Bm25Candidate>`
 #[allow(clippy::type_complexity)]
 pub fn search_bm25(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Bm25Candidate>> {
     ensure_bm25_schema(conn)?;

@@ -242,6 +242,22 @@ fn init_schema(conn: &Connection) -> Result<()> {
 /// Upsert parsed file atomically.
 /// Deletes old symbols/refs/imports/chunks for that file, then inserts new.
 pub fn upsert_parsed_file(conn: &mut Connection, pf: &ParsedFile, size_bytes: u64) -> Result<()> {
+    // Defensive dedupe: stable symbol IDs can collide for distinct symbols that share
+    // the same qualified name within a file (e.g. trait impl methods). Keep the first.
+    let mut seen = std::collections::HashSet::new();
+    let symbols: Vec<&Symbol> = pf
+        .symbols
+        .iter()
+        .filter(|s| seen.insert(s.id.clone()))
+        .collect();
+    if symbols.len() < pf.symbols.len() {
+        tracing::warn!(
+            file = %pf.file,
+            total = %pf.symbols.len(),
+            unique = %symbols.len(),
+            "deduplicated symbol ids before upsert"
+        );
+    }
     let tx = conn.transaction()?;
     // Insert or replace file
     tx.execute(
@@ -261,7 +277,7 @@ pub fn upsert_parsed_file(conn: &mut Connection, pf: &ParsedFile, size_bytes: u6
     tx.execute("DELETE FROM chunks WHERE file=?1", params![pf.file])?;
     tx.execute("DELETE FROM call_edges WHERE file=?1", params![pf.file])?;
 
-    for s in &pf.symbols {
+    for s in symbols {
         tx.execute(
             "INSERT INTO symbols (id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![

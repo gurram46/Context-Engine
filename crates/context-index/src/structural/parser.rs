@@ -353,13 +353,19 @@ fn walk_rust(
             }
         }
         "impl_item" => {
-            let mut type_name = String::new();
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    if child.kind() == "type_identifier" || child.kind() == "scoped_type_identifier"
-                    {
-                        type_name = node_text(&child, source).to_string();
-                        break;
+            // Prefer the `type` field (the implementing type), falling back to scanning.
+            let mut type_name = node
+                .child_by_field_name("type")
+                .map(|n| node_text(&n, source).to_string())
+                .unwrap_or_default();
+            if type_name.is_empty() {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        if child.kind() == "type_identifier"
+                            || child.kind() == "scoped_type_identifier"
+                        {
+                            type_name = node_text(&child, source).to_string();
+                        }
                     }
                 }
             }
@@ -618,11 +624,38 @@ fn walk_py(
                     name: short,
                     file: file.to_string(),
                     line,
-                    parent_symbol: parent_id,
+                    parent_symbol: parent_id.clone(),
                     kind: ReferenceKind::Call,
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                 });
+                // Also record function-valued arguments (e.g. ctx.invoke(bundle),
+                // cli.add_command(bundle_command.bundle)) so dependency_trace can
+                // discover registration/dispatch call sites.
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    for i in 0..args.child_count() {
+                        if let Some(arg) = args.child(i) {
+                            let arg_name = match arg.kind() {
+                                "identifier" => Some(node_text(&arg, source).to_string()),
+                                "attribute" => arg
+                                    .child_by_field_name("attribute")
+                                    .map(|a| node_text(&a, source).to_string()),
+                                _ => None,
+                            };
+                            if let Some(name) = arg_name {
+                                references.push(Reference {
+                                    name,
+                                    file: file.to_string(),
+                                    line: (arg.start_position().row + 1) as u32,
+                                    parent_symbol: parent_id.clone(),
+                                    kind: ReferenceKind::Call,
+                                    start_byte: arg.start_byte(),
+                                    end_byte: arg.end_byte(),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         _ => {}
@@ -1410,6 +1443,32 @@ mod tests {
             .symbols
             .iter()
             .any(|s| s.name == "ProjectIndex" && matches!(s.kind, SymbolKind::Struct)));
+    }
+    #[test]
+    fn parse_rust_trait_impl_uses_implementing_type() {
+        let content = "trait T { fn m(&self); }\nstruct Foo;\nimpl T for Foo { fn m(&self) {} }\n";
+        let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        let pf = parse_file("x.rs", content, &hash);
+        let m = pf
+            .symbols
+            .iter()
+            .find(|s| s.name == "m")
+            .expect("method m should exist");
+        assert!(
+            m.qualified_name.contains("Foo"),
+            "qualified name should use implementing type Foo, got {}",
+            m.qualified_name
+        );
+    }
+    #[test]
+    fn parse_python_call_argument_reference() {
+        let content = "def caller():\n    ctx.invoke(bundle)\n";
+        let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        let pf = parse_file("a.py", content, &hash);
+        assert!(
+            pf.references.iter().any(|r| r.name == "bundle"),
+            "function-valued argument should be recorded as a reference"
+        );
     }
     #[test]
     fn parse_go_simple() {

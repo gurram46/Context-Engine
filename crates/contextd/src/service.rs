@@ -64,8 +64,13 @@ pub struct ReconcileStats {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StatusReport {
     pub version: String,
+    #[serde(rename = "contextdVersion")]
+    pub contextd_version: String,
+    pub rust_version: String,
+    pub pid: u32,
     pub project_root: String,
     pub git_branch: Option<String>,
     pub index_generation: Option<u64>,
@@ -298,8 +303,17 @@ impl ContextService {
         // watcher state — simple
         let watcher_state = "rust-notify".to_string();
 
+        let rust_version = env!("CARGO_PKG_RUST_VERSION").to_string();
+        let rust_version = if rust_version.is_empty() {
+            "1.80".to_string()
+        } else {
+            rust_version
+        };
         Ok(StatusReport {
-            version,
+            version: version.clone(),
+            contextd_version: version,
+            rust_version,
+            pid: std::process::id(),
             project_root,
             git_branch,
             index_generation: generation,

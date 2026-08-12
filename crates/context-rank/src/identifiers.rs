@@ -60,8 +60,6 @@ pub fn extract_identifiers(q: &str) -> Vec<String> {
         "covers",
         "implemented",
         "implementation",
-        "secret",
-        "redaction",
     ]
     .into_iter()
     .collect();
@@ -140,5 +138,17 @@ mod tests {
     fn new_router() {
         let ids = extract_identifiers("Where is NewRouter implemented?");
         assert!(ids.iter().any(|s| s == "NewRouter"));
+    }
+    #[test]
+    fn domain_terms_not_stop_words() {
+        let ids = extract_identifiers("Where is secret redaction implemented?");
+        assert!(
+            ids.iter().any(|s| s == "secret"),
+            "secret should be an identifier"
+        );
+        assert!(
+            ids.iter().any(|s| s == "redaction"),
+            "redaction should be an identifier"
+        );
     }
 }
