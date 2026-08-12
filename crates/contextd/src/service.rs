@@ -5,7 +5,7 @@ use std::sync::Arc;
 use context_core::ContextError;
 use context_index::embed::Embedder;
 use context_index::structural::store as structural_store;
-use context_index::ProjectRoot;
+use context_index::{ProjectIndex, ProjectRoot};
 
 use crate::pipeline::{retrieve_context, ContextResult, Providers};
 use crate::project::ProjectCache;
@@ -120,13 +120,22 @@ impl ContextService {
     /// Target <100ms for no-change.
     pub async fn reconcile(&self) -> Result<ReconcileStats, ContextError> {
         let t0 = std::time::Instant::now();
-        // ProjectCache::ensure already does discovery + incremental structural build.
-        // For R5 we just ensure; it is already cheap via hash skip.
-        let idx = self.cache.ensure().await?;
+        let root = ProjectRoot::resolve(Some(&self.root))
+            .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
+        let idx =
+            ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
+        // Incremental structural build (hash skip) — spawn_blocking
+        let root_path = root.path().to_path_buf();
+        let idx_clone = idx.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let si = context_index::structural::StructuralIndex::for_path(root_path);
+            let _ = si.build(&idx_clone);
+        })
+        .await;
         let elapsed = t0.elapsed().as_millis();
         Ok(ReconcileStats {
             discovered: idx.stats.discovered,
-            changed_files: 0, // ProjectCache handles incremental; 0 for no-change case
+            changed_files: 0,
             elapsed_ms: elapsed,
         })
     }
@@ -136,9 +145,20 @@ impl ContextService {
         query: &str,
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
-        // Reconcile first (cheap)
+        // Reconcile first (cheap) for explicit root
         let _ = self.reconcile().await;
-        let project = self.cache.ensure().await?;
+        let root = ProjectRoot::resolve(Some(&self.root))
+            .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
+        let project =
+            ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
+        // Ensure structural DB is ready (reconcile already did, but ensure again for safety)
+        let root_path = root.path().to_path_buf();
+        let idx_clone = project.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let si = context_index::structural::StructuralIndex::for_path(root_path);
+            let _ = si.build(&idx_clone);
+        })
+        .await;
         let providers = Providers {};
         retrieve_context(
             query,
@@ -221,7 +241,7 @@ impl ContextService {
                     }
                 }
             }
-            if let Ok(idx) = self.cache.ensure().await {
+            if let Ok(idx) = ProjectIndex::discover(&root) {
                 files_indexed = idx.stats.discovered;
             }
         }
