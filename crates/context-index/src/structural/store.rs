@@ -241,7 +241,26 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
 /// Upsert parsed file atomically.
 /// Deletes old symbols/refs/imports/chunks for that file, then inserts new.
+/// If `parse_error` is present, preserves last-known-good symbols/refs/chunks.
 pub fn upsert_parsed_file(conn: &mut Connection, pf: &ParsedFile, size_bytes: u64) -> Result<()> {
+    if pf.parse_error.is_some() {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE path=?1)",
+                params![pf.file],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if exists {
+            conn.execute(
+                "UPDATE files SET parse_error=?1 WHERE path=?2",
+                params![pf.parse_error, pf.file],
+            )?;
+            tracing::warn!(file=%pf.file, error=?pf.parse_error, "parse error — preserving last-known-good");
+            return Ok(());
+        }
+        // new file with parse error: insert with no symbols (fall through)
+    }
     // Defensive dedupe: stable symbol IDs can collide for distinct symbols that share
     // the same qualified name within a file (e.g. trait impl methods). Keep the first.
     let mut seen = std::collections::HashSet::new();
@@ -874,5 +893,54 @@ mod tests {
         let p2 = index_db_path(Path::new("/tmp/repo2"));
         assert_ne!(p1, p2);
         assert!(p1.to_string_lossy().contains("repo1"));
+    }
+    #[test]
+    fn preserve_last_good_on_parse_error() {
+        let mut conn = open_in_memory().unwrap();
+        let pf_good = crate::structural::types::ParsedFile {
+            file: "a.py".into(),
+            language: crate::structural::language::Language::Python,
+            content_hash: "hash_good".into(),
+            symbols: vec![crate::structural::types::Symbol {
+                id: "id_foo".into(),
+                name: "foo".into(),
+                qualified_name: "foo".into(),
+                kind: crate::structural::types::SymbolKind::Function,
+                file: "a.py".into(),
+                language: crate::structural::language::Language::Python,
+                start_line: 1,
+                end_line: 2,
+                start_byte: 0,
+                end_byte: 10,
+                visibility: crate::structural::types::Visibility::Private,
+                parent: None,
+            }],
+            references: vec![],
+            imports: vec![],
+            chunks: vec![],
+            parse_error: None,
+        };
+        upsert_parsed_file(&mut conn, &pf_good, 100).unwrap();
+        assert_eq!(count_symbols(&conn).unwrap(), 1);
+        let pf_bad = crate::structural::types::ParsedFile {
+            file: "a.py".into(),
+            language: crate::structural::language::Language::Python,
+            content_hash: "hash_bad".into(),
+            symbols: vec![],
+            references: vec![],
+            imports: vec![],
+            chunks: vec![],
+            parse_error: Some("partial parse with errors".into()),
+        };
+        upsert_parsed_file(&mut conn, &pf_bad, 100).unwrap();
+        assert_eq!(
+            count_symbols(&conn).unwrap(),
+            1,
+            "symbols should be preserved on parse error"
+        );
+        let hash: String = conn
+            .query_row("SELECT hash FROM files WHERE path='a.py'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hash, "hash_good", "hash should remain last-good");
     }
 }

@@ -91,6 +91,7 @@ pub struct ContextService {
     root: PathBuf,
     #[allow(dead_code)]
     explicit_root: Option<PathBuf>,
+    build_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ContextService {
@@ -107,6 +108,7 @@ impl ContextService {
             cache: Arc::new(ProjectCache::new()),
             root: root_path,
             explicit_root: root,
+            build_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -118,12 +120,14 @@ impl ContextService {
             cache,
             root: root.clone(),
             explicit_root: Some(root),
+            build_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     /// Cheap reconcile — discovery + incremental structural/BM25.
-    /// Target <100ms for no-change.
+    /// Target <100ms for no-change. Serialized to avoid concurrent SQLite writes.
     pub async fn reconcile(&self) -> Result<ReconcileStats, ContextError> {
+        let _guard = self.build_lock.lock().await;
         let t0 = std::time::Instant::now();
         let root = ProjectRoot::resolve(Some(&self.root))
             .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
@@ -152,22 +156,12 @@ impl ContextService {
         query: &str,
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
-        // Reconcile first (cheap) for explicit root
+        // Reconcile first (cheap, serialized) — no second duplicate build
         let _ = self.reconcile().await;
         let root = ProjectRoot::resolve(Some(&self.root))
             .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
         let project =
             ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
-        // Ensure structural DB is ready (reconcile already did, but ensure again for safety)
-        let root_path = root.path().to_path_buf();
-        let idx_clone = project.clone();
-        tokio::task::spawn_blocking(move || {
-            let si = context_index::structural::StructuralIndex::for_path(root_path);
-            si.build(&idx_clone)
-        })
-        .await
-        .map_err(|e| ContextError::Internal(format!("structural build panicked: {e}")))?
-        .map_err(|e| ContextError::Internal(format!("structural build failed: {e}")))?;
         let providers = Providers {};
         retrieve_context(
             query,
@@ -331,5 +325,34 @@ impl ContextService {
             watcher_state,
             store_schema_version: store_version,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn concurrent_searches_serialized() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo(): pass").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        svc.reconcile().await.unwrap();
+        let opts = SearchOptions::default();
+        let (r1, r2) = tokio::join!(svc.search("foo", opts.clone()), svc.search("foo", opts));
+        assert!(
+            r1.is_ok(),
+            "first concurrent search should succeed: {:?}",
+            r1.err()
+        );
+        assert!(
+            r2.is_ok(),
+            "second concurrent search should succeed: {:?}",
+            r2.err()
+        );
     }
 }

@@ -301,11 +301,13 @@ pub async fn retrieve_context(
         if gq.direction == "callers" || gq.direction == "both" {
             if let Ok(callers) = structural_store::find_callers(&conn, &gq.symbol) {
                 for edge in callers.iter().take(5) {
-                    let caller_sym = edge.resolved_symbol_id.as_deref().and_then(|id| {
-                        structural_store::find_symbol_by_id(&conn, id)
+                    let caller_sym = if edge.caller_symbol_id.is_empty() {
+                        None
+                    } else {
+                        structural_store::find_symbol_by_id(&conn, &edge.caller_symbol_id)
                             .ok()
                             .flatten()
-                    });
+                    };
                     let text = if let Some(s) = caller_sym.as_ref() {
                         Some(load_symbol_snippet(&project.root, s).await)
                     } else {
@@ -610,16 +612,14 @@ pub async fn retrieve_context(
             let q = sq.clone();
             // Embed query without holding DB connection (Connection is !Send)
             let qvec = {
-                let cached = context_index::embed::QUERY_CACHE
-                    .get(fp.model_id.as_str(), &q)
-                    .await;
+                let cached = context_index::embed::QUERY_CACHE.get(&fp, &q).await;
                 if let Some(v) = cached {
                     v
                 } else {
                     match embedder.embed_query(&q).await {
                         Ok(v) => {
                             context_index::embed::QUERY_CACHE
-                                .insert(fp.model_id.as_str(), &q, v.clone())
+                                .insert(&fp, &q, v.clone())
                                 .await;
                             v
                         }
@@ -832,6 +832,85 @@ async fn load_chunk_snippet(root: &Path, bm: &context_index::bm25::Bm25Candidate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn caller_evidence_uses_caller_not_callee() {
+        use context_index::structural::language::Language;
+        use context_index::structural::store;
+        use context_index::structural::types::{CallConfidence, Symbol, SymbolKind, Visibility};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut conn = store::open_db(tmp.path()).unwrap();
+        let caller_sym = Symbol {
+            id: "caller_id".into(),
+            name: "caller_fn".into(),
+            qualified_name: "caller_fn".into(),
+            kind: SymbolKind::Function,
+            file: "caller.rs".into(),
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 5,
+            start_byte: 0,
+            end_byte: 10,
+            visibility: Visibility::Private,
+            parent: None,
+        };
+        let callee_sym = Symbol {
+            id: "callee_id".into(),
+            name: "target".into(),
+            qualified_name: "target".into(),
+            kind: SymbolKind::Function,
+            file: "callee.rs".into(),
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 3,
+            start_byte: 0,
+            end_byte: 10,
+            visibility: Visibility::Private,
+            parent: None,
+        };
+        conn.execute(
+            "INSERT INTO files (path, hash, language, size_bytes) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["caller.rs", "hash1", "rust", 10],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, hash, language, size_bytes) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["callee.rs", "hash2", "rust", 10],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            rusqlite::params![caller_sym.id, caller_sym.name, caller_sym.qualified_name, caller_sym.kind.as_str(), caller_sym.file, "rust", caller_sym.start_line, caller_sym.end_line, caller_sym.start_byte as i64, caller_sym.end_byte as i64, caller_sym.visibility.as_str(), caller_sym.parent],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            rusqlite::params![callee_sym.id, callee_sym.name, callee_sym.qualified_name, callee_sym.kind.as_str(), callee_sym.file, "rust", callee_sym.start_line, callee_sym.end_line, callee_sym.start_byte as i64, callee_sym.end_byte as i64, callee_sym.visibility.as_str(), callee_sym.parent],
+        )
+        .unwrap();
+        let edge = context_index::structural::types::CallEdge {
+            caller_symbol_id: "caller_id".into(),
+            callee_name: "target".into(),
+            resolved_symbol_id: Some("callee_id".into()),
+            confidence: CallConfidence::Resolved,
+            file: "caller.rs".into(),
+            line: 2,
+        };
+        store::insert_call_edges(&mut conn, std::slice::from_ref(&edge)).unwrap();
+        let loaded_caller = store::find_symbol_by_id(&conn, &edge.caller_symbol_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded_caller.file, "caller.rs",
+            "caller evidence must load caller file, not callee"
+        );
+        let loaded_callee =
+            store::find_symbol_by_id(&conn, edge.resolved_symbol_id.as_deref().unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(loaded_callee.file, "callee.rs");
+        assert_ne!(loaded_caller.file, loaded_callee.file);
+    }
 
     #[test]
     fn non_symbol_crates_path_is_not_strong_symbol() {

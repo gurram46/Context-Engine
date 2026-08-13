@@ -210,7 +210,11 @@ impl Embedder for OllamaEmbedder {
                     .filter_map(|v| v.as_f64().map(|f| f as f32))
                     .collect();
                 if vec.len() != self.dim {
-                    tracing::warn!(expected=%self.dim, got=%vec.len(), "dimension mismatch");
+                    anyhow::bail!(
+                        "dimension mismatch: expected {}, got {}",
+                        self.dim,
+                        vec.len()
+                    );
                 }
                 // normalize for cosine
                 let mut v = vec;
@@ -226,6 +230,13 @@ impl Embedder for OllamaEmbedder {
                 .iter()
                 .filter_map(|v| v.as_f64().map(|f| f as f32))
                 .collect();
+            if vec.len() != self.dim {
+                anyhow::bail!(
+                    "dimension mismatch: expected {}, got {}",
+                    self.dim,
+                    vec.len()
+                );
+            }
             let mut v = vec;
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
             for x in &mut v {
@@ -257,6 +268,13 @@ impl Embedder for OllamaEmbedder {
                                     .iter()
                                     .filter_map(|v| v.as_f64().map(|f| f as f32))
                                     .collect();
+                                if v.len() != self.dim {
+                                    anyhow::bail!(
+                                        "dimension mismatch in batch: expected {}, got {}",
+                                        self.dim,
+                                        v.len()
+                                    );
+                                }
                                 let norm: f32 =
                                     v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
                                 for x in &mut v {
@@ -297,20 +315,47 @@ impl QueryCache {
             cap,
         }
     }
-    fn key(model: &str, query: &str) -> String {
+    fn key(fp: &ModelFingerprint, query: &str) -> String {
+        format!("{}::{}", fp.key(), query)
+    }
+    fn key_model(model: &str, query: &str) -> String {
         format!("{}::{}", model, query)
     }
-    pub async fn get(&self, model: &str, query: &str) -> Option<Vec<f32>> {
-        let k = Self::key(model, query);
+    pub async fn get(&self, fp: &ModelFingerprint, query: &str) -> Option<Vec<f32>> {
+        let k = Self::key(fp, query);
         self.map.lock().await.get(&k).cloned()
     }
-    pub async fn insert(&self, model: &str, query: &str, vec: Vec<f32>) {
-        let k = Self::key(model, query);
+    // For tests that use raw model string (legacy)
+    pub async fn get_model(&self, model: &str, query: &str) -> Option<Vec<f32>> {
+        let k = Self::key_model(model, query);
+        self.map.lock().await.get(&k).cloned()
+    }
+    pub async fn insert(&self, fp: &ModelFingerprint, query: &str, vec: Vec<f32>) {
+        let k = Self::key(fp, query);
         let mut map = self.map.lock().await;
         let mut order = self.order.lock().await;
         if map.contains_key(&k) {
             map.insert(k.clone(), vec);
             // move to end
+            order.retain(|x| x != &k);
+            order.push(k);
+            return;
+        }
+        if map.len() >= self.cap {
+            if let Some(old) = order.first().cloned() {
+                order.remove(0);
+                map.remove(&old);
+            }
+        }
+        map.insert(k.clone(), vec);
+        order.push(k);
+    }
+    pub async fn insert_model(&self, model: &str, query: &str, vec: Vec<f32>) {
+        let k = Self::key_model(model, query);
+        let mut map = self.map.lock().await;
+        let mut order = self.order.lock().await;
+        if map.contains_key(&k) {
+            map.insert(k.clone(), vec);
             order.retain(|x| x != &k);
             order.push(k);
             return;
@@ -351,12 +396,47 @@ mod tests {
     #[tokio::test]
     async fn cache_bounded() {
         let c = QueryCache::new(2);
-        c.insert("m", "q1", vec![1.0]).await;
-        c.insert("m", "q2", vec![2.0]).await;
-        assert!(c.get("m", "q1").await.is_some());
-        c.insert("m", "q3", vec![3.0]).await;
+        let fp = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v1".into(),
+            dimension: 8,
+        };
+        c.insert(&fp, "q1", vec![1.0]).await;
+        c.insert(&fp, "q2", vec![2.0]).await;
+        assert!(c.get(&fp, "q1").await.is_some());
+        c.insert(&fp, "q3", vec![3.0]).await;
         // q1 should be evicted (LRU)
-        assert!(c.get("m", "q1").await.is_none());
-        assert!(c.get("m", "q3").await.is_some());
+        assert!(c.get(&fp, "q1").await.is_none());
+        assert!(c.get(&fp, "q3").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn cache_key_includes_fingerprint() {
+        let c = QueryCache::new(10);
+        let fp1 = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v1".into(),
+            dimension: 8,
+        };
+        let fp2 = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v2".into(),
+            dimension: 8,
+        };
+        let fp3 = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v1".into(),
+            dimension: 16,
+        };
+        c.insert(&fp1, "q", vec![1.0]).await;
+        assert!(c.get(&fp1, "q").await.is_some());
+        assert!(
+            c.get(&fp2, "q").await.is_none(),
+            "different version should not hit cache"
+        );
+        assert!(
+            c.get(&fp3, "q").await.is_none(),
+            "different dimension should not hit cache"
+        );
     }
 }

@@ -196,6 +196,10 @@ impl StructuralWatcher {
     /// Graceful shutdown
     pub async fn shutdown(&self) {
         self.shutdown.notify_waiters();
+        {
+            let mut s = self.status.lock().await;
+            s.is_running = false;
+        }
         // Give worker a moment
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -204,6 +208,10 @@ impl StructuralWatcher {
 impl Drop for StructuralWatcher {
     fn drop(&mut self) {
         self.shutdown.notify_waiters();
+        // Best-effort: mark not running if we can (sync try_lock)
+        if let Ok(mut s) = self.status.try_lock() {
+            s.is_running = false;
+        }
         self._worker.abort();
     }
 }
@@ -224,6 +232,10 @@ async fn watcher_worker(
         tokio::select! {
             _ = shutdown.notified() => {
                 tracing::info!("watcher worker shutdown");
+                {
+                    let mut s = status.lock().await;
+                    s.is_running = false;
+                }
                 break;
             }
             msg = rx.recv() => {
@@ -344,6 +356,11 @@ async fn watcher_worker(
             last_flush = tokio::time::Instant::now();
         }
     }
+    // Ensure stopped state is visible even if loop exited via channel close
+    {
+        let mut s = status.lock().await;
+        s.is_running = false;
+    }
 }
 
 fn now_ms() -> u64 {
@@ -388,6 +405,22 @@ mod tests {
         let st = w.status().await;
         assert!(st.is_running);
         w.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watcher_status_after_shutdown_false() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        let w = StructuralWatcher::new(root.clone())?;
+        assert!(w.status().await.is_running);
+        w.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !w.status().await.is_running,
+            "status should be false after shutdown"
+        );
         Ok(())
     }
 

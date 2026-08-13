@@ -4,9 +4,19 @@ use std::time::{Duration, Instant};
 
 use context_core::ContextError;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 use crate::discovery::ProjectIndex;
+
+/// Ensures orphaned `rg` is killed if the future is cancelled (timeout).
+struct KillOnDrop(Option<Child>);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.start_kill();
+        }
+    }
+}
 
 /// Max file size for normal content search (10 MB).
 /// Larger files are not loaded fully; filename lookup still works.
@@ -195,6 +205,8 @@ pub async fn exact_search(
         .stderr
         .take()
         .ok_or_else(|| ContextError::Internal("rg stderr not piped".into()))?;
+    // Guard: if outer timeout cancels `out_fut`, `Child` is dropped without `wait`; Tokio does not auto-kill, so we kill on drop.
+    let mut kill_guard = KillOnDrop(Some(child));
 
     // Bounded stdout handling with timeout
     let t0 = Instant::now();
@@ -260,11 +272,16 @@ pub async fn exact_search(
         }
 
         // Wait for child with timeout (rg should finish quickly after stdout closed)
-        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        let child_ref = kill_guard
+            .0
+            .as_mut()
+            .ok_or_else(|| ContextError::Internal("rg child missing".into()))?;
+        let status = tokio::time::timeout(Duration::from_secs(5), child_ref.wait())
             .await
             .map_err(|_| ContextError::Timeout("rg wait timeout".into()))?
             .map_err(|e| ContextError::Internal(format!("rg wait failed: {}", e)))?;
-
+        // Prevent Drop kill after successful wait
+        kill_guard.0.take();
         let stderr_text = stderr_task.await.unwrap_or_default();
         if !status.success() && status.code() != Some(1) {
             // 1 = no matches, 0 = matches, else error
@@ -394,5 +411,39 @@ mod tests {
         assert_eq!(parts.next().unwrap(), "10");
         assert_eq!(parts.next().unwrap(), "5");
         assert_eq!(parts.next().unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_child_and_allows_subsequent_search() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let mut content = String::new();
+        for i in 0..1000 {
+            content.push_str(&format!("line {} hello world\n", i));
+        }
+        std::fs::write(tmp.path().join("a.txt"), content).unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let res1 = exact_search(
+            &idx,
+            ExactQuery::Literal("hello".into()),
+            ExactSearchOptions {
+                max_results: 100,
+                timeout: Duration::from_millis(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(res1.is_ok() || matches!(res1, Err(ContextError::Timeout(_))));
+        let res2 = exact_search(
+            &idx,
+            ExactQuery::Literal("hello".into()),
+            ExactSearchOptions {
+                max_results: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!res2.is_empty());
     }
 }

@@ -67,6 +67,19 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
             })
             .then_with(|| a.file.cmp(&b.file))
     });
+    // Retain best definition for preservation after collapse (must capture before dedup consumes scored)
+    let best_def = scored
+        .iter()
+        .filter(|e| {
+            e.relation == Some(crate::types::EvidenceRelation::Definition)
+                && e.source == crate::types::RetrievalSource::Symbol
+        })
+        .max_by(|a, b| {
+            a.final_score
+                .partial_cmp(&b.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .cloned();
 
     // 3. Dedup (deterministic via BTreeMap)
     let mut seen: BTreeMap<String, Evidence> = BTreeMap::new();
@@ -183,18 +196,110 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
             && e.source == crate::types::RetrievalSource::Symbol
     });
     if !def_exists {
-        // Find best def from scored (original scored before dedup, but we have deduped)
-        // For now, just check if any def in original scored would have been
-        // We need to keep scored list before dedup for this, but we have it as `scored` was moved.
-        // Instead, check collapsed_list is already sorted, if no def, we can't recover without original.
-        // For now, do nothing.
+        if let Some(def) = best_def.clone() {
+            collapsed_list.push(def);
+            collapsed_list.sort_by(|a, b| {
+                b.final_score
+                    .partial_cmp(&a.final_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.file.cmp(&b.file))
+            });
+        }
     }
 
-    let ranked = collapsed_list.into_iter().take(top_n).collect();
+    let mut ranked: Vec<Evidence> = collapsed_list.into_iter().take(top_n).collect();
+    let ranked_has_def = ranked.iter().any(|e| {
+        e.relation == Some(crate::types::EvidenceRelation::Definition)
+            && e.source == crate::types::RetrievalSource::Symbol
+    });
+    if !ranked_has_def {
+        if let Some(def) = best_def {
+            if ranked.len() < top_n {
+                ranked.push(def);
+            } else if !ranked.is_empty() {
+                ranked.pop();
+                ranked.push(def);
+            } else {
+                ranked.push(def);
+            }
+            ranked.sort_by(|a, b| {
+                b.final_score
+                    .partial_cmp(&a.final_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.file.cmp(&b.file))
+            });
+        }
+    }
 
     FuseResult {
         ranked,
         deduped,
         collapsed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Evidence, EvidenceRelation, QueryType, RetrievalSource};
+
+    fn mk_ev(
+        file: &str,
+        source: RetrievalSource,
+        relation: EvidenceRelation,
+        symbol: Option<&str>,
+        text: &str,
+        score: f64,
+    ) -> Evidence {
+        Evidence {
+            source,
+            file: file.into(),
+            start_line: Some(10),
+            end_line: Some(12),
+            symbol: symbol.map(|s| s.to_string()),
+            symbol_kind: Some("function_definition".into()),
+            text: Some(text.into()),
+            score: Some(score),
+            relation: Some(relation),
+            authority_score: None,
+            final_score: None,
+            provenance: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn definition_preserved_when_top_n_would_drop_it() {
+        let query = "Where is foo implemented?";
+        // High-scoring exact in backend (should outrank stale def)
+        let doc_like = mk_ev(
+            "backend/cli.py",
+            RetrievalSource::Exact,
+            EvidenceRelation::Reference,
+            None,
+            "cli add_command foo",
+            1.0,
+        );
+        // Stale definition with lower authority
+        let stale_def = mk_ev(
+            "archive/old.rs",
+            RetrievalSource::Symbol,
+            EvidenceRelation::Definition,
+            Some("foo"),
+            "def foo():",
+            1.0,
+        );
+        let opts = FuseOptions {
+            top_n: 1,
+            query_type: QueryType::Symbol,
+            raw_query: query.into(),
+        };
+        let res = fuse_evidence(vec![doc_like, stale_def], opts);
+        assert!(
+            res.ranked
+                .iter()
+                .any(|e| e.relation == Some(EvidenceRelation::Definition)),
+            "definition should be preserved even when top_n=1 and doc outranks initially"
+        );
     }
 }

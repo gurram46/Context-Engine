@@ -629,29 +629,46 @@ fn walk_py(
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                 });
-                // Also record function-valued arguments (e.g. ctx.invoke(bundle),
+                // Also record function-valued arguments for wiring calls (e.g. ctx.invoke(bundle),
                 // cli.add_command(bundle_command.bundle)) so dependency_trace can
-                // discover registration/dispatch call sites.
-                if let Some(args) = node.child_by_field_name("arguments") {
-                    for i in 0..args.child_count() {
-                        if let Some(arg) = args.child(i) {
-                            let arg_name = match arg.kind() {
-                                "identifier" => Some(node_text(&arg, source).to_string()),
-                                "attribute" => arg
-                                    .child_by_field_name("attribute")
-                                    .map(|a| node_text(&a, source).to_string()),
-                                _ => None,
-                            };
-                            if let Some(name) = arg_name {
-                                references.push(Reference {
-                                    name,
-                                    file: file.to_string(),
-                                    line: (arg.start_position().row + 1) as u32,
-                                    parent_symbol: parent_id.clone(),
-                                    kind: ReferenceKind::Call,
-                                    start_byte: arg.start_byte(),
-                                    end_byte: arg.end_byte(),
-                                });
+                // discover registration/dispatch call sites. Avoid `process(user_id)` false edges.
+                let is_wiring = {
+                    let lower = callee_full.to_lowercase();
+                    lower.contains("command")
+                        || lower.contains("register")
+                        || lower.contains("invoke")
+                        || lower.contains("include")
+                        || lower.contains("router")
+                        || lower.contains("add")
+                        || lower.contains("mount")
+                        || lower.contains("handler")
+                        || lower.contains("dispatch")
+                        || lower.contains("bind")
+                        || lower.contains("plug")
+                        || lower.contains("use")
+                };
+                if is_wiring {
+                    if let Some(args) = node.child_by_field_name("arguments") {
+                        for i in 0..args.child_count() {
+                            if let Some(arg) = args.child(i) {
+                                let arg_name = match arg.kind() {
+                                    "identifier" => Some(node_text(&arg, source).to_string()),
+                                    "attribute" => arg
+                                        .child_by_field_name("attribute")
+                                        .map(|a| node_text(&a, source).to_string()),
+                                    _ => None,
+                                };
+                                if let Some(name) = arg_name {
+                                    references.push(Reference {
+                                        name,
+                                        file: file.to_string(),
+                                        line: (arg.start_position().row + 1) as u32,
+                                        parent_symbol: parent_id.clone(),
+                                        kind: ReferenceKind::Call,
+                                        start_byte: arg.start_byte(),
+                                        end_byte: arg.end_byte(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -1468,6 +1485,30 @@ mod tests {
         assert!(
             pf.references.iter().any(|r| r.name == "bundle"),
             "function-valued argument should be recorded as a reference"
+        );
+    }
+    #[test]
+    fn parse_python_call_argument_not_for_data() {
+        let content = "def caller():\n    process(user_id)\n";
+        let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        let pf = parse_file("a.py", content, &hash);
+        assert!(
+            !pf.references.iter().any(|r| r.name == "user_id"),
+            "data arg user_id should not be recorded as Call"
+        );
+        assert!(
+            pf.references.iter().any(|r| r.name == "process"),
+            "call itself should still be recorded"
+        );
+    }
+    #[test]
+    fn parse_python_call_argument_wiring_attribute() {
+        let content = "def caller():\n    cli.add_command(bundle.bundle)\n";
+        let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        let pf = parse_file("a.py", content, &hash);
+        assert!(
+            pf.references.iter().any(|r| r.name == "bundle"),
+            "wiring attribute arg should be recorded"
         );
     }
     #[test]

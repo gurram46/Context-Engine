@@ -78,6 +78,13 @@ pub fn upsert_vector(
     fingerprint: &ModelFingerprint,
     vector: &[f32],
 ) -> Result<()> {
+    if vector.len() != fingerprint.dimension {
+        anyhow::bail!(
+            "vector dimension mismatch: expected {}, got {}",
+            fingerprint.dimension,
+            vector.len()
+        );
+    }
     ensure_vector_schema(conn)?;
     let blob = vec_to_blob(vector);
     conn.execute(
@@ -302,7 +309,7 @@ pub fn search_brute(
 }
 
 /// High-level search with query embedding cache.
-/// Bounded cache key includes model identity + query string.
+/// Bounded cache key includes full fingerprint (model+version+dimension) + query.
 pub async fn search_vector(
     conn: &Connection,
     query: &str,
@@ -310,15 +317,13 @@ pub async fn search_vector(
     embedder: &dyn Embedder,
     limit: usize,
 ) -> Result<Vec<VectorCandidate>> {
-    // Check cache
-    let cached = QUERY_CACHE.get(fingerprint.model_id.as_str(), query).await;
+    // Check cache — full fingerprint prevents stale reuse across model changes
+    let cached = QUERY_CACHE.get(fingerprint, query).await;
     let qvec = if let Some(v) = cached {
         v
     } else {
         let v = embedder.embed_query(query).await?;
-        QUERY_CACHE
-            .insert(fingerprint.model_id.as_str(), query, v.clone())
-            .await;
+        QUERY_CACHE.insert(fingerprint, query, v.clone()).await;
         v
     };
     // Use brute force for now; usearch can be added later with same API
@@ -630,6 +635,25 @@ mod tests {
             "error should mention length mismatch: {}",
             err
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upsert_rejects_wrong_dimension() -> Result<()> {
+        let mut conn = open_in_memory()?;
+        let fp = ModelFingerprint {
+            model_id: "test".to_string(),
+            version: "v1".to_string(),
+            dimension: 4,
+        };
+        let bad_vec = vec![1.0, 2.0, 3.0]; // 3 != 4
+        let res = upsert_vector(&mut conn, "hash1", &fp, &bad_vec);
+        assert!(res.is_err(), "upsert should reject dimension mismatch");
+        assert!(
+            res.unwrap_err().to_string().contains("dimension mismatch"),
+            "error should mention dimension mismatch"
+        );
+        assert_eq!(count_vectors(&conn, &fp)?, 0);
         Ok(())
     }
 }

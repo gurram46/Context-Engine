@@ -209,7 +209,6 @@ fn is_true_definition(evidence: &Evidence, raw_query: &str) -> bool {
         format!("def {}", target),
         format!("class {}", target),
         format!("func {}", target),
-        "func (".to_string(),
         format!("type {} struct", target),
         format!("type {} interface", target),
         format!("function {}", target),
@@ -225,6 +224,13 @@ fn is_true_definition(evidence: &Evidence, raw_query: &str) -> bool {
     {
         let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(&target))).unwrap();
         if re.is_match(&text) {
+            return true;
+        }
+    }
+    // Go method with receiver: func (s *Server) Target — allow any receiver between func ( and target
+    if text.contains("func (") {
+        let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(&target))).unwrap();
+        if re.is_match(&text) && text.contains("func ") {
             return true;
         }
     }
@@ -508,4 +514,55 @@ pub fn apply_authority(
         out.push(e);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Evidence, EvidenceRelation, RetrievalSource};
+
+    fn ev(symbol: Option<&str>, kind: &str, text: &str) -> Evidence {
+        Evidence {
+            source: RetrievalSource::Symbol,
+            file: "test.go".into(),
+            start_line: Some(1),
+            end_line: Some(5),
+            symbol: symbol.map(|s| s.to_string()),
+            symbol_kind: Some(kind.into()),
+            text: Some(text.into()),
+            score: Some(1.0),
+            relation: Some(EvidenceRelation::Definition),
+            authority_score: None,
+            final_score: None,
+            provenance: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn go_true_definition_requires_target() {
+        let other = ev(
+            Some("OtherMethod"),
+            "method",
+            "func (s *Server) OtherMethod() {}",
+        );
+        assert!(
+            !is_true_definition(&other, "Where is NewRouter implemented?"),
+            "unrelated Go method should not be true definition for NewRouter"
+        );
+        let target = ev(
+            Some("NewRouter"),
+            "function_declaration",
+            "func NewRouter() Router {",
+        );
+        assert!(
+            is_true_definition(&target, "Where is NewRouter implemented?"),
+            "NewRouter definition should be true"
+        );
+        let method_target = ev(Some("Start"), "method", "func (s *Server) Start() {}");
+        assert!(
+            is_true_definition(&method_target, "Where is Start implemented?"),
+            "method with receiver should be true when target matches"
+        );
+    }
 }
