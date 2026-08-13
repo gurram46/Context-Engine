@@ -214,9 +214,13 @@ def main():
                   "django/contrib/admin/static/**\n"
                   "docs/**\n"
                   "django/contrib/gis/**\n",
-        "nestjs": "# bench smoke profile: ignore sample/integration for fast local (NEVER for official)\n"
+        "nestjs": "# bench smoke profile: fast local with expected files preserved (NEVER for official)\n"
+                  "integration/**\n"
                   "sample/**\n"
-                  "integration/**\n",
+                  "!sample/01-cats-app/\n"
+                  "!sample/01-cats-app/src/\n"
+                  "!sample/01-cats-app/src/app.module.ts\n"
+                  "!sample/01-cats-app/src/main.ts\n",
     }
     for repo_name in list(by_repo.keys()):
         repo_path = REPO_ROOT / "bench" / "repos" / repo_name
