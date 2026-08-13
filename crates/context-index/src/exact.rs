@@ -173,7 +173,6 @@ pub async fn exact_search(
         "dist",
         "build",
         "target",
-        "crates", // engine-repo-specific: avoids indexing the Rust implementation itself during frozen eval
         "__pycache__",
         ".pytest_cache",
         "coverage",
@@ -445,5 +444,41 @@ mod tests {
         .await
         .unwrap();
         assert!(!res2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn crates_dir_is_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let crates_file = tmp.path().join("crates/demo/src/lib.rs");
+        std::fs::create_dir_all(crates_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &crates_file,
+            b"pub fn unique_crates_demo_fn_9f3a1b() {}\n// UNIQUE_CRATES_DEMO_IDENTIFIER_12345\n",
+        )
+        .unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        assert!(
+            idx.files
+                .iter()
+                .any(|f| f.relative_path == "crates/demo/src/lib.rs"),
+            "crates file should be discovered"
+        );
+        let res = exact_search(
+            &idx,
+            ExactQuery::Literal("UNIQUE_CRATES_DEMO_IDENTIFIER_12345".into()),
+            ExactSearchOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !res.is_empty(),
+            "exact_search should find identifier inside crates/**"
+        );
+        assert!(
+            res.iter().any(|e| e.file == "crates/demo/src/lib.rs"),
+            "expected crates/demo/src/lib.rs in results, got {:?}",
+            res.iter().map(|e| &e.file).collect::<Vec<_>>()
+        );
     }
 }

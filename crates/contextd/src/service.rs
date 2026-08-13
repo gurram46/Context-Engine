@@ -156,8 +156,9 @@ impl ContextService {
         query: &str,
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
-        // Reconcile first (cheap, serialized) — no second duplicate build
-        let _ = self.reconcile().await;
+        self.reconcile()
+            .await
+            .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
         let root = ProjectRoot::resolve(Some(&self.root))
             .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
         let project =
@@ -353,6 +354,28 @@ mod tests {
             r2.is_ok(),
             "second concurrent search should succeed: {:?}",
             r2.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_failure_is_propagated() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join(".context")).unwrap();
+        fs::write(root.join(".context/index"), b"not a directory").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let res = svc.search("foo", SearchOptions::default()).await;
+        assert!(
+            res.is_err(),
+            "search should propagate reconcile failure, got {:?}",
+            res
+        );
+        let err = res.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err.contains("reconcile"),
+            "error should mention reconcile, got: {}",
+            err
         );
     }
 }
