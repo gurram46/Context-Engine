@@ -17,7 +17,42 @@ fn workspace_root() -> std::path::PathBuf {
 
 #[tokio::test]
 async fn exact_fallback_test_bundle() {
-    let root = ProjectRoot::resolve(Some(workspace_root().as_path())).expect("root");
+    // Isolated temporary repo fixture — avoids indexing the real Context-Engine repo
+    // which contains benchmark/golden tests that mention `test_bundle` and contaminate exact retrieval.
+    // Fixture mirrors realistic layout with distractors so ranking is actually tested, not just existence.
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let root_path = tmp.path();
+    std::fs::create_dir_all(root_path.join(".git")).expect("git");
+    std::fs::create_dir_all(root_path.join("backend/context_engine/commands")).expect("mkdir");
+    std::fs::create_dir_all(root_path.join("tests")).expect("mkdir");
+    std::fs::create_dir_all(root_path.join("docs")).expect("mkdir");
+    std::fs::create_dir_all(root_path.join("src")).expect("mkdir");
+    // Distractor: Source file (FileKind::Source) — will get -12 sourceWhenTestAsked
+    std::fs::write(
+        root_path.join("backend/context_engine/commands/bundle_command.py"),
+        b"def bundle(name: str, format: str):\n    pass\n# test_bundle distraction in source impl\n",
+    )
+    .expect("write");
+    // Expected: Test file (FileKind::Test via tests/ + test_ prefix) — will get +38 testWhenAsked
+    std::fs::write(
+        root_path.join("tests/test_bundle_integration.py"),
+        b"def test_bundle_without_task(tmp_path):\n    assert True\n\ndef test_bundle_with_task(tmp_path):\n    assert bundle() is not None\n\n# test_bundle integration tests for bundle generation\n",
+    )
+    .expect("write");
+    // Distractor: Doc file (FileKind::Doc) — will get -20 docWhenTestAsked
+    std::fs::write(
+        root_path.join("docs/bundle.md"),
+        b"# Bundle\n\nBundle generation docs with test_bundle mention for ranking test.\n",
+    )
+    .expect("write");
+    // Distractor: Source file in src/ (FileKind::Source) — will get -12
+    std::fs::write(
+        root_path.join("src/unrelated_bundle_helper.py"),
+        b"def unrelated_helper():\n    # helper mentions test_bundle but is not a test\n    pass\n",
+    )
+    .expect("write");
+
+    let root = ProjectRoot::resolve(Some(root_path)).expect("root");
     let idx = ProjectIndex::discover(&root).expect("index");
     // Simulate OCI empty: only exact for test_bundle
     let res = context_index::exact::exact_search(
@@ -42,7 +77,7 @@ async fn exact_fallback_test_bundle() {
         "should find test_bundle_integration.py via exact, got {:?}",
         res.iter().map(|e| &e.file).collect::<Vec<_>>()
     );
-    // Also verify authority/fuse still ranks it
+    // Also verify authority/fuse still ranks it Top1 with realistic distractors
     let evidences: Vec<context_rank::types::Evidence> = res
         .into_iter()
         .map(|e| context_rank::types::Evidence {
