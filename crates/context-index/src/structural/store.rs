@@ -341,7 +341,22 @@ pub fn upsert_parsed_file(conn: &mut Connection, pf: &ParsedFile, size_bytes: u6
             ],
         )?;
     }
-    for c in &pf.chunks {
+    // Defensive dedupe for chunks as well (large vendor JS can produce duplicate chunk ids)
+    let mut seen_chunks = std::collections::HashSet::new();
+    let chunks: Vec<&crate::structural::types::Chunk> = pf
+        .chunks
+        .iter()
+        .filter(|c| seen_chunks.insert(c.id.clone()))
+        .collect();
+    if chunks.len() < pf.chunks.len() {
+        tracing::warn!(
+            file = %pf.file,
+            total = %pf.chunks.len(),
+            unique = %chunks.len(),
+            "deduplicated chunk ids before upsert"
+        );
+    }
+    for c in chunks {
         tx.execute(
             "INSERT INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![

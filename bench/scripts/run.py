@@ -57,40 +57,93 @@ def load_questions():
 
 
 def compute_retrieval_metrics(expected_files, hits, top_n=5):
-    """hits: list of SearchHit in ranked order (already top_n)."""
-    # Normalize expected to lower posix
-    exp_norm = [e.lower().replace("\\", "/") for e in expected_files]
-    hit_files = [h.file.lower().replace("\\", "/") for h in hits]
+    """hits: list of SearchHit in ranked order (already top_n).
 
-    def is_hit(file):
-        # exact match or suffix match (allow expected "django/db/models/base.py" to match "django/db/models/base.py")
-        # and also allow expected to be suffix of hit (if hit has no prefix)
-        lf = file.lower()
-        for e in exp_norm:
-            if lf == e or lf.endswith("/" + e) or e.endswith("/" + lf) or lf.endswith(e):
+    FILE-LEVEL evaluation: convert evidence into ranked UNIQUE files
+    preserving first occurrence before metrics.
+    Hit@K = binary (any relevant in first K unique files)
+    Recall@K = relevant retrieved / total relevant (fractional)
+    MRR = 1/rank of first relevant unique file
+    """
+    exp_norm = [e.lower().replace("\\", "/") for e in expected_files]
+    # unique expected
+    exp_unique = list(dict.fromkeys(exp_norm))
+    exp_set = set(exp_unique)
+    total_relevant = len(exp_unique) if exp_unique else 1
+
+    # dedupe hits into unique files preserving rank
+    seen = set()
+    unique_files = []
+    unique_hits = []  # SearchHit corresponding to first occurrence per file
+    for h in hits:
+        norm = h.file.lower().replace("\\", "/")
+        if norm not in seen:
+            seen.add(norm)
+            unique_files.append(norm)
+            unique_hits.append(h)
+
+    def matches_expected(hit_file, expected):
+        lf = hit_file.lower()
+        e = expected.lower()
+        return lf == e or lf.endswith("/" + e) or e.endswith("/" + lf) or lf.endswith(e)
+
+    def is_hit_file(hit_file):
+        for e in exp_unique:
+            if matches_expected(hit_file, e):
                 return True
         return False
 
-    # find rank of first expected (1-indexed)
+    # find rank of first relevant unique file (1-indexed)
     rank = None
-    for i, hf in enumerate(hit_files, start=1):
-        if is_hit(hf):
+    for i, uf in enumerate(unique_files, start=1):
+        if is_hit_file(uf):
             rank = i
             break
 
-    top1 = 1 if rank == 1 else 0
-    r1 = 1 if rank is not None and rank <= 1 else 0
-    r3 = 1 if rank is not None and rank <= 3 else 0
-    r5 = 1 if rank is not None and rank <= 5 else 0
+    # Hit@K
+    def hit_at(K):
+        if K <= 0:
+            return 0
+        for uf in unique_files[:K]:
+            if is_hit_file(uf):
+                return 1
+        return 0
+
+    # Recall@K
+    def recall_at(K):
+        if total_relevant == 0:
+            return 0.0
+        retrieved = 0
+        # for each expected, check if it appears in first K unique files
+        for e in exp_unique:
+            for uf in unique_files[:K]:
+                if matches_expected(uf, e):
+                    retrieved += 1
+                    break
+        return retrieved / total_relevant
+
+    top1 = hit_at(1)
+    h1 = hit_at(1)
+    h3 = hit_at(3)
+    h5 = hit_at(5)
+    r1 = recall_at(1)
+    r3 = recall_at(3)
+    r5 = recall_at(5)
     mrr = 1.0 / rank if rank else 0.0
+    unique_count = len(unique_files)
 
     return {
         "top1_correct": top1,
+        "hit_at_1": h1,
+        "hit_at_3": h3,
+        "hit_at_5": h5,
         "recall_at_1": r1,
         "recall_at_3": r3,
         "recall_at_5": r5,
         "mrr": mrr,
         "rank": rank,
+        "unique_files": unique_count,
+        "deduplicated_from": len(hits),
     }
 
 
@@ -174,6 +227,7 @@ def main():
             # store for summary
             indexing_results[(adapter.name, repo_name)] = idx
             # also write a synthetic indexing record to results for traceability
+            status_data = getattr(adapter, "_last_status", None) if adapter.name == "context_engine" else None
             rec = {
                 "type": "indexing",
                 "adapter": adapter.name,
@@ -181,9 +235,136 @@ def main():
                 "commit": entry["commit"],
                 "wall_ms": wall,
                 "indexing": idx.__dict__ if idx else None,
+                "status": status_data,
             }
             with out_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
+
+    # Additional timing measurements for real contextd: cold first-search, warm, one-file-change
+    # Skip for quick accuracy run; enable via CONTEXT_BENCH_TIMING=1
+    import os as _os
+    _do_timing = _os.environ.get("CONTEXT_BENCH_TIMING") == "1"
+    for adapter in adapters:
+        if not _do_timing or adapter.name != "context_engine":
+            continue
+        for repo_name, qs in by_repo.items():
+            if filter_repos and repo_name not in filter_repos:
+                continue
+            repo_path = REPO_ROOT / "bench" / "repos" / repo_name
+            if not repo_path.exists():
+                continue
+            # neutral query: first question's query for this repo
+            neutral_q = qs[0]["query"] if qs else "Model"
+            # Attempt to capture cold first-search by optionally removing index file (disposable checkout only)
+            # Remove ONLY the bench checkout's contextd index to force cold rebuild, if it exists
+            index_db = repo_path / ".context" / "index" / "structural.db"
+            had_index = index_db.exists()
+            if had_index:
+                try:
+                    # remove index files to force cold rebuild on next search; keep backup via rename if needed
+                    # For C0, we remove only this checkout's index; it will be rebuilt via reconcile
+                    import shutil
+                    idx_dir = repo_path / ".context" / "index"
+                    # save backup list
+                    backups = []
+                    for pat in ["structural.db", "structural.db-wal", "structural.db-shm"]:
+                        p = idx_dir / pat
+                        if p.exists():
+                            bak = p.with_suffix(p.suffix + ".bak_timing")
+                            try:
+                                p.rename(bak)
+                                backups.append((p, bak))
+                            except Exception:
+                                pass
+                    # cold measurement
+                    t0 = time.perf_counter()
+                    # Use adapter.search which will trigger reconcile+build if index missing
+                    cold_res = adapter.search(neutral_q, repo_path, top_n=5)
+                    cold_wall = cold_res.elapsed_ms
+                    # restore backups? Actually keep rebuilt index for subsequent warm measurement; remove backups
+                    for orig, bak in backups:
+                        try:
+                            if bak.exists():
+                                bak.unlink()
+                        except Exception:
+                            pass
+                    # warm measurement (no change)
+                    t1 = time.perf_counter()
+                    warm_res = adapter.search(neutral_q, repo_path, top_n=5)
+                    warm_wall = warm_res.elapsed_ms
+                    # one-file-change: create disposable file, measure, restore exactly
+                    tmp_file = repo_path / "__bench_tmp_one_file_change__.txt"
+                    try:
+                        tmp_file.write_text("bench timing probe", encoding="utf-8")
+                        t2 = time.perf_counter()
+                        one_res = adapter.search(neutral_q, repo_path, top_n=5)
+                        one_wall = one_res.elapsed_ms
+                    finally:
+                        try:
+                            if tmp_file.exists():
+                                tmp_file.unlink()
+                        except Exception:
+                            pass
+                    # reconcile after removal of tmp file to restore state (next search will see deletion)
+                    try:
+                        adapter.search(neutral_q, repo_path, top_n=5)
+                    except Exception:
+                        pass
+                    timing_rec = {
+                        "type": "timing",
+                        "adapter": adapter.name,
+                        "repo": repo_name,
+                        "neutral_query": neutral_q,
+                        "cold_first_search_wall_ms": cold_wall,
+                        "warm_no_change_wall_ms": warm_wall,
+                        "one_file_change_wall_ms": one_wall,
+                        "had_index_before": had_index,
+                        "label": "cold first-search wall time (not pure index time)",
+                    }
+                    with out_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(timing_rec) + "\n")
+                    print(f"[{adapter.name}] timing {repo_name}: cold {cold_wall}ms warm {warm_wall}ms one-file {one_wall}ms", flush=True)
+                except Exception as e:
+                    print(f"[{adapter.name}] timing {repo_name} failed: {e}", file=sys.stderr)
+            else:
+                # no index to delete; just measure cold as first search wall, warm as second
+                try:
+                    t0 = time.perf_counter()
+                    cold_res = adapter.search(neutral_q, repo_path, top_n=5)
+                    cold_wall = cold_res.elapsed_ms
+                    warm_res = adapter.search(neutral_q, repo_path, top_n=5)
+                    warm_wall = warm_res.elapsed_ms
+                    tmp_file = repo_path / "__bench_tmp_one_file_change__.txt"
+                    try:
+                        tmp_file.write_text("bench timing probe", encoding="utf-8")
+                        one_res = adapter.search(neutral_q, repo_path, top_n=5)
+                        one_wall = one_res.elapsed_ms
+                    finally:
+                        try:
+                            if tmp_file.exists():
+                                tmp_file.unlink()
+                        except Exception:
+                            pass
+                    try:
+                        adapter.search(neutral_q, repo_path, top_n=5)
+                    except Exception:
+                        pass
+                    timing_rec = {
+                        "type": "timing",
+                        "adapter": adapter.name,
+                        "repo": repo_name,
+                        "neutral_query": neutral_q,
+                        "cold_first_search_wall_ms": cold_wall,
+                        "warm_no_change_wall_ms": warm_wall,
+                        "one_file_change_wall_ms": one_wall,
+                        "had_index_before": False,
+                        "label": "cold first-search wall time (not pure index time)",
+                    }
+                    with out_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(timing_rec) + "\n")
+                    print(f"[{adapter.name}] timing {repo_name}: cold {cold_wall}ms warm {warm_wall}ms one-file {one_wall}ms (no prior index)", flush=True)
+                except Exception as e:
+                    print(f"[{adapter.name}] timing {repo_name} failed: {e}", file=sys.stderr)
 
     # Query runs
     for adapter in adapters:
@@ -219,11 +400,15 @@ def main():
                     "top_n": args.top_n,
                     "hits": [{"file": h.file, "score": h.score, "line": h.line, "provenance": h.provenance} for h in res.hits],
                     "top1_correct": metrics["top1_correct"],
+                    "hit_at_1": metrics["hit_at_1"],
+                    "hit_at_3": metrics["hit_at_3"],
+                    "hit_at_5": metrics["hit_at_5"],
                     "recall_at_1": metrics["recall_at_1"],
                     "recall_at_3": metrics["recall_at_3"],
                     "recall_at_5": metrics["recall_at_5"],
                     "mrr": metrics["mrr"],
                     "rank": metrics["rank"],
+                    "unique_files": metrics["unique_files"],
                     "candidate_count": res.candidate_count,
                     "evidence_count": res.evidence_count,
                     "files_returned": res.files_returned,

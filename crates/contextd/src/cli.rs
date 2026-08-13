@@ -114,6 +114,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         "packed_tokens": res.stats.packed_tokens,
                         "retrievers": res.stats.retrievers_used,
                         "elapsed_ms": res.stats.elapsed_ms,
+                        "exact_ms": res.stats.exact_ms,
+                        "structural_ms": res.stats.structural_ms,
+                        "bm25_ms": res.stats.bm25_ms,
+                        "semantic_ms": res.stats.semantic_ms,
+                        "rank_ms": res.stats.rank_ms,
+                        "pack_ms": res.stats.pack_ms,
                     }
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);
