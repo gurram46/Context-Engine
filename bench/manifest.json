@@ -1,0 +1,47 @@
+{
+  "version": "1.0",
+  "created": "2026-08-14",
+  "description": "Context Bench v1 — pinned external repos for reproducible retrieval benchmark",
+  "repos": [
+    {
+      "name": "django",
+      "url": "https://github.com/django/django.git",
+      "commit": "c6be0bf3bb744d234947cefd6def9f31d9655800",
+      "language": "python",
+      "categories": ["definition", "caller", "callee", "test", "conceptual", "exact"],
+      "note": "Python web framework, large codebase, stable file layout"
+    },
+    {
+      "name": "nestjs",
+      "url": "https://github.com/nestjs/nest.git",
+      "commit": "674ac31d4f02d399fca9c491f352f5066d57b62d",
+      "language": "typescript",
+      "categories": ["definition", "caller", "callee", "test", "conceptual", "exact"],
+      "note": "TypeScript framework, NestFactory / modules"
+    },
+    {
+      "name": "ripgrep",
+      "url": "https://github.com/BurntSushi/ripgrep.git",
+      "commit": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+      "language": "rust",
+      "categories": ["definition", "caller", "callee", "test", "conceptual", "exact"],
+      "note": "Rust CLI, well-factorized lib + binary"
+    },
+    {
+      "name": "lodash",
+      "url": "https://github.com/lodash/lodash.git",
+      "commit": "a666ba591064c8011988275790ad7d625279f09c",
+      "language": "javascript",
+      "categories": ["definition", "exact", "conceptual", "test"],
+      "note": "JS utility library, many small modules"
+    },
+    {
+      "name": "gin",
+      "url": "https://github.com/gin-gonic/gin.git",
+      "commit": "34dac209ffb6ef85cc78c5d217bbb7ad001d68fd",
+      "language": "go",
+      "categories": ["definition", "caller", "callee", "test", "exact", "conceptual"],
+      "note": "Medium-size Go HTTP framework (selected for Go coverage)"
+    }
+  ]
+}

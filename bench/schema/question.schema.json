@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ContextBenchQuestion",
+  "description": "Versioned machine-readable benchmark question. Ground truth lives outside production code; adapters must not inspect expected_* at query time.",
+  "version": "1.0",
+  "type": "object",
+  "required": ["id", "repo", "category", "query", "expected_files", "ground_truth_source"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+_[a-z0-9_]+_[0-9]{3}$",
+      "description": "Stable ID: <repo>_<slug>_<nnn> e.g. django_queryset_filter_001"
+    },
+    "repo": {
+      "type": "string",
+      "enum": ["django", "nestjs", "ripgrep", "lodash", "gin"],
+      "description": "Repo key matching manifest.json"
+    },
+    "category": {
+      "type": "string",
+      "enum": ["definition", "caller", "callee", "test", "conceptual", "exact"],
+      "description": "definition: symbol impl; caller: who calls; callee: what does X call; test: related tests; conceptual: how is X implemented; exact: identifier/path literal"
+    },
+    "query": {
+      "type": "string",
+      "minLength": 3,
+      "description": "Natural language query as a user would ask"
+    },
+    "expected_files": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "Relative POSIX paths from repo root that should appear in results (at least one)"
+    },
+    "expected_symbols": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional symbol names that should appear (for definition/caller/callee)"
+    },
+    "notes": {
+      "type": "string",
+      "description": "Human notes on why this ground truth is correct and how to verify"
+    },
+    "ground_truth_source": {
+      "type": "string",
+      "enum": ["manual", "compiler", "repository-test", "other"],
+      "description": "How ground truth was established; must be independently verifiable"
+    },
+    "language": {
+      "type": "string",
+      "description": "Primary language of expected file (redundant with manifest, for filter)"
+    },
+    "created": {
+      "type": "string",
+      "format": "date",
+      "description": "Creation date YYYY-MM-DD"
+    }
+  },
+  "additionalProperties": false
+}
