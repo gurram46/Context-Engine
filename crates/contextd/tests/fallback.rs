@@ -69,19 +69,18 @@ async fn exact_fallback_test_bundle() {
     let fused = fuse_evidence(
         scored,
         FuseOptions {
-            top_n: 50,
+            top_n: 5,
             query_type: QueryType::Test,
             raw_query: "What tests cover bundle generation?".into(),
         },
     );
     assert!(!fused.ranked.is_empty());
     assert!(
-        fused
-            .ranked
-            .iter()
-            .any(|e| e.file.ends_with("test_bundle_integration.py")),
-        "test_bundle_integration.py should be in ranked results, got {:?}",
-        fused.ranked.iter().map(|e| &e.file).collect::<Vec<_>>()
+        fused.ranked[0].file.ends_with("test_bundle_integration.py")
+            || fused
+                .ranked
+                .iter()
+                .any(|e| e.file.ends_with("test_bundle_integration.py"))
     );
 }
 

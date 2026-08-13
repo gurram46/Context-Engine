@@ -306,14 +306,6 @@ pub fn score_authority(
         score += w;
         reasons.push(format!("+{} test when asked", w));
     }
-    if query_type == QueryType::Test && evidence.source == RetrievalSource::Test {
-        score += 30;
-        reasons.push("+30 test source".to_string());
-    }
-    if query_type == QueryType::Test && file.starts_with("tests/") {
-        score += 10;
-        reasons.push("+10 top-level tests".to_string());
-    }
     if let Some(sym) = &evidence.symbol {
         if lower_query.contains(&sym.to_lowercase()) {
             score += 5;
