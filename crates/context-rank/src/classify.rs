@@ -19,7 +19,8 @@ static DEP_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(who calls|what calls|callers|callees|depends on|what breaks if|impact of|used by|transitive|calls?)\b").unwrap()
 });
 static SYM_DEF_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(where is|where's|defined|implementation|implemented|define)\b").unwrap()
+    Regex::new(r"(?i)\b(where is|where's|defined|definition|implementation|implemented|define)\b")
+        .unwrap()
 });
 static CONCEPT_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -127,7 +128,20 @@ pub fn classify_query(raw: &str) -> ClassifiedQuery {
     {
         let tokens: Vec<&str> = normalized.split_whitespace().collect();
         let has_id = tokens.iter().any(|t| {
-            let base = t.split(['.', ':']).next_back().unwrap_or(t);
+            let base = t
+                .split(['.', ':'])
+                .next_back()
+                .unwrap_or(t)
+                .trim_matches(|c| {
+                    c == '"'
+                        || c == '\''
+                        || c == '`'
+                        || c == '?'
+                        || c == '!'
+                        || c == ','
+                        || c == ';'
+                        || c == ':'
+                });
             is_identifier_token(base) || has_qualified_symbol(t)
         });
         if has_id {
@@ -157,7 +171,20 @@ pub fn classify_query(raw: &str) -> ClassifiedQuery {
             .collect();
         // Simplified: check if any token is identifier
         for tok in ids {
-            let base = tok.split(['.', ':']).next_back().unwrap_or(tok);
+            let base = tok
+                .split(['.', ':'])
+                .next_back()
+                .unwrap_or(tok)
+                .trim_matches(|c| {
+                    c == '"'
+                        || c == '\''
+                        || c == '`'
+                        || c == '?'
+                        || c == '!'
+                        || c == ','
+                        || c == ';'
+                        || c == ':'
+                });
             if is_identifier_token(base) || has_qualified_symbol(tok) {
                 hints.push("symbol-definition".to_string());
                 return ClassifiedQuery {
@@ -293,7 +320,24 @@ fn is_camel_case(q: &str) -> bool {
     CAMEL_RE.is_match(q)
 }
 fn is_pascal_case(q: &str) -> bool {
-    PASCAL_RE.is_match(q) || PASCAL_ALT_RE.is_match(q)
+    if PASCAL_RE.is_match(q) || PASCAL_ALT_RE.is_match(q) {
+        return true;
+    }
+    // Single Pascal word like Model, Searcher, Controller, MyType (capitalized, 3+ chars, rest lower/digit)
+    // Exclude common English words that are capitalized at sentence start
+    let lower = q.to_lowercase();
+    let stop = [
+        "where", "what", "who", "how", "find", "where's", "when", "why", "which",
+    ];
+    if stop.contains(&lower.as_str()) {
+        return false;
+    }
+    static SINGLE_PASCAL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^[A-Z][a-z][a-zA-Z0-9]*$").unwrap());
+    if SINGLE_PASCAL_RE.is_match(q) && q.len() >= 3 {
+        return true;
+    }
+    false
 }
 fn is_screaming_snake(q: &str) -> bool {
     SCREAMING_SNAKE_RE.is_match(q)
@@ -320,9 +364,17 @@ fn is_identifier_token(t: &str) -> bool {
         && (is_snake_case(t) || is_camel_case(t) || is_pascal_case(t) || is_screaming_snake(t))
 }
 fn has_identifier(q: &str) -> bool {
+    let stop = [
+        "where", "what", "who", "how", "find", "where's", "when", "why", "which", "the", "is",
+        "are", "for", "and", "or", "to", "in", "of", "a", "an",
+    ];
     for m in HAS_IDENTIFIER_RE.find_iter(q) {
         let tok = m.as_str();
         let base = tok.split(['.', ':']).next_back().unwrap_or(tok);
+        let lower = base.to_lowercase();
+        if stop.contains(&lower.as_str()) {
+            continue;
+        }
         if is_identifier_token(base) || has_qualified_symbol(tok) {
             return true;
         }
@@ -361,5 +413,84 @@ mod tests {
             c.query_type,
             QueryType::Conceptual | QueryType::Symbol
         ));
+    }
+
+    // R5.1-A symbol classification
+    #[test]
+    fn symbol_model_implemented() {
+        assert_eq!(
+            classify_query("Where is Model implemented?").query_type,
+            QueryType::Symbol
+        );
+    }
+    #[test]
+    fn symbol_searcher_implemented() {
+        assert_eq!(
+            classify_query("Where is Searcher implemented?").query_type,
+            QueryType::Symbol
+        );
+    }
+    #[test]
+    fn symbol_foo_bar_defined() {
+        assert_eq!(
+            classify_query("Where is foo_bar defined?").query_type,
+            QueryType::Symbol
+        );
+    }
+    #[test]
+    fn symbol_parse_config() {
+        assert_eq!(
+            classify_query("Find definition of parseConfig").query_type,
+            QueryType::Symbol
+        );
+    }
+    #[test]
+    fn symbol_backticked_mytype() {
+        assert_eq!(
+            classify_query("Where is `MyType` implemented?").query_type,
+            QueryType::Symbol
+        );
+    }
+    #[test]
+    fn symbol_quoted_newrouter() {
+        assert_eq!(
+            classify_query("Where is \"NewRouter\" defined?").query_type,
+            QueryType::Symbol
+        );
+    }
+    #[test]
+    fn conceptual_middleware() {
+        assert_eq!(
+            classify_query("How is middleware implemented?").query_type,
+            QueryType::Conceptual
+        );
+    }
+    #[test]
+    fn conceptual_ignore_handling() {
+        assert_eq!(
+            classify_query("Where is ignore handling implemented?").query_type,
+            QueryType::Conceptual
+        );
+    }
+    #[test]
+    fn conceptual_regex_matching() {
+        assert_eq!(
+            classify_query("How is regex matching implemented?").query_type,
+            QueryType::Conceptual
+        );
+    }
+    #[test]
+    fn exact_cargo_toml_question() {
+        assert_eq!(
+            classify_query("Where is Cargo.toml?").query_type,
+            QueryType::Exact
+        );
+    }
+    #[test]
+    fn exact_find_src_config() {
+        assert_eq!(
+            classify_query("Find src/config.ts").query_type,
+            QueryType::Exact
+        );
     }
 }

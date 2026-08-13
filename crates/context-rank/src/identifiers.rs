@@ -76,7 +76,13 @@ pub fn extract_identifiers(q: &str) -> Vec<String> {
         let is_snake = t.contains('_');
         let is_screaming = SCREAMING_RE.is_match(&t);
         let is_camel = CAMEL_RE.is_match(&t);
-        let is_pascal = PASCAL_RE.is_match(&t) || PASCAL_RE2.is_match(&t);
+        let is_pascal = PASCAL_RE.is_match(&t)
+            || PASCAL_RE2.is_match(&t)
+            || (t.len() >= 3 && {
+                static SINGLE_PASCAL: LazyLock<Regex> =
+                    LazyLock::new(|| Regex::new(r"^[A-Z][a-z][a-zA-Z0-9]*$").unwrap());
+                SINGLE_PASCAL.is_match(&t)
+            });
         let is_qualified = t.contains('.') || t.contains("::");
         let is_lower_generic = LOWER_RE.is_match(&low) && !stop.contains(low.as_str());
         if is_snake || is_screaming || is_camel || is_pascal || is_qualified || is_lower_generic {
