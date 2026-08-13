@@ -961,11 +961,12 @@ mod tests {
 
     #[test]
     fn dedup_chunk_ids_before_upsert() {
-        // Reproduce duplicate chunk IDs (e.g., vendor JS with overlapping chunks)
+        // Production chunk_id = blake3(file, start_byte, end_byte, content_hash)
+        // So a real duplicate is an ACTUAL identical duplicate (same file/range/hash -> same ID)
         let mut conn = open_in_memory().unwrap();
         let lang = crate::structural::language::Language::Python;
-        let dup_id = "dup_chunk_id_123".to_string();
-        let unique_id = "unique_chunk_id_456".to_string();
+        let content_hash_a = "hash_a".to_string();
+        let dup_id = crate::structural::types::chunk_id("a.py", 0, 10, &content_hash_a);
         let chunk_a = crate::structural::types::Chunk {
             id: dup_id.clone(),
             file: "a.py".into(),
@@ -975,22 +976,13 @@ mod tests {
             start_byte: 0,
             end_byte: 10,
             parent_symbol: None,
-            content_hash: "hash_a".into(),
+            content_hash: content_hash_a.clone(),
             text_size_bytes: 10,
         };
-        // Duplicate ID, different position/content but same ID -> should be deduped
-        let chunk_b = crate::structural::types::Chunk {
-            id: dup_id.clone(),
-            file: "a.py".into(),
-            language: lang,
-            start_line: 3,
-            end_line: 4,
-            start_byte: 20,
-            end_byte: 30,
-            parent_symbol: None,
-            content_hash: "hash_b".into(),
-            text_size_bytes: 10,
-        };
+        // Actual identical duplicate
+        let chunk_b = chunk_a.clone();
+        let content_hash_c = "hash_c".to_string();
+        let unique_id = crate::structural::types::chunk_id("a.py", 40, 50, &content_hash_c);
         let chunk_c = crate::structural::types::Chunk {
             id: unique_id.clone(),
             file: "a.py".into(),
@@ -1000,7 +992,7 @@ mod tests {
             start_byte: 40,
             end_byte: 50,
             parent_symbol: None,
-            content_hash: "hash_c".into(),
+            content_hash: content_hash_c.clone(),
             text_size_bytes: 10,
         };
         let pf = crate::structural::types::ParsedFile {
@@ -1010,7 +1002,7 @@ mod tests {
             symbols: vec![],
             references: vec![],
             imports: vec![],
-            chunks: vec![chunk_a, chunk_b, chunk_c],
+            chunks: vec![chunk_a.clone(), chunk_b, chunk_c.clone()],
             parse_error: None,
         };
         // Should succeed despite duplicate IDs
@@ -1046,5 +1038,15 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(total, 2);
+        // Persisted duplicate fields must match the original chunk
+        let (persisted_start, persisted_hash): (i64, String) = conn
+            .query_row(
+                "SELECT start_byte, content_hash FROM chunks WHERE id=?1",
+                params![dup_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted_start as usize, chunk_a.start_byte);
+        assert_eq!(persisted_hash, chunk_a.content_hash);
     }
 }
