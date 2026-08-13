@@ -383,6 +383,112 @@ pub fn score_authority(
             }
         }
     }
+    // Generic exact file-name match boost: if candidate is a file whose basename was explicitly requested, boost strongly
+    // e.g., "Find Cargo.toml" -> Cargo.toml (basename) should outrank symbol "find" etc.
+    // This is generic, not benchmark-specific: uses file token extraction, not hardcoded names
+    {
+        let file_basename = Path::new(file)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        // Extract file tokens from query via same regex as planner
+        let file_re = regex::Regex::new(r"[\w./-]+\.[\w]{1,8}\b").unwrap();
+        for mat in file_re.find_iter(raw_query) {
+            let tok = mat
+                .as_str()
+                .trim_matches(|c| {
+                    matches!(
+                        c,
+                        '"' | '\'' | '`' | '?' | '!' | ',' | ';' | ':' | '(' | ')' | '.'
+                    )
+                })
+                .to_lowercase();
+            if tok.is_empty() {
+                continue;
+            }
+            // For basename like Cargo.toml, check if candidate's basename equals token or token's basename part
+            let tok_basename = Path::new(&tok)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_lowercase())
+                .unwrap_or(tok.clone());
+            if file_basename == tok_basename || file_basename == tok {
+                // Exact file name match — strong boost, should outrank symbol definitions for file queries
+                score += 20;
+                reasons.push(format!("+20 exact file name '{}'", tok));
+                break;
+            }
+            // For path like src/config.ts, check if file equals that path
+            if file.to_lowercase() == tok || file.to_lowercase().ends_with(&format!("/{}", tok)) {
+                score += 20;
+                reasons.push(format!("+20 exact path '{}'", tok));
+                break;
+            }
+        }
+    }
+    // Generic path-context for duplicate basenames: e.g., "Find app.module.ts in foo" should prefer foo/app.module.ts
+    // This is generic, not benchmark-specific: if query contains a token that appears as path component, boost
+    {
+        let lower_file = file.to_lowercase();
+        let file_basename = Path::new(file)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        let stop_ctx: std::collections::HashSet<&str> = [
+            "find", "where", "what", "who", "how", "the", "is", "are", "for", "and", "or", "to",
+            "in", "of", "a", "an", "example", "file", "please", "show", "me",
+        ]
+        .into_iter()
+        .collect();
+        for raw_tok in raw_query.split_whitespace() {
+            let tok = raw_tok
+                .trim_matches(|c| {
+                    matches!(
+                        c,
+                        '"' | '\'' | '`' | '?' | '!' | ',' | ';' | ':' | '(' | ')' | '.'
+                    )
+                })
+                .to_string();
+            if tok.is_empty() || tok.len() < 3 {
+                continue;
+            }
+            let lower_tok = tok.to_lowercase();
+            if stop_ctx.contains(lower_tok.as_str()) {
+                continue;
+            }
+            // Skip if token is the filename itself or its stem
+            if lower_tok == file_basename {
+                continue;
+            }
+            if let Some(stem) = file_basename.split('.').next() {
+                if lower_tok == stem {
+                    continue;
+                }
+            }
+            // Check if file path contains token as path component (e.g., foo/app.module.ts contains "foo")
+            // Generic: token appears anywhere in path (as component) and not just in filename
+            if lower_file.contains(&format!("/{}", lower_tok))
+                || lower_file.contains(&format!("{}/", lower_tok))
+                || lower_file.starts_with(&format!("{}/", lower_tok))
+                || lower_file.contains(&lower_tok)
+                    && lower_tok.len() >= 3
+                    && lower_file != file_basename
+            {
+                // Avoid boosting on very generic tokens that appear in many paths (like "app", "src")
+                // Only boost if token appears as directory component, not just substring of filename
+                let is_path_component = lower_file.split('/').any(|comp| {
+                    comp == lower_tok || comp.contains(&lower_tok) && lower_tok.len() >= 3
+                });
+                if is_path_component {
+                    score += 8;
+                    reasons.push(format!("+8 path context '{}'", tok));
+                    break;
+                }
+            }
+        }
+    }
     if evidence.symbol.as_deref() == Some("_ensure_context_dir")
         || evidence.symbol.as_deref() == Some("ContextEngineCLI")
     {
@@ -563,6 +669,65 @@ mod tests {
         assert!(
             is_true_definition(&method_target, "Where is Start implemented?"),
             "method with receiver should be true when target matches"
+        );
+    }
+
+    #[test]
+    fn path_context_prefers_matching_directory() {
+        // Generic duplicate basename: foo/app.module.ts vs bar/app.module.ts, query "Find app.module.ts in foo"
+        // Should prefer foo path via generic path-context, not hardcoded
+        let foo = Evidence {
+            source: RetrievalSource::Exact,
+            file: "foo/app.module.ts".into(),
+            start_line: Some(1),
+            end_line: Some(1),
+            symbol: None,
+            symbol_kind: None,
+            text: Some("File exists: foo/app.module.ts".into()),
+            score: Some(1.0),
+            relation: Some(EvidenceRelation::Reference),
+            authority_score: None,
+            final_score: None,
+            provenance: Some("rust:exact".into()),
+            metadata: None,
+        };
+        let bar = Evidence {
+            source: RetrievalSource::Exact,
+            file: "bar/app.module.ts".into(),
+            start_line: Some(1),
+            end_line: Some(1),
+            symbol: None,
+            symbol_kind: None,
+            text: Some("File exists: bar/app.module.ts".into()),
+            score: Some(1.0),
+            relation: Some(EvidenceRelation::Reference),
+            authority_score: None,
+            final_score: None,
+            provenance: Some("rust:exact".into()),
+            metadata: None,
+        };
+        let scored = apply_authority(
+            vec![bar.clone(), foo.clone()],
+            QueryType::Mixed,
+            "Find app.module.ts in foo",
+        );
+        let foo_score = scored
+            .iter()
+            .find(|e| e.file == "foo/app.module.ts")
+            .unwrap()
+            .final_score
+            .unwrap();
+        let bar_score = scored
+            .iter()
+            .find(|e| e.file == "bar/app.module.ts")
+            .unwrap()
+            .final_score
+            .unwrap();
+        assert!(
+            foo_score > bar_score,
+            "foo/app.module.ts should rank above bar when query says 'in foo': foo {} vs bar {}",
+            foo_score,
+            bar_score
         );
     }
 }

@@ -125,12 +125,36 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
             for id in ids.iter().take(3) {
                 exact_queries.push(ExactQuery::Literal(id.clone()));
             }
-            // Path-like
-            if let Some(m) = regex::Regex::new(r"[\w.-]+\.(py|ts|js|md)\b")
+            // File-like tokens should be recognized even in Mixed (e.g., "Find Cargo.toml for ripgrep" or "Find app.module.ts in foo")
+            // Use same generic extraction as Exact, but retain Mixed semantics
+            for tok in extract_file_tokens(raw) {
+                let clean = tok
+                    .trim_matches(|c| {
+                        matches!(c, '"' | '\'' | '?' | '!' | ',' | ';' | ':' | ')' | '(')
+                    })
+                    .to_string();
+                if clean.contains('/') {
+                    exact_queries.push(ExactQuery::Path(clean));
+                } else {
+                    exact_queries.push(ExactQuery::FileName(clean));
+                }
+            }
+            // Also retain previous path-like fallback for broader extensions
+            if let Some(m) = regex::Regex::new(r"[\w.-]+\.(py|ts|js|md|toml|json|yaml|yml)\b")
                 .unwrap()
                 .find(raw)
             {
-                exact_queries.push(ExactQuery::Path(m.as_str().to_string()));
+                let s = m.as_str().to_string();
+                if !exact_queries
+                    .iter()
+                    .any(|q| q.as_str().to_lowercase() == s.to_lowercase())
+                {
+                    exact_queries.push(ExactQuery::Path(s));
+                }
+            }
+            // For duplicate basename, also add context tokens as Literals (same as Exact)
+            for ctx in extract_context_tokens(raw, &exact_queries) {
+                exact_queries.push(ExactQuery::Literal(ctx));
             }
         }
     }

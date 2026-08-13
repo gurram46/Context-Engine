@@ -6,6 +6,7 @@ use context_index::{ExactQuery, ExactSearchOptions, ProjectIndex};
 use context_rank::{apply_authority, fuse_evidence, FuseOptions, QueryType};
 use std::path::Path;
 
+#[allow(dead_code)]
 fn workspace_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -121,7 +122,23 @@ async fn exact_fallback_test_bundle() {
 
 #[tokio::test]
 async fn exact_fallback_redact_secrets() {
-    let root = ProjectRoot::resolve(Some(workspace_root().as_path())).expect("root");
+    // Isolated temp repo to avoid bench contamination (bench/ contains many files that would slow rg)
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let root_path = tmp.path();
+    std::fs::create_dir_all(root_path.join(".git")).expect("git");
+    std::fs::create_dir_all(root_path.join("backend/context_engine/core")).expect("mkdir");
+    std::fs::write(
+        root_path.join("backend/context_engine/core/utils.py"),
+        b"def redact_secrets(data):\n    return data\n# redact_secrets helper\n",
+    )
+    .expect("write");
+    // Distractor
+    std::fs::write(
+        root_path.join("backend/context_engine/core/other.py"),
+        b"# other file without redact\n",
+    )
+    .expect("write");
+    let root = ProjectRoot::resolve(Some(root_path)).expect("root");
     let idx = ProjectIndex::discover(&root).expect("index");
     let res = context_index::exact::exact_search(
         &idx,
@@ -147,7 +164,22 @@ async fn exact_fallback_redact_secrets() {
 
 #[tokio::test]
 async fn exact_fallback_bundle_wiring() {
-    let root = ProjectRoot::resolve(Some(workspace_root().as_path())).expect("root");
+    // Isolated temp repo to avoid bench contamination
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let root_path = tmp.path();
+    std::fs::create_dir_all(root_path.join(".git")).expect("git");
+    std::fs::create_dir_all(root_path.join("backend/context_engine")).expect("mkdir");
+    std::fs::write(
+        root_path.join("backend/context_engine/cli.py"),
+        b"from .commands.bundle import bundle_command\nx = bundle_command.bundle\n",
+    )
+    .expect("write");
+    std::fs::write(
+        root_path.join("backend/context_engine/other.py"),
+        b"# other\n",
+    )
+    .expect("write");
+    let root = ProjectRoot::resolve(Some(root_path)).expect("root");
     let idx = ProjectIndex::discover(&root).expect("index");
     let res = context_index::exact::exact_search(
         &idx,

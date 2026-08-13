@@ -93,6 +93,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let svc = ContextService::new(root).await?;
             let res = svc.search(&query, search_opts).await?;
             if is_json {
+                let classified = context_rank::classify_query(&query);
+                let plan = context_rank::build_retrieval_plan(&query);
                 let out = serde_json::json!({
                     "query": res.query,
                     "type": res.query_type.as_str(),
@@ -114,6 +116,22 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         "packed_tokens": res.stats.packed_tokens,
                         "retrievers": res.stats.retrievers_used,
                         "elapsed_ms": res.stats.elapsed_ms,
+                        "exact_ms": res.stats.exact_ms,
+                        "structural_ms": res.stats.structural_ms,
+                        "bm25_ms": res.stats.bm25_ms,
+                        "semantic_ms": res.stats.semantic_ms,
+                        "rank_ms": res.stats.rank_ms,
+                        "pack_ms": res.stats.pack_ms,
+                    },
+                    "debug": {
+                        "classification": classified.query_type.as_str(),
+                        "hints": classified.hints,
+                        "identifiers": context_rank::extract_identifiers(&query),
+                        "exact_queries": plan.exact_queries.iter().map(|q| q.as_str().to_string()).collect::<Vec<_>>(),
+                        "symbol_queries": plan.symbol_queries,
+                        "graph_queries": plan.graph_queries.iter().map(|g| serde_json::json!({"symbol": g.symbol, "direction": g.direction})).collect::<Vec<_>>(),
+                        "test_queries": plan.test_queries,
+                        "semantic_queries": plan.semantic_queries,
                     }
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);

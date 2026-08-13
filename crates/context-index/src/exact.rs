@@ -178,7 +178,6 @@ pub async fn exact_search(
         "coverage",
         ".next",
         ".nuxt",
-        "bench",
     ] {
         args.push("-g".into());
         args.push(format!("!{}/**", pat));
