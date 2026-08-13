@@ -958,4 +958,93 @@ mod tests {
             .unwrap();
         assert_eq!(hash, "hash_good", "hash should remain last-good");
     }
+
+    #[test]
+    fn dedup_chunk_ids_before_upsert() {
+        // Reproduce duplicate chunk IDs (e.g., vendor JS with overlapping chunks)
+        let mut conn = open_in_memory().unwrap();
+        let lang = crate::structural::language::Language::Python;
+        let dup_id = "dup_chunk_id_123".to_string();
+        let unique_id = "unique_chunk_id_456".to_string();
+        let chunk_a = crate::structural::types::Chunk {
+            id: dup_id.clone(),
+            file: "a.py".into(),
+            language: lang,
+            start_line: 1,
+            end_line: 2,
+            start_byte: 0,
+            end_byte: 10,
+            parent_symbol: None,
+            content_hash: "hash_a".into(),
+            text_size_bytes: 10,
+        };
+        // Duplicate ID, different position/content but same ID -> should be deduped
+        let chunk_b = crate::structural::types::Chunk {
+            id: dup_id.clone(),
+            file: "a.py".into(),
+            language: lang,
+            start_line: 3,
+            end_line: 4,
+            start_byte: 20,
+            end_byte: 30,
+            parent_symbol: None,
+            content_hash: "hash_b".into(),
+            text_size_bytes: 10,
+        };
+        let chunk_c = crate::structural::types::Chunk {
+            id: unique_id.clone(),
+            file: "a.py".into(),
+            language: lang,
+            start_line: 5,
+            end_line: 6,
+            start_byte: 40,
+            end_byte: 50,
+            parent_symbol: None,
+            content_hash: "hash_c".into(),
+            text_size_bytes: 10,
+        };
+        let pf = crate::structural::types::ParsedFile {
+            file: "a.py".into(),
+            language: lang,
+            content_hash: "file_hash".into(),
+            symbols: vec![],
+            references: vec![],
+            imports: vec![],
+            chunks: vec![chunk_a, chunk_b, chunk_c],
+            parse_error: None,
+        };
+        // Should succeed despite duplicate IDs
+        upsert_parsed_file(&mut conn, &pf, 100).unwrap();
+        // Exactly one dup_id and one unique_id should persist, total 2
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks WHERE file='a.py'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "duplicate chunk ID should be deduped to 1, plus unique"
+        );
+        let dup_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE id=?1",
+                params![dup_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dup_count, 1, "exactly one dup_id should remain");
+        let uniq_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM chunks WHERE id=?1)",
+                params![unique_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(uniq_exists, "unique chunk should remain");
+        // Ensure no unrelated chunk lost: query all chunks
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 2);
+    }
 }

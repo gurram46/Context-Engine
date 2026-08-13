@@ -176,7 +176,10 @@ def main():
     parser.add_argument("--repos", default=None, help="comma filter for repo names (e.g. django,nestjs,ripgrep)")
     parser.add_argument("--output", default=str(RESULTS_JSONL), help="output JSONL path")
     parser.add_argument("--manifest", default=str(MANIFEST), help="manifest path")
+    parser.add_argument("--profile", choices=["smoke", "official"], default="official", help="smoke=fast local with bench-created .ignore (never for public claims), official=exact pinned upstream (default)")
     args = parser.parse_args()
+    profile = args.profile
+    print(f"Profile: {profile} (smoke=with bench .ignore, official=exact upstream)", flush=True)
 
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     repo_map = {r["name"]: r for r in manifest["repos"]}
@@ -203,6 +206,58 @@ def main():
     out_path = Path(args.output)
     # clear previous
     out_path.write_text("", encoding="utf-8")
+    # Profile handling: smoke vs official
+    # SMOKE: bench-created .ignore for fast iteration (NEVER for public claims)
+    # OFFICIAL: exact upstream, respect only repo-native ignores
+    SMOKE_IGNORES = {
+        "django": "# bench smoke profile: ignore large vendor/static for fast local iteration (NEVER for official)\n"
+                  "django/contrib/admin/static/**\n"
+                  "docs/**\n"
+                  "django/contrib/gis/**\n",
+        "nestjs": "# bench smoke profile: ignore sample/integration for fast local (NEVER for official)\n"
+                  "sample/**\n"
+                  "integration/**\n",
+    }
+    for repo_name in list(by_repo.keys()):
+        repo_path = REPO_ROOT / "bench" / "repos" / repo_name
+        if not repo_path.exists():
+            continue
+        ignore_path = repo_path / ".ignore"
+        is_smoke_ignore = ignore_path.exists() and "bench smoke profile" in ignore_path.read_text(encoding="utf-8", errors="ignore")[:500]
+        if profile == "official":
+            if is_smoke_ignore:
+                print(f"[{repo_name}] official profile: removing bench-created .ignore", flush=True)
+                try:
+                    ignore_path.unlink()
+                except Exception as e:
+                    print(f"  failed to remove .ignore: {e}", file=sys.stderr)
+                # also need to clean index that was built with smoke ignores — force rebuild on next search
+                # Remove .context/index to ensure official indexing is not polluted by smoke DB
+                ctx_index = repo_path / ".context" / "index"
+                if ctx_index.exists():
+                    print(f"  cleaning .context/index for official (was smoke)", flush=True)
+                    import shutil as _shutil
+                    try:
+                        _shutil.rmtree(ctx_index)
+                    except Exception as e:
+                        print(f"    rmtree failed: {e}", file=sys.stderr)
+        else:  # smoke
+            if repo_name in SMOKE_IGNORES:
+                if not is_smoke_ignore:
+                    print(f"[{repo_name}] smoke profile: creating bench .ignore", flush=True)
+                    try:
+                        ignore_path.write_text(SMOKE_IGNORES[repo_name], encoding="utf-8")
+                    except Exception as e:
+                        print(f"  failed to write .ignore: {e}", file=sys.stderr)
+                    # clean old official index if exists, so smoke rebuilds with ignores
+                    ctx_index = repo_path / ".context" / "index"
+                    if ctx_index.exists():
+                        import shutil as _shutil
+                        try:
+                            _shutil.rmtree(ctx_index)
+                            print(f"  cleaned .context/index for smoke", flush=True)
+                        except Exception as e:
+                            print(f"    rmtree failed: {e}", file=sys.stderr)
 
     # Collect indexing metrics per adapter per repo
     indexing_results = {}
@@ -233,6 +288,7 @@ def main():
                 "adapter": adapter.name,
                 "repo": repo_name,
                 "commit": entry["commit"],
+                "profile": profile,
                 "wall_ms": wall,
                 "indexing": idx.__dict__ if idx else None,
                 "status": status_data,
@@ -314,6 +370,7 @@ def main():
                         "type": "timing",
                         "adapter": adapter.name,
                         "repo": repo_name,
+                        "profile": profile,
                         "neutral_query": neutral_q,
                         "cold_first_search_wall_ms": cold_wall,
                         "warm_no_change_wall_ms": warm_wall,
@@ -353,6 +410,7 @@ def main():
                         "type": "timing",
                         "adapter": adapter.name,
                         "repo": repo_name,
+                        "profile": profile,
                         "neutral_query": neutral_q,
                         "cold_first_search_wall_ms": cold_wall,
                         "warm_no_change_wall_ms": warm_wall,
@@ -397,6 +455,7 @@ def main():
                     "ground_truth_source": q.get("ground_truth_source"),
                     "adapter": adapter.name,
                     "commit": entry["commit"],
+                    "profile": profile,
                     "top_n": args.top_n,
                     "hits": [{"file": h.file, "score": h.score, "line": h.line, "provenance": h.provenance} for h in res.hits],
                     "top1_correct": metrics["top1_correct"],

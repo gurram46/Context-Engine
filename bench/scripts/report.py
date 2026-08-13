@@ -119,6 +119,15 @@ def main():
     lines.append("")
     lines.append(f"Generated from `{inp}` — {len(queries)} queries")
     lines.append("")
+    # Profile stamping
+    profiles = sorted(set(r.get("profile", "unknown") for r in queries))
+    prof_str = ", ".join(profiles)
+    if "official" in profiles:
+        lines.append(f"Profile: {prof_str} — OFFICIAL = exact pinned upstream (only repo-native ignores); for public claims")
+    elif "smoke" in profiles:
+        lines.append(f"Profile: {prof_str} — SMOKE = bench-created .ignore present (fast local, NEVER for public claims)")
+    else:
+        lines.append(f"Profile: {prof_str}")
     lines.append("Note: FILE-LEVEL evaluation uses ranked UNIQUE files (deduplicated preserving first occurrence). Hit@K is binary, Recall@K is fractional (relevant retrieved / total relevant).")
     lines.append("")
 
@@ -189,14 +198,25 @@ def main():
     if idx_recs:
         lines.append("## INDEXING")
         lines.append("")
-        lines.append("| ADAPTER | REPO | WALL MS | FILES | SYMBOLS | BM25 | VECTORS | DISK | UNAVAILABLE |")
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+        lines.append("| ADAPTER | REPO | PROFILE | WALL MS | FILES | SYMBOLS | BM25 | VECTORS | DISK | UNAVAILABLE |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
         for r in idx_recs:
             idx = r.get("indexing") or {}
+            prof = r.get("profile", "?")
             lines.append(
-                f"| {r['adapter']} | {r['repo']} | {r.get('wall_ms')} | {idx.get('files_indexed')} | {idx.get('symbols')} | {idx.get('bm25_docs')} | {idx.get('vector_count')} | {idx.get('index_disk_bytes')} | {','.join(idx.get('unavailable', []))} |"
+                f"| {r['adapter']} | {r['repo']} | {prof} | {r.get('wall_ms')} | {idx.get('files_indexed')} | {idx.get('symbols')} | {idx.get('bm25_docs')} | {idx.get('vector_count')} | {idx.get('index_disk_bytes')} | {','.join(idx.get('unavailable', []))} |"
             )
         lines.append("")
+        # Timing records if present
+        timing_recs = [r for r in records if r.get("type") == "timing"]
+        if timing_recs:
+            lines.append("## TIMING (cold first-search wall time, not pure index time)")
+            lines.append("")
+            lines.append("| ADAPTER | REPO | PROFILE | COLD | WARM | ONE-FILE | NEUTRAL QUERY |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for r in timing_recs:
+                lines.append(f"| {r['adapter']} | {r['repo']} | {r.get('profile','?')} | {r.get('cold_first_search_wall_ms')} | {r.get('warm_no_change_wall_ms')} | {r.get('one_file_change_wall_ms')} | {r.get('neutral_query','')[:30]} |")
+            lines.append("")
         # also include contextd status details if available
         # try to extract from indexing raw? but we store only indexing metrics; status details are in indexing unavailable but we can show notes
 
