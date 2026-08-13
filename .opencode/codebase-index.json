@@ -1,0 +1,31 @@
+{
+  "embeddingProvider": "ollama",
+  "scope": "project",
+  "indexing": {
+    "autoIndex": false,
+    "watchFiles": true,
+    "requireProjectMarker": true,
+    "semanticOnly": false
+  },
+  "search": {
+    "maxResults": 20,
+    "minScore": 0.1,
+    "fusionStrategy": "rrf",
+    "rerankTopN": 20
+  },
+  "exclude": [
+    "**/.context/**",
+    "**/node_modules/**",
+    "**/ui/node_modules/**",
+    "**/ui/dist/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/context_engine/embeddings_db/**",
+    "**/.git/**",
+    "**/target/**",
+    "**/v2/dist/**",
+    "**/.opencode/**"
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "name": "context-engine-v2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Context Engine V2 - hybrid retrieval router",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts",
+    "test:watch": "vitest --config vitest.config.ts",
+    "context": "tsx src/cli/main.ts",
+    "mcp": "node dist/mcp/server.js",
+    "eval": "tsx eval/runner.ts",
+    "debug-search": "tsx src/cli/main.ts debug-search"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "tiktoken": "^1.0.15"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

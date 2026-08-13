@@ -1,0 +1,12 @@
+[package]
+name = "context-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared domain and MCP types for contextd — R0"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
