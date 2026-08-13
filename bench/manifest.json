@@ -1,7 +1,8 @@
 {
   "version": "1.0",
+  "ground_truth_revision": "m1-v1.1",
   "created": "2026-08-14",
-  "description": "Context Bench v1 — pinned external repos for reproducible retrieval benchmark",
+  "description": "Context Bench v1 — pinned external repos for reproducible retrieval benchmark (m1-v1.1: fix Searcher wording, ignore conceptual category, Standard printer, app.module wording, expand caller expected sets)",
   "repos": [
     {
       "name": "django",
