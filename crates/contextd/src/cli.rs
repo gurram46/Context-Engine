@@ -93,9 +93,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let svc = ContextService::new(root).await?;
             let res = svc.search(&query, search_opts).await?;
             if is_json {
-                let classified = context_rank::classify_query(&query);
-                let plan = context_rank::build_retrieval_plan(&query);
-                let out = serde_json::json!({
+                let mut out = serde_json::json!({
                     "query": res.query,
                     "type": res.query_type.as_str(),
                     "evidence": res.evidence.iter().map(|e| serde_json::json!({
@@ -122,8 +120,13 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         "semantic_ms": res.stats.semantic_ms,
                         "rank_ms": res.stats.rank_ms,
                         "pack_ms": res.stats.pack_ms,
-                    },
-                    "debug": {
+                    }
+                });
+                // Debug observability only when --debug is set, not in normal JSON output
+                if cli.debug {
+                    let classified = context_rank::classify_query(&query);
+                    let plan = context_rank::build_retrieval_plan(&query);
+                    out["debug"] = serde_json::json!({
                         "classification": classified.query_type.as_str(),
                         "hints": classified.hints,
                         "identifiers": context_rank::extract_identifiers(&query),
@@ -132,8 +135,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         "graph_queries": plan.graph_queries.iter().map(|g| serde_json::json!({"symbol": g.symbol, "direction": g.direction})).collect::<Vec<_>>(),
                         "test_queries": plan.test_queries,
                         "semantic_queries": plan.semantic_queries,
-                    }
-                });
+                    });
+                }
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 // human readable

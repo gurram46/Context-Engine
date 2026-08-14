@@ -4,17 +4,6 @@
 use context_index::project_root::ProjectRoot;
 use context_index::{ExactQuery, ExactSearchOptions, ProjectIndex};
 use context_rank::{apply_authority, fuse_evidence, FuseOptions, QueryType};
-use std::path::Path;
-
-#[allow(dead_code)]
-fn workspace_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
 
 #[tokio::test]
 async fn exact_fallback_test_bundle() {

@@ -37,6 +37,9 @@ pub fn extract_identifiers(q: &str) -> Vec<String> {
         "what",
         "who",
         "how",
+        "which",
+        "when",
+        "why",
         "the",
         "is",
         "are",
@@ -48,6 +51,11 @@ pub fn extract_identifiers(q: &str) -> Vec<String> {
         "of",
         "a",
         "an",
+        "find",
+        "show",
+        "please",
+        "example",
+        "file",
         "trace",
         "flow",
         "generation",
@@ -156,5 +164,43 @@ mod tests {
             ids.iter().any(|s| s == "redaction"),
             "redaction should be an identifier"
         );
+    }
+
+    #[test]
+    fn find_cargo_toml_no_find() {
+        let ids = extract_identifiers("Find Cargo.toml for ripgrep");
+        assert!(
+            !ids.iter().any(|s| s.to_lowercase() == "find"),
+            "Find should not be an identifier, got {:?}",
+            ids
+        );
+    }
+
+    #[test]
+    fn find_app_module_foo_no_find_example() {
+        let ids = extract_identifiers("Find app.module.ts in the foo example");
+        assert!(
+            !ids.iter().any(|s| s.to_lowercase() == "find"),
+            "Find should not be identifier"
+        );
+        assert!(
+            !ids.iter().any(|s| s.to_lowercase() == "example"),
+            "example should not be identifier"
+        );
+    }
+
+    #[test]
+    fn where_model_contains_model() {
+        let ids = extract_identifiers("Where is Model implemented?");
+        assert!(
+            ids.iter().any(|s| s == "Model"),
+            "Model should be identifier"
+        );
+    }
+
+    #[test]
+    fn what_calls_search_contains_search() {
+        let ids = extract_identifiers("What calls search?");
+        assert!(ids.iter().any(|s| s.to_lowercase() == "search"));
     }
 }
