@@ -101,13 +101,20 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
             semantic_queries.push(raw.to_string());
             for id in ids.iter().take(2) {
                 test_queries.push(id.clone());
-                exact_queries.push(ExactQuery::Literal(id.clone()));
-                // Generic test file variant: test_<id>
+                // Precise test file variants via FileName (fast, deterministic), avoid broad Literal via rg for common words
+                // Generic case conversion: FooBar/fooBar -> foo_bar + foobar
+                let lower = id.to_lowercase();
                 let snake = to_snake_case(id);
-                if snake != *id {
-                    exact_queries.push(ExactQuery::Literal(format!("test_{}", snake)));
-                } else {
-                    exact_queries.push(ExactQuery::Literal(format!("test_{}", id.to_lowercase())));
+                let mut variants = vec![lower.clone()];
+                if snake != lower {
+                    variants.push(snake.clone());
+                }
+                for v in variants {
+                    exact_queries.push(ExactQuery::FileName(format!("test_{}.py", v)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}_test.py", v)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}_test.go", v)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}.spec.ts", v)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}.test.ts", v)));
                 }
             }
         }

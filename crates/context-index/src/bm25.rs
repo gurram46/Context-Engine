@@ -300,7 +300,8 @@ pub fn search_bm25(conn: &Connection, query: &str, limit: usize) -> Result<Vec<B
         }
         query_terms_set.insert(t);
     }
-    let query_terms: Vec<String> = query_terms_set.into_iter().collect();
+    let mut query_terms: Vec<String> = query_terms_set.into_iter().collect();
+    query_terms.sort();
     if query_terms.is_empty() {
         return Ok(Vec::new());
     }
@@ -378,8 +379,9 @@ pub fn search_bm25(conn: &Connection, query: &str, limit: usize) -> Result<Vec<B
         return Ok(Vec::new());
     }
 
-    // Get doc lengths and metadata
-    let doc_ids: Vec<String> = doc_ids_set.into_iter().collect();
+    // Get doc lengths and metadata — deterministic ordering for IN clause
+    let mut doc_ids: Vec<String> = doc_ids_set.into_iter().collect();
+    doc_ids.sort();
     let placeholders2 = doc_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql_docs = format!("SELECT doc_id, chunk_id, file, content_hash, length, symbol, start_line, end_line FROM bm25_documents WHERE doc_id IN ({})", placeholders2);
     let mut doc_meta: HashMap<String, (String, String, String, usize, Option<String>, u32, u32)> =
@@ -427,7 +429,12 @@ pub fn search_bm25(conn: &Connection, query: &str, limit: usize) -> Result<Vec<B
         }
     }
 
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Deterministic ordering before LIMIT: score desc, then doc_id asc, then file via doc_meta not yet but doc_id is deterministic
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     scored.truncate(limit);
 
     let mut out = Vec::new();

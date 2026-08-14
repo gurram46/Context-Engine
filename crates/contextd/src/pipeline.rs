@@ -9,6 +9,21 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
+fn to_snake_case(s: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Retrieval providers — R5 production uses no V2/OCI providers.
 /// Kept as empty struct for API compatibility; legacy CandidateProvider is LEGACY only.
 pub struct Providers {}
@@ -164,7 +179,7 @@ fn fuse_rrf(
             }
         }
     }
-    // Convert to Evidence with RRF as score, preserve provenance
+    // Convert to Evidence with RRF as score, preserve provenance — deterministic via BTree ordering
     let mut fused: Vec<Evidence> = map
         .into_values()
         .map(|(mut ev, rrf)| {
@@ -180,11 +195,14 @@ fn fuse_rrf(
             ev
         })
         .collect();
-    // Sort by RRF desc
+    // Sort by RRF desc, then deterministic tie-breakers
     fused.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.start_line.cmp(&b.start_line))
+            .then_with(|| a.symbol.cmp(&b.symbol))
     });
     fused
 }
@@ -430,6 +448,7 @@ pub async fn retrieve_context(
                 added += 1;
             }
         }
+        // Precise dedicated test filename matching — only if structural found nothing (avoid displacing good evidence)
         if added == 0 {
             let lower = tq.to_lowercase();
             for f in project
@@ -437,11 +456,39 @@ pub async fn retrieve_context(
                 .iter()
                 .filter(|r| r.kind == context_index::FileKind::Test)
             {
-                if f.relative_path.to_lowercase().contains(&lower)
-                    || f.relative_path
-                        .to_lowercase()
-                        .contains(&format!("test_{}", lower))
-                {
+                if candidates.iter().any(|e| e.file == f.relative_path) {
+                    continue;
+                }
+                let file_lower = f.relative_path.to_lowercase();
+                let file_name = std::path::Path::new(&file_lower)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&file_lower)
+                    .to_string();
+                // Precise conventions with generic snake_case: FooBar/fooBar -> foo_bar + foobar
+                let snake = to_snake_case(tq);
+                let snake_lower = snake.to_lowercase();
+                let is_match = file_name == format!("test_{}.py", lower)
+                    || file_name == format!("{}_test.py", lower)
+                    || file_name == format!("{}_test.go", lower)
+                    || file_name == format!("{}.spec.ts", lower)
+                    || file_name == format!("{}.test.ts", lower)
+                    || file_name == format!("{}.spec.js", lower)
+                    || file_name == format!("{}.test.js", lower)
+                    || (snake_lower != lower
+                        && (file_name == format!("test_{}.py", snake_lower)
+                            || file_name == format!("{}_test.py", snake_lower)
+                            || file_name == format!("{}_test.go", snake_lower)
+                            || file_name == format!("{}.spec.ts", snake_lower)
+                            || file_name == format!("{}.test.ts", snake_lower)
+                            || file_name == format!("{}.spec.js", snake_lower)
+                            || file_name == format!("{}.test.js", snake_lower)));
+                if is_match {
+                    let score = if lower.len() == 1 && file_name == format!("test_{}.py", lower) {
+                        1.0
+                    } else {
+                        0.8
+                    };
                     candidates.push(Evidence {
                         source: context_rank::types::RetrievalSource::Test,
                         file: f.relative_path.clone(),
@@ -450,7 +497,7 @@ pub async fn retrieve_context(
                         symbol: Some(tq.clone()),
                         symbol_kind: None,
                         text: Some(format!("Test file: {}", f.relative_path)),
-                        score: Some(0.8),
+                        score: Some(score),
                         relation: Some(context_rank::types::EvidenceRelation::Test),
                         authority_score: None,
                         final_score: None,
@@ -464,15 +511,62 @@ pub async fn retrieve_context(
                 }
             }
         }
+        // Source-local inline tests: symbol def file itself contains structural test symbols (same file)
+        if added == 0 {
+            if let Ok(defs) = structural_store::find_definitions(&conn, tq) {
+                for def in defs.iter().take(2) {
+                    let file = &def.file;
+                    let has_inline =
+                        if let Ok(syms) = structural_store::load_symbols_for_file(&conn, file) {
+                            syms.iter().any(|s| {
+                                let n = s.name.to_lowercase();
+                                let q = s.qualified_name.to_lowercase();
+                                // precise: only tests/test/test_ prefix, not broad contains (avoids contest/latest/testament)
+                                n == "tests"
+                                    || n == "test"
+                                    || n.starts_with("test_")
+                                    || q == "tests"
+                                    || q == "test"
+                                    || q.starts_with("test_")
+                            })
+                        } else {
+                            false
+                        };
+                    if has_inline {
+                        candidates.push(Evidence {
+                            source: context_rank::types::RetrievalSource::Test,
+                            file: file.clone(),
+                            start_line: Some(def.start_line),
+                            end_line: Some(def.end_line),
+                            symbol: Some(tq.clone()),
+                            symbol_kind: Some(def.kind.as_str().to_string()),
+                            text: Some(format!("Inline tests in {}", file)),
+                            score: Some(0.9),
+                            relation: Some(context_rank::types::EvidenceRelation::Test),
+                            authority_score: None,
+                            final_score: None,
+                            provenance: Some("rust:test:inline".into()),
+                            metadata: None,
+                        });
+                        added += 1;
+                        if added >= 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         retrievers_used.push(format!("rust-test:{}:{}", tq, added));
     }
     let structural_ms = t_struct.elapsed().as_millis();
 
     // Determine sufficiency before heavy retrieval
     let suff = sufficiency(classified.query_type, &candidates, query);
-    // For R4, BM25+semantic for CONCEPTUAL, MIXED, TEST; for others only if insufficient
+    // For R4, BM25+semantic for CONCEPTUAL, MIXED; for TEST only if not already strong (avoid heavy BM25 when precise test file found)
     let run_bm25 = match classified.query_type {
-        QueryType::Conceptual | QueryType::Mixed | QueryType::Test => true,
+        QueryType::Conceptual | QueryType::Mixed => true,
+        QueryType::Test if suff == EvidenceSufficiency::Strong => false,
+        QueryType::Test => true,
         QueryType::Symbol | QueryType::Dependency if suff == EvidenceSufficiency::Insufficient => {
             true
         }
