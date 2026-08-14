@@ -481,4 +481,69 @@ mod tests {
             res.iter().map(|e| &e.file).collect::<Vec<_>>()
         );
     }
+
+    #[tokio::test]
+    async fn duplicate_basename_both_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let foo = tmp.path().join("foo/app.module.ts");
+        let bar = tmp.path().join("bar/app.module.ts");
+        std::fs::create_dir_all(foo.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(bar.parent().unwrap()).unwrap();
+        std::fs::write(&foo, b"// foo app module").unwrap();
+        std::fs::write(&bar, b"// bar app module").unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let res = exact_search(
+            &idx,
+            ExactQuery::FileName("app.module.ts".into()),
+            ExactSearchOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            res.len(),
+            2,
+            "both foo and bar should be returned for duplicate basename"
+        );
+        assert!(res.iter().any(|e| e.file == "foo/app.module.ts"));
+        assert!(res.iter().any(|e| e.file == "bar/app.module.ts"));
+    }
+
+    #[tokio::test]
+    async fn path_query_returns_single() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let foo = tmp.path().join("foo/app.module.ts");
+        let bar = tmp.path().join("bar/app.module.ts");
+        std::fs::create_dir_all(foo.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(bar.parent().unwrap()).unwrap();
+        std::fs::write(&foo, b"// foo").unwrap();
+        std::fs::write(&bar, b"// bar").unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let res = exact_search(
+            &idx,
+            ExactQuery::Path("foo/app.module.ts".into()),
+            ExactSearchOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].file, "foo/app.module.ts");
+    }
+
+    #[tokio::test]
+    async fn file_not_found_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let res = exact_search(
+            &idx,
+            ExactQuery::FileName("nonexistent_xyz_123.py".into()),
+            ExactSearchOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(res.is_empty(), "should return empty for non-existent file");
+    }
 }
