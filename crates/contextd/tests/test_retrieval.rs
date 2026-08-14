@@ -354,6 +354,51 @@ async fn test_single_letter_negative_a_not_match_api() {
 }
 
 #[tokio::test]
+async fn test_inline_no_false_positive_contest_latest_testament() {
+    // contest/latest/testament contain "test" substring but must NOT be inline-test evidence
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let root = tmp.path();
+    setup_git(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        b"[package]\nname=\"foo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        b"pub struct Contest;\nimpl Contest { pub fn new() -> Self { Self } }\npub struct Latest;\npub struct Testament;\n",
+    )
+    .unwrap();
+    let pr = ProjectRoot::resolve(Some(root)).expect("root");
+    let idx = ProjectIndex::discover(&pr).expect("idx");
+    let si = StructuralIndex::new(&pr);
+    si.build(&idx).expect("build");
+    let project = ProjectIndex::discover(&pr).expect("idx2");
+    for query in &[
+        "What tests cover contest?",
+        "What tests cover latest?",
+        "What tests cover testament?",
+    ] {
+        let res = retrieve_context(query, &project, &Providers {}, 10000, 5)
+            .await
+            .expect("retrieve");
+        let has_inline = res.evidence.iter().any(|e| {
+            e.file.ends_with("src/lib.rs") && e.provenance.as_deref() == Some("rust:test:inline")
+        });
+        assert!(
+            !has_inline,
+            "{} must not be inline test evidence via broad contains, got {:?}",
+            query,
+            res.evidence
+                .iter()
+                .map(|e| format!("{}:{}", e.file, e.provenance.clone().unwrap_or_default()))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_determinism_20x_identical() {
     let tmp = tempfile::TempDir::new().expect("tmp");
     let root = tmp.path();

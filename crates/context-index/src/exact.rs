@@ -213,7 +213,6 @@ pub async fn exact_search(
     let out_fut = async {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
-        let mut evid = Vec::new();
         let stderr_reader = BufReader::new(stderr);
         // Spawn stderr collector
         let stderr_task = tokio::spawn(async move {
@@ -230,9 +229,10 @@ pub async fn exact_search(
             s
         });
 
-        // Collect up to 500 for deterministic sort-then-truncate (avoid nondeterministic early truncation)
-        const COLLECT_LIMIT: usize = 500;
-        while evid.len() < COLLECT_LIMIT {
+        // Bounded deterministic heap: keep smallest max_results by (file, line, text) while streaming
+        // This is deterministic for any N (including >500) and bounded O(max_results log max_results)
+        let mut heap: Vec<ExactEvidence> = Vec::with_capacity(max_results + 1);
+        loop {
             line.clear();
             let n = reader
                 .read_line(&mut line)
@@ -245,9 +245,6 @@ pub async fn exact_search(
             if raw_line.is_empty() {
                 continue;
             }
-            // rg --column gives file:line:column:text
-            // Convert to a relative POSIX path FIRST so drive letters (e.g. "C:")
-            // on Windows don't corrupt the `:` split below.
             let rel = to_relative_posix(raw_line, root);
             let mut parts = rel.splitn(4, ':');
             let file = parts.next().unwrap_or("");
@@ -255,7 +252,6 @@ pub async fn exact_search(
             let _col = parts.next().unwrap_or("0");
             let text = parts.next().unwrap_or("").to_string();
             let rel = file.to_string();
-            // Skip if file is too large (check via ProjectIndex)
             if let Some(rec) = project.files.iter().find(|f| f.relative_path == rel) {
                 if rec.size_bytes > MAX_SEARCH_FILE_BYTES {
                     continue;
@@ -263,15 +259,29 @@ pub async fn exact_search(
             }
             let line_num: u32 = line_str.parse().unwrap_or(1);
             let kind = crate::classification::classify_file(Path::new(&rel));
-            evid.push(ExactEvidence {
+            let ev = ExactEvidence {
                 file: rel,
                 line: line_num,
                 end_line: Some(line_num),
                 text: text.chars().take(400).collect(),
                 match_text: Some(search_term.clone()),
                 kind,
-            });
+            };
+            // Insert sorted by file,line,text and keep only max_results smallest
+            let pos = heap
+                .binary_search_by(|e: &ExactEvidence| {
+                    e.file
+                        .cmp(&ev.file)
+                        .then_with(|| e.line.cmp(&ev.line))
+                        .then_with(|| e.text.cmp(&ev.text))
+                })
+                .unwrap_or_else(|e| e);
+            heap.insert(pos, ev);
+            if heap.len() > max_results {
+                heap.pop();
+            }
         }
+        let mut evid = heap;
 
         // Wait for child with timeout (rg should finish quickly after stdout closed)
         let child_ref = kill_guard
@@ -541,6 +551,45 @@ mod tests {
         .unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].file, "foo/app.module.ts");
+    }
+
+    #[tokio::test]
+    async fn deterministic_beyond_500_matches() {
+        // >500 matches must be deterministic with bounded heap (50 smallest by file,line)
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        for i in 0..600 {
+            let name = format!("file_{:04}.txt", i);
+            std::fs::write(tmp.path().join(&name), b"common_term_xyz\n").unwrap();
+        }
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let mut first: Option<Vec<String>> = None;
+        for iter in 0..20 {
+            let res = exact_search(
+                &idx,
+                ExactQuery::Literal("common_term_xyz".into()),
+                ExactSearchOptions {
+                    max_results: 50,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(res.len(), 50, "should return 50 smallest");
+            let ordered: Vec<String> = res
+                .iter()
+                .map(|e| format!("{}:{}", e.file, e.line))
+                .collect();
+            // Verify sorted by file,line
+            let mut sorted = ordered.clone();
+            sorted.sort();
+            assert_eq!(ordered, sorted, "must be sorted");
+            if let Some(prev) = &first {
+                assert_eq!(prev, &ordered, "determinism failed at iter {}", iter);
+            } else {
+                first = Some(ordered);
+            }
+        }
     }
 
     #[tokio::test]

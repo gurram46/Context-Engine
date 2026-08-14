@@ -279,22 +279,6 @@ fn extract_context_tokens(raw: &str, file_queries: &[ExactQuery]) -> Vec<String>
     uniq
 }
 
-#[allow(dead_code)]
-fn to_snake_case(s: &str) -> String {
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if c.is_uppercase() {
-            if i != 0 {
-                out.push('_');
-            }
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -496,10 +496,12 @@ pub async fn retrieve_context(
                             syms.iter().any(|s| {
                                 let n = s.name.to_lowercase();
                                 let q = s.qualified_name.to_lowercase();
-                                // precise: test symbol in same file, not whole-repo string search
-                                n.contains("test")
-                                    || q.contains("test")
+                                // precise: only tests/test/test_ prefix, not broad contains (avoids contest/latest/testament)
+                                n == "tests"
+                                    || n == "test"
                                     || n.starts_with("test_")
+                                    || q == "tests"
+                                    || q == "test"
                                     || q.starts_with("test_")
                             })
                         } else {
