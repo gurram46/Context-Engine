@@ -230,7 +230,7 @@ pub async fn exact_search(
         });
 
         // Bounded deterministic heap: keep smallest max_results by (file, line, text) while streaming
-        // This is deterministic for any N (including >500) and bounded O(max_results log max_results)
+        // This is deterministic for any N (including >500) and bounded O(N*K) with K=max_results (50), memory O(K) — binary_search O(log K) + Vec::insert O(K)
         let mut heap: Vec<ExactEvidence> = Vec::with_capacity(max_results + 1);
         loop {
             line.clear();

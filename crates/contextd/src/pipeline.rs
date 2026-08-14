@@ -9,6 +9,21 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
+fn to_snake_case(s: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Retrieval providers — R5 production uses no V2/OCI providers.
 /// Kept as empty struct for API compatibility; legacy CandidateProvider is LEGACY only.
 pub struct Providers {}
@@ -450,14 +465,24 @@ pub async fn retrieve_context(
                     .and_then(|n| n.to_str())
                     .unwrap_or(&file_lower)
                     .to_string();
-                // Precise conventions only — no broad contains(lower)
+                // Precise conventions with generic snake_case: FooBar/fooBar -> foo_bar + foobar
+                let snake = to_snake_case(tq);
+                let snake_lower = snake.to_lowercase();
                 let is_match = file_name == format!("test_{}.py", lower)
                     || file_name == format!("{}_test.py", lower)
                     || file_name == format!("{}_test.go", lower)
                     || file_name == format!("{}.spec.ts", lower)
                     || file_name == format!("{}.test.ts", lower)
                     || file_name == format!("{}.spec.js", lower)
-                    || file_name == format!("{}.test.js", lower);
+                    || file_name == format!("{}.test.js", lower)
+                    || (snake_lower != lower
+                        && (file_name == format!("test_{}.py", snake_lower)
+                            || file_name == format!("{}_test.py", snake_lower)
+                            || file_name == format!("{}_test.go", snake_lower)
+                            || file_name == format!("{}.spec.ts", snake_lower)
+                            || file_name == format!("{}.test.ts", snake_lower)
+                            || file_name == format!("{}.spec.js", snake_lower)
+                            || file_name == format!("{}.test.js", snake_lower)));
                 if is_match {
                     let score = if lower.len() == 1 && file_name == format!("test_{}.py", lower) {
                         1.0

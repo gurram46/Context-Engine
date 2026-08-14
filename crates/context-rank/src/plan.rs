@@ -102,19 +102,19 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
             for id in ids.iter().take(2) {
                 test_queries.push(id.clone());
                 // Precise test file variants via FileName (fast, deterministic), avoid broad Literal via rg for common words
-                // For single-letter Q, use test_q.py etc.; for multi-letter, also use FileName to avoid rg timeout on common terms like "objects"
+                // Generic case conversion: FooBar/fooBar -> foo_bar + foobar
                 let lower = id.to_lowercase();
-                if id.len() == 1 {
-                    exact_queries.push(ExactQuery::FileName(format!("test_{}.py", lower)));
-                    exact_queries.push(ExactQuery::FileName(format!("{}_test.go", lower)));
-                    exact_queries.push(ExactQuery::FileName(format!("{}.spec.ts", lower)));
-                    exact_queries.push(ExactQuery::FileName(format!("{}.test.ts", lower)));
-                } else {
-                    // For multi-letter, use only precise FileName variants (avoid broad Literal("objects") via rg)
-                    exact_queries.push(ExactQuery::FileName(format!("test_{}.py", lower)));
-                    exact_queries.push(ExactQuery::FileName(format!("{}_test.go", lower)));
-                    exact_queries.push(ExactQuery::FileName(format!("{}.spec.ts", lower)));
-                    exact_queries.push(ExactQuery::FileName(format!("{}.test.ts", lower)));
+                let snake = to_snake_case(id);
+                let mut variants = vec![lower.clone()];
+                if snake != lower {
+                    variants.push(snake.clone());
+                }
+                for v in variants {
+                    exact_queries.push(ExactQuery::FileName(format!("test_{}.py", v)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}_test.py", v)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}_test.go", v)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}.spec.ts", v)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}.test.ts", v)));
                 }
             }
         }
@@ -277,6 +277,21 @@ fn extract_context_tokens(raw: &str, file_queries: &[ExactQuery]) -> Vec<String>
         }
     }
     uniq
+}
+
+fn to_snake_case(s: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

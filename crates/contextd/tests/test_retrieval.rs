@@ -354,6 +354,90 @@ async fn test_single_letter_negative_a_not_match_api() {
 }
 
 #[tokio::test]
+async fn test_foo_bar_camel_to_snake() {
+    // FooBar and fooBar must map to test_foo_bar.py via generic snake_case, not just test_foobar.py
+    for query in &["What tests cover FooBar?", "What tests cover fooBar?"] {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        setup_git(root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("src/foo_bar.py"), b"def FooBar(): pass\n").unwrap();
+        std::fs::write(
+            root.join("tests/test_foo_bar.py"),
+            b"def test_foo_bar(): pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/test_foobar.py"),
+            b"def test_foobar(): pass\n",
+        )
+        .unwrap();
+        let pr = ProjectRoot::resolve(Some(root)).expect("root");
+        let idx = ProjectIndex::discover(&pr).expect("idx");
+        let si = StructuralIndex::new(&pr);
+        si.build(&idx).expect("build");
+        let project = ProjectIndex::discover(&pr).expect("idx2");
+        let res = retrieve_context(query, &project, &Providers {}, 10000, 5)
+            .await
+            .expect("retrieve");
+        let files: Vec<&str> = res.evidence.iter().map(|e| e.file.as_str()).collect();
+        assert!(
+            files.iter().any(|f| f.ends_with("test_foo_bar.py")),
+            "{} should find test_foo_bar.py via snake_case, got {:?}",
+            query,
+            files
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_foo_bar_negative_unrelated_not_matched() {
+    // FooBar must not match unrelated test_baz.py via broad substring
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let root = tmp.path();
+    setup_git(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(root.join("src/foo_bar.py"), b"def FooBar(): pass\n").unwrap();
+    std::fs::write(
+        root.join("tests/test_foo_bar.py"),
+        b"def test_foo_bar(): pass\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("tests/test_baz.py"), b"def test_baz(): pass\n").unwrap();
+    let pr = ProjectRoot::resolve(Some(root)).expect("root");
+    let idx = ProjectIndex::discover(&pr).expect("idx");
+    let si = StructuralIndex::new(&pr);
+    si.build(&idx).expect("build");
+    let project = ProjectIndex::discover(&pr).expect("idx2");
+    let res = retrieve_context(
+        "What tests cover FooBar?",
+        &project,
+        &Providers {},
+        10000,
+        5,
+    )
+    .await
+    .expect("retrieve");
+    let has_baz_test = res.evidence.iter().any(|e| {
+        e.file.ends_with("test_baz.py")
+            && e.provenance
+                .as_deref()
+                .map(|p| p.contains("test"))
+                .unwrap_or(false)
+    });
+    assert!(
+        !has_baz_test,
+        "FooBar must not match test_baz.py via Test, got {:?}",
+        res.evidence
+            .iter()
+            .map(|e| format!("{}:{}", e.file, e.provenance.clone().unwrap_or_default()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn test_inline_no_false_positive_contest_latest_testament() {
     // contest/latest/testament contain "test" substring but must NOT be inline-test evidence
     let tmp = tempfile::TempDir::new().expect("tmp");
