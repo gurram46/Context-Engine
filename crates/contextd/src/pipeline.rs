@@ -430,18 +430,45 @@ pub async fn retrieve_context(
                 added += 1;
             }
         }
-        if added == 0 {
+        // Always also try file path matching for dedicated test files, even if find_tests_related found some
+        {
             let lower = tq.to_lowercase();
             for f in project
                 .files
                 .iter()
                 .filter(|r| r.kind == context_index::FileKind::Test)
             {
-                if f.relative_path.to_lowercase().contains(&lower)
-                    || f.relative_path
-                        .to_lowercase()
-                        .contains(&format!("test_{}", lower))
-                {
+                if candidates.iter().any(|e| e.file == f.relative_path) {
+                    continue;
+                }
+                let file_lower = f.relative_path.to_lowercase();
+                let file_name = std::path::Path::new(&file_lower)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&file_lower)
+                    .to_string();
+                let is_match = if lower.len() == 1 {
+                    file_name == format!("test_{}.py", lower)
+                        || file_name == format!("{}_test.py", lower)
+                        || file_name == format!("{}_test.go", lower)
+                        || file_name == format!("{}.spec.ts", lower)
+                        || file_name == format!("{}.test.ts", lower)
+                        || file_name == format!("{}.spec.js", lower)
+                        || file_name == format!("{}.test.js", lower)
+                        || file_name.contains(&format!("test_{}", lower))
+                } else {
+                    file_lower.contains(&lower)
+                        || file_lower.contains(&format!("test_{}", lower))
+                        || file_lower.contains(&format!("{}_test", lower))
+                        || file_lower.contains(&format!("{}.spec", lower))
+                        || file_lower.contains(&format!("{}.test", lower))
+                };
+                if is_match {
+                    let score = if lower.len() == 1 && file_name == format!("test_{}.py", lower) {
+                        1.0
+                    } else {
+                        0.8
+                    };
                     candidates.push(Evidence {
                         source: context_rank::types::RetrievalSource::Test,
                         file: f.relative_path.clone(),
@@ -450,7 +477,7 @@ pub async fn retrieve_context(
                         symbol: Some(tq.clone()),
                         symbol_kind: None,
                         text: Some(format!("Test file: {}", f.relative_path)),
-                        score: Some(0.8),
+                        score: Some(score),
                         relation: Some(context_rank::types::EvidenceRelation::Test),
                         authority_score: None,
                         final_score: None,
@@ -458,8 +485,58 @@ pub async fn retrieve_context(
                         metadata: None,
                     });
                     added += 1;
-                    if added >= 5 {
+                    if added >= 7 {
                         break;
+                    }
+                }
+            }
+        }
+        // Source-local inline tests: if tq is defined in a file that itself contains tests (e.g., Rust #[cfg(test)]), that file is valid
+        if added == 0 {
+            if let Ok(defs) = structural_store::find_definitions(&conn, tq) {
+                for def in defs.iter().take(2) {
+                    let file = &def.file;
+                    let has_inline = {
+                        if let Ok(syms) = structural_store::load_symbols_for_file(&conn, file) {
+                            syms.iter().any(|s| {
+                                let n = s.name.to_lowercase();
+                                n.contains("test")
+                                    || s.qualified_name.to_lowercase().contains("test")
+                            })
+                        } else {
+                            false
+                        }
+                    } || {
+                        let abs = project.root.join(file);
+                        std::fs::read_to_string(&abs)
+                            .map(|c| {
+                                c.contains("#[cfg(test)]")
+                                    || c.contains("#[test]")
+                                    || c.contains("mod tests")
+                                    || c.contains("mod test_")
+                            })
+                            .unwrap_or(false)
+                    };
+                    if has_inline {
+                        candidates.push(Evidence {
+                            source: context_rank::types::RetrievalSource::Test,
+                            file: file.clone(),
+                            start_line: Some(def.start_line),
+                            end_line: Some(def.end_line),
+                            symbol: Some(tq.clone()),
+                            symbol_kind: Some(def.kind.as_str().to_string()),
+                            text: Some(format!("Inline tests in {}", file)),
+                            score: Some(0.9),
+                            relation: Some(context_rank::types::EvidenceRelation::Test),
+                            authority_score: None,
+                            final_score: None,
+                            provenance: Some("rust:test:inline".into()),
+                            metadata: None,
+                        });
+                        added += 1;
+                        if added >= 5 {
+                            break;
+                        }
                     }
                 }
             }

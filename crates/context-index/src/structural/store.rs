@@ -602,10 +602,21 @@ pub fn find_tests_related(conn: &Connection, query: &str) -> Result<Vec<Symbol>>
     // Use FileKind::Test via filename heuristics + symbol relationships.
     // Find symbols with name matching query (prefix) and then filter to test files using LIKE on file.
     // For R3, we just find symbols where file contains test patterns.
-    let pattern = format!("%{}%", query);
-    let mut stmt = conn.prepare(
-        "SELECT id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent FROM symbols WHERE (name LIKE ?1 OR qualified_name LIKE ?1) AND (file LIKE '%test%' OR file LIKE '%Test%' OR file LIKE '%_test.go' OR file LIKE '%spec%') LIMIT 20",
-    )?;
+    // For single-letter queries like "Q", use exact match to avoid matching many symbols containing "q" as substring (e.g., sequence_list)
+    let (pattern, use_exact) = if query.len() == 1 {
+        (query.to_string(), true)
+    } else {
+        (format!("%{}%", query), false)
+    };
+    let mut stmt = if use_exact {
+        conn.prepare(
+            "SELECT id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent FROM symbols WHERE (name = ?1 OR qualified_name = ?1) AND (file LIKE '%test%' OR file LIKE '%Test%' OR file LIKE '%_test.go' OR file LIKE '%spec%') LIMIT 20",
+        )?
+    } else {
+        conn.prepare(
+            "SELECT id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent FROM symbols WHERE (name LIKE ?1 OR qualified_name LIKE ?1) AND (file LIKE '%test%' OR file LIKE '%Test%' OR file LIKE '%_test.go' OR file LIKE '%spec%') LIMIT 20",
+        )?
+    };
     let rows = stmt.query_map(params![pattern], |row| {
         Ok(Symbol {
             id: row.get(0)?,

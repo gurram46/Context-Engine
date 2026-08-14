@@ -78,7 +78,13 @@ pub fn extract_identifiers(q: &str) -> Vec<String> {
         if stop.contains(low.as_str()) {
             continue;
         }
-        if t.len() < 3 {
+        // Allow single uppercase identifiers like "Q" for test queries (e.g., Q objects)
+        let is_single_upper = t.len() == 1
+            && t.chars()
+                .next()
+                .map(|c| c.is_ascii_uppercase())
+                .unwrap_or(false);
+        if t.len() < 3 && !is_single_upper {
             continue;
         }
         let is_snake = t.contains('_');
@@ -93,7 +99,19 @@ pub fn extract_identifiers(q: &str) -> Vec<String> {
             });
         let is_qualified = t.contains('.') || t.contains("::");
         let is_lower_generic = LOWER_RE.is_match(&low) && !stop.contains(low.as_str());
-        if is_snake || is_screaming || is_camel || is_pascal || is_qualified || is_lower_generic {
+        let is_single_upper = t.len() == 1
+            && t.chars()
+                .next()
+                .map(|c| c.is_ascii_uppercase())
+                .unwrap_or(false);
+        if is_snake
+            || is_screaming
+            || is_camel
+            || is_pascal
+            || is_qualified
+            || is_lower_generic
+            || is_single_upper
+        {
             filtered.push(t);
         }
     }
