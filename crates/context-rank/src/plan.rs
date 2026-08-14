@@ -101,13 +101,20 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
             semantic_queries.push(raw.to_string());
             for id in ids.iter().take(2) {
                 test_queries.push(id.clone());
-                exact_queries.push(ExactQuery::Literal(id.clone()));
-                // Generic test file variant: test_<id>
-                let snake = to_snake_case(id);
-                if snake != *id {
-                    exact_queries.push(ExactQuery::Literal(format!("test_{}", snake)));
+                // Precise test file variants via FileName (fast, deterministic), avoid broad Literal via rg for common words
+                // For single-letter Q, use test_q.py etc.; for multi-letter, also use FileName to avoid rg timeout on common terms like "objects"
+                let lower = id.to_lowercase();
+                if id.len() == 1 {
+                    exact_queries.push(ExactQuery::FileName(format!("test_{}.py", lower)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}_test.go", lower)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}.spec.ts", lower)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}.test.ts", lower)));
                 } else {
-                    exact_queries.push(ExactQuery::Literal(format!("test_{}", id.to_lowercase())));
+                    // For multi-letter, use only precise FileName variants (avoid broad Literal("objects") via rg)
+                    exact_queries.push(ExactQuery::FileName(format!("test_{}.py", lower)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}_test.go", lower)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}.spec.ts", lower)));
+                    exact_queries.push(ExactQuery::FileName(format!("{}.test.ts", lower)));
                 }
             }
         }
@@ -272,6 +279,7 @@ fn extract_context_tokens(raw: &str, file_queries: &[ExactQuery]) -> Vec<String>
     uniq
 }
 
+#[allow(dead_code)]
 fn to_snake_case(s: &str) -> String {
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {

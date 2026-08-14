@@ -164,7 +164,7 @@ fn fuse_rrf(
             }
         }
     }
-    // Convert to Evidence with RRF as score, preserve provenance
+    // Convert to Evidence with RRF as score, preserve provenance — deterministic via BTree ordering
     let mut fused: Vec<Evidence> = map
         .into_values()
         .map(|(mut ev, rrf)| {
@@ -180,11 +180,14 @@ fn fuse_rrf(
             ev
         })
         .collect();
-    // Sort by RRF desc
+    // Sort by RRF desc, then deterministic tie-breakers
     fused.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.start_line.cmp(&b.start_line))
+            .then_with(|| a.symbol.cmp(&b.symbol))
     });
     fused
 }
@@ -430,8 +433,8 @@ pub async fn retrieve_context(
                 added += 1;
             }
         }
-        // Always also try file path matching for dedicated test files, even if find_tests_related found some
-        {
+        // Precise dedicated test filename matching — only if structural found nothing (avoid displacing good evidence)
+        if added == 0 {
             let lower = tq.to_lowercase();
             for f in project
                 .files
@@ -447,22 +450,14 @@ pub async fn retrieve_context(
                     .and_then(|n| n.to_str())
                     .unwrap_or(&file_lower)
                     .to_string();
-                let is_match = if lower.len() == 1 {
-                    file_name == format!("test_{}.py", lower)
-                        || file_name == format!("{}_test.py", lower)
-                        || file_name == format!("{}_test.go", lower)
-                        || file_name == format!("{}.spec.ts", lower)
-                        || file_name == format!("{}.test.ts", lower)
-                        || file_name == format!("{}.spec.js", lower)
-                        || file_name == format!("{}.test.js", lower)
-                        || file_name.contains(&format!("test_{}", lower))
-                } else {
-                    file_lower.contains(&lower)
-                        || file_lower.contains(&format!("test_{}", lower))
-                        || file_lower.contains(&format!("{}_test", lower))
-                        || file_lower.contains(&format!("{}.spec", lower))
-                        || file_lower.contains(&format!("{}.test", lower))
-                };
+                // Precise conventions only — no broad contains(lower)
+                let is_match = file_name == format!("test_{}.py", lower)
+                    || file_name == format!("{}_test.py", lower)
+                    || file_name == format!("{}_test.go", lower)
+                    || file_name == format!("{}.spec.ts", lower)
+                    || file_name == format!("{}.test.ts", lower)
+                    || file_name == format!("{}.spec.js", lower)
+                    || file_name == format!("{}.test.js", lower);
                 if is_match {
                     let score = if lower.len() == 1 && file_name == format!("test_{}.py", lower) {
                         1.0
@@ -485,38 +480,31 @@ pub async fn retrieve_context(
                         metadata: None,
                     });
                     added += 1;
-                    if added >= 7 {
+                    if added >= 5 {
                         break;
                     }
                 }
             }
         }
-        // Source-local inline tests: if tq is defined in a file that itself contains tests (e.g., Rust #[cfg(test)]), that file is valid
+        // Source-local inline tests: symbol def file itself contains structural test symbols (same file)
         if added == 0 {
             if let Ok(defs) = structural_store::find_definitions(&conn, tq) {
                 for def in defs.iter().take(2) {
                     let file = &def.file;
-                    let has_inline = {
+                    let has_inline =
                         if let Ok(syms) = structural_store::load_symbols_for_file(&conn, file) {
                             syms.iter().any(|s| {
                                 let n = s.name.to_lowercase();
+                                let q = s.qualified_name.to_lowercase();
+                                // precise: test symbol in same file, not whole-repo string search
                                 n.contains("test")
-                                    || s.qualified_name.to_lowercase().contains("test")
+                                    || q.contains("test")
+                                    || n.starts_with("test_")
+                                    || q.starts_with("test_")
                             })
                         } else {
                             false
-                        }
-                    } || {
-                        let abs = project.root.join(file);
-                        std::fs::read_to_string(&abs)
-                            .map(|c| {
-                                c.contains("#[cfg(test)]")
-                                    || c.contains("#[test]")
-                                    || c.contains("mod tests")
-                                    || c.contains("mod test_")
-                            })
-                            .unwrap_or(false)
-                    };
+                        };
                     if has_inline {
                         candidates.push(Evidence {
                             source: context_rank::types::RetrievalSource::Test,
@@ -547,9 +535,11 @@ pub async fn retrieve_context(
 
     // Determine sufficiency before heavy retrieval
     let suff = sufficiency(classified.query_type, &candidates, query);
-    // For R4, BM25+semantic for CONCEPTUAL, MIXED, TEST; for others only if insufficient
+    // For R4, BM25+semantic for CONCEPTUAL, MIXED; for TEST only if not already strong (avoid heavy BM25 when precise test file found)
     let run_bm25 = match classified.query_type {
-        QueryType::Conceptual | QueryType::Mixed | QueryType::Test => true,
+        QueryType::Conceptual | QueryType::Mixed => true,
+        QueryType::Test if suff == EvidenceSufficiency::Strong => false,
+        QueryType::Test => true,
         QueryType::Symbol | QueryType::Dependency if suff == EvidenceSufficiency::Insufficient => {
             true
         }

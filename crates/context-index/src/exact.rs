@@ -206,6 +206,7 @@ pub async fn exact_search(
         .ok_or_else(|| ContextError::Internal("rg stderr not piped".into()))?;
     // Guard: if outer timeout cancels `out_fut`, `Child` is dropped without `wait`; Tokio does not auto-kill, so we kill on drop.
     let mut kill_guard = KillOnDrop(Some(child));
+    let max_results = opts.max_results;
 
     // Bounded stdout handling with timeout
     let t0 = Instant::now();
@@ -229,7 +230,9 @@ pub async fn exact_search(
             s
         });
 
-        while evid.len() < opts.max_results {
+        // Collect up to 500 for deterministic sort-then-truncate (avoid nondeterministic early truncation)
+        const COLLECT_LIMIT: usize = 500;
+        while evid.len() < COLLECT_LIMIT {
             line.clear();
             let n = reader
                 .read_line(&mut line)
@@ -295,6 +298,15 @@ pub async fn exact_search(
                 )));
             }
         }
+
+        // Deterministic ordering before LIMIT truncation — sort then truncate to max_results
+        evid.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.text.cmp(&b.text))
+        });
+        evid.truncate(max_results);
 
         Ok::<Vec<ExactEvidence>, ContextError>(evid)
     };
