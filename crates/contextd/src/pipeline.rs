@@ -726,7 +726,12 @@ pub async fn retrieve_context(
                     retrievers_used.push(format!("rust-semantic:0:{}", fp.model_id));
                     continue;
                 }
-                match context_index::vector::search_brute(&conn, &qvec, &fp, 10) {
+                match context_index::vector::search_brute(
+                    &conn,
+                    &qvec,
+                    &fp,
+                    context_index::vector::SEMANTIC_CANDIDATE_K,
+                ) {
                     Ok(results) => {
                         for (rank, vc) in results.into_iter().enumerate() {
                             let text = load_file_snippet(&project.root, &vc.file, vc.start_line)

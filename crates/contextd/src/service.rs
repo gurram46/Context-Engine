@@ -91,6 +91,8 @@ pub struct StatusReport {
     #[serde(rename = "semanticIndexReady")]
     pub semantic_index_ready: bool,
     pub eligible_chunk_count: usize,
+    pub semantic_ref_count: usize,
+    pub representation_version: String,
     pub missing_vector_count: usize,
     pub stale_vector_count: usize,
     pub watcher_state: String,
@@ -239,15 +241,10 @@ impl ContextService {
         } else {
             context_index::embed::configured_fingerprint()
         };
-        let (was_semantic_ready, _was_missing_before) = if let Ok(conn) =
-            structural_store::open_db(root.path())
-        {
-            let eligible_before = context_index::vector::eligible_chunk_count(&conn).unwrap_or(0);
-            let missing_before =
-                context_index::vector::missing_vector_count(&conn, &fingerprint).unwrap_or(0);
-            (eligible_before > 0 && missing_before == 0, missing_before)
+        let was_semantic_ready = if let Ok(conn) = structural_store::open_db(root.path()) {
+            context_index::vector::is_semantic_ready(&conn, &fingerprint, true).unwrap_or(false)
         } else {
-            (false, 0)
+            false
         };
         let idx =
             ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
@@ -428,6 +425,7 @@ impl ContextService {
         let mut store_version = None;
 
         let fingerprint = context_index::embed::configured_fingerprint();
+        let mut semantic_ref_count = 0usize;
         if let Ok(root) = ProjectRoot::resolve(Some(&self.root)) {
             if let Ok(conn) = structural_store::open_db(root.path()) {
                 if let Ok(gen) = structural_store::get_generation(&conn) {
@@ -445,6 +443,7 @@ impl ContextService {
                 vector_count =
                     context_index::vector::count_vectors(&conn, &fingerprint).unwrap_or(0) as usize;
                 eligible = context_index::vector::eligible_chunk_count(&conn).unwrap_or(0);
+                semantic_ref_count = context_index::vector::semantic_ref_count(&conn).unwrap_or(0);
                 missing =
                     context_index::vector::missing_vector_count(&conn, &fingerprint).unwrap_or(0);
                 stale = context_index::vector::stale_vector_count(&conn, &fingerprint).unwrap_or(0);
@@ -482,16 +481,10 @@ impl ContextService {
         let dim = fingerprint.dimension;
         let semantic_backend_available =
             context_index::embed::is_configured_model_available().await;
-        let semantic_index_ready = if !semantic_backend_available {
-            false
-        } else {
-            // need conn again for is_semantic_ready but we already computed missing/eligible
-            if eligible == 0 {
-                false
-            } else {
-                missing == 0
-            }
-        };
+        let semantic_index_ready = semantic_backend_available
+            && eligible != 0
+            && semantic_ref_count == eligible
+            && missing == 0;
         let semantic_available = semantic_backend_available;
         let watcher_state = "rust-notify".to_string();
 
@@ -524,6 +517,9 @@ impl ContextService {
             semantic_backend_available,
             semantic_index_ready,
             eligible_chunk_count: eligible,
+            semantic_ref_count,
+            representation_version: context_index::vector::SEMANTIC_REPRESENTATION_VERSION
+                .to_string(),
             missing_vector_count: missing,
             stale_vector_count: stale,
             watcher_state,
@@ -842,11 +838,16 @@ mod tests {
             "cold fast reconcile should embed 0"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        // status should be not ready
+        // status should be not ready (no refs yet)
         let conn = context_index::structural::store::open_db(&root).unwrap();
         let fp = fake.fingerprint();
         assert!(!context_index::vector::is_semantic_ready(&conn, &fp, true).unwrap());
-        assert!(context_index::vector::missing_vector_count(&conn, &fp).unwrap() > 0);
+        let eligible = context_index::vector::eligible_chunk_count(&conn).unwrap();
+        let refs = context_index::vector::semantic_ref_count(&conn).unwrap();
+        assert!(
+            refs != eligible
+                || context_index::vector::missing_vector_count(&conn, &fp).unwrap() > 0
+        );
         // lexical search should still succeed
         let res = svc
             .search("foo_0", crate::service::SearchOptions::default())

@@ -6,7 +6,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Index location — worktree-safe.
 /// Chooses `<repo>/.context/index/structural.db`
@@ -58,6 +58,7 @@ pub async fn open_db_async(project_root: PathBuf) -> Result<Connection> {
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
+    // First create core structural tables (without vectors/semantic) to allow version check without column errors
     conn.execute_batch(
         r#"
         PRAGMA journal_mode=WAL;
@@ -190,23 +191,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-
-        -- R4D native vector store (content-hash keyed for reuse)
-        CREATE TABLE IF NOT EXISTS vectors (
-            content_hash TEXT NOT NULL,
-            model_id TEXT NOT NULL,
-            version TEXT NOT NULL,
-            dimension INTEGER NOT NULL,
-            vector BLOB NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY(content_hash, model_id, version)
-        );
-        CREATE INDEX IF NOT EXISTS idx_vectors_model ON vectors(model_id, version);
-        CREATE INDEX IF NOT EXISTS idx_vectors_hash ON vectors(content_hash);
         "#,
     )?;
 
-    // Check schema version
+    // Check schema version before handling vectors/semantic
     let existing: Option<i32> = conn
         .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
             r.get(0)
@@ -214,15 +202,129 @@ fn init_schema(conn: &Connection) -> Result<()> {
         .optional()?;
     match existing {
         None => {
+            // Fresh DB: create new v3 semantic tables
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS vectors (
+                    representation_hash TEXT NOT NULL,
+                    representation_version TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    vector BLOB NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY(representation_hash, representation_version, model_id, version, dimension)
+                );
+                CREATE INDEX IF NOT EXISTS idx_vectors_model ON vectors(model_id, version, dimension);
+                CREATE INDEX IF NOT EXISTS idx_vectors_hash ON vectors(representation_hash, representation_version);
+                CREATE TABLE IF NOT EXISTS semantic_chunk_refs (
+                    chunk_id TEXT NOT NULL,
+                    representation_hash TEXT NOT NULL,
+                    representation_version TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY(chunk_id, representation_version),
+                    FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_semantic_refs_rep ON semantic_chunk_refs(representation_hash, representation_version);
+                CREATE INDEX IF NOT EXISTS idx_semantic_refs_chunk ON semantic_chunk_refs(chunk_id);
+                "#,
+            )?;
             conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
                 params![SCHEMA_VERSION],
             )?;
         }
-        Some(v) if v == SCHEMA_VERSION => {}
+        Some(v) if v == SCHEMA_VERSION => {
+            // Ensure new tables exist even if DB was created with intermediate version (idempotent)
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS vectors (
+                    representation_hash TEXT NOT NULL,
+                    representation_version TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    vector BLOB NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY(representation_hash, representation_version, model_id, version, dimension)
+                );
+                CREATE INDEX IF NOT EXISTS idx_vectors_model ON vectors(model_id, version, dimension);
+                CREATE INDEX IF NOT EXISTS idx_vectors_hash ON vectors(representation_hash, representation_version);
+                CREATE TABLE IF NOT EXISTS semantic_chunk_refs (
+                    chunk_id TEXT NOT NULL,
+                    representation_hash TEXT NOT NULL,
+                    representation_version TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY(chunk_id, representation_version),
+                    FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_semantic_refs_rep ON semantic_chunk_refs(representation_hash, representation_version);
+                CREATE INDEX IF NOT EXISTS idx_semantic_refs_chunk ON semantic_chunk_refs(chunk_id);
+                "#,
+            )?;
+        }
+        Some(2) => {
+            // Migration v2 -> v3: discard unsafe content_hash vectors, create new representation-keyed store.
+            conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS vectors;
+                CREATE TABLE vectors (
+                    representation_hash TEXT NOT NULL,
+                    representation_version TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    vector BLOB NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY(representation_hash, representation_version, model_id, version, dimension)
+                );
+                CREATE INDEX IF NOT EXISTS idx_vectors_model ON vectors(model_id, version, dimension);
+                CREATE INDEX IF NOT EXISTS idx_vectors_hash ON vectors(representation_hash, representation_version);
+                CREATE TABLE IF NOT EXISTS semantic_chunk_refs (
+                    chunk_id TEXT NOT NULL,
+                    representation_hash TEXT NOT NULL,
+                    representation_version TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY(chunk_id, representation_version),
+                    FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_semantic_refs_rep ON semantic_chunk_refs(representation_hash, representation_version);
+                CREATE INDEX IF NOT EXISTS idx_semantic_refs_chunk ON semantic_chunk_refs(chunk_id);
+                "#,
+            )?;
+            conn.execute(
+                "UPDATE schema_version SET version=?1",
+                params![SCHEMA_VERSION],
+            )?;
+        }
         Some(v) if v < SCHEMA_VERSION => {
-            // Simple migration: for R3, we only have v1, so no migration needed.
-            // If older, update.
+            conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS vectors;
+                CREATE TABLE vectors (
+                    representation_hash TEXT NOT NULL,
+                    representation_version TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    vector BLOB NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY(representation_hash, representation_version, model_id, version, dimension)
+                );
+                CREATE INDEX IF NOT EXISTS idx_vectors_model ON vectors(model_id, version, dimension);
+                CREATE INDEX IF NOT EXISTS idx_vectors_hash ON vectors(representation_hash, representation_version);
+                CREATE TABLE IF NOT EXISTS semantic_chunk_refs (
+                    chunk_id TEXT NOT NULL,
+                    representation_hash TEXT NOT NULL,
+                    representation_version TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    PRIMARY KEY(chunk_id, representation_version),
+                    FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_semantic_refs_rep ON semantic_chunk_refs(representation_hash, representation_version);
+                CREATE INDEX IF NOT EXISTS idx_semantic_refs_chunk ON semantic_chunk_refs(chunk_id);
+                "#,
+            )?;
             conn.execute(
                 "UPDATE schema_version SET version=?1",
                 params![SCHEMA_VERSION],
@@ -1059,5 +1161,80 @@ mod tests {
             .unwrap();
         assert_eq!(persisted_start as usize, chunk_a.start_byte);
         assert_eq!(persisted_hash, chunk_a.content_hash);
+    }
+
+    #[test]
+    fn migration_v2_to_v3_discards_old_vectors() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let db_path = crate::structural::store::index_db_path(tmp.path());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        // Create a v2 DB manually
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                PRAGMA foreign_keys=ON;
+                CREATE TABLE schema_version (version INTEGER PRIMARY KEY, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+                INSERT INTO schema_version (version) VALUES (2);
+                CREATE TABLE files (path TEXT PRIMARY KEY, hash TEXT NOT NULL, language TEXT NOT NULL, size_bytes INTEGER, modified_time TEXT, parse_error TEXT);
+                INSERT INTO files (path, hash, language) VALUES ('a.py', 'h1', 'python');
+                CREATE TABLE symbols (id TEXT PRIMARY KEY, name TEXT NOT NULL, qualified_name TEXT NOT NULL, kind TEXT NOT NULL, file TEXT NOT NULL, language TEXT NOT NULL, start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, start_byte INTEGER NOT NULL, end_byte INTEGER NOT NULL, visibility TEXT NOT NULL, parent TEXT, FOREIGN KEY(file) REFERENCES files(path) ON DELETE CASCADE);
+                CREATE TABLE imports (id INTEGER PRIMARY KEY AUTOINCREMENT, file TEXT NOT NULL, import_path TEXT NOT NULL, alias TEXT, line INTEGER NOT NULL, is_relative INTEGER NOT NULL, FOREIGN KEY(file) REFERENCES files(path) ON DELETE CASCADE);
+                CREATE TABLE refs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, file TEXT NOT NULL, line INTEGER NOT NULL, parent_symbol TEXT, kind TEXT NOT NULL, start_byte INTEGER NOT NULL, end_byte INTEGER NOT NULL, FOREIGN KEY(file) REFERENCES files(path) ON DELETE CASCADE);
+                CREATE TABLE chunks (id TEXT PRIMARY KEY, file TEXT NOT NULL, language TEXT NOT NULL, start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, start_byte INTEGER NOT NULL, end_byte INTEGER NOT NULL, parent_symbol TEXT, content_hash TEXT NOT NULL, text_size_bytes INTEGER NOT NULL, FOREIGN KEY(file) REFERENCES files(path) ON DELETE CASCADE);
+                INSERT INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES ('c1', 'a.py', 'python', 1, 2, 0, 10, NULL, 'chash1', 10);
+                CREATE TABLE call_edges (id INTEGER PRIMARY KEY AUTOINCREMENT, caller_symbol_id TEXT NOT NULL, callee_name TEXT NOT NULL, resolved_symbol_id TEXT, confidence TEXT NOT NULL, file TEXT NOT NULL, line INTEGER NOT NULL, FOREIGN KEY(file) REFERENCES files(path) ON DELETE CASCADE);
+                CREATE TABLE structural_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE bm25_documents (doc_id TEXT PRIMARY KEY, chunk_id TEXT NOT NULL, file TEXT NOT NULL, content_hash TEXT NOT NULL, length INTEGER NOT NULL, symbol TEXT, start_line INTEGER, end_line INTEGER);
+                CREATE TABLE bm25_postings (term TEXT NOT NULL, doc_id TEXT NOT NULL, tf INTEGER NOT NULL, PRIMARY KEY(term, doc_id), FOREIGN KEY(doc_id) REFERENCES bm25_documents(doc_id) ON DELETE CASCADE);
+                CREATE TABLE bm25_terms (term TEXT PRIMARY KEY, df INTEGER NOT NULL);
+                CREATE TABLE bm25_stats (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO bm25_documents (doc_id, chunk_id, file, content_hash, length) VALUES ('d1', 'c1', 'a.py', 'chash1', 10);
+                CREATE TABLE vectors (content_hash TEXT NOT NULL, model_id TEXT NOT NULL, version TEXT NOT NULL, dimension INTEGER NOT NULL, vector BLOB NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(content_hash, model_id, version));
+                INSERT INTO vectors (content_hash, model_id, version, dimension, vector) VALUES ('chash1', 'all-minilm', 'ollama-all-minilm-v1', 384, randomblob(384*4));
+                "#,
+            )
+            .unwrap();
+        }
+        // Now open via our store which should migrate to v3
+        let conn = open_db(tmp.path()).unwrap();
+        let v: i32 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3, "should migrate to 3");
+        // structural data survives
+        let cnt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt, 1);
+        let cnt2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bm25_documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt2, 1, "BM25 should survive");
+        // old vectors should be discarded (new table empty)
+        let cnt_vectors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt_vectors, 0, "old unsafe vectors should be discarded");
+        // new semantic tables exist
+        let cnt_refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM semantic_chunk_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt_refs, 0);
+        // ensure new vectors schema has representation_hash column
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("representation_hash"),
+            "new vectors should have representation_hash: {}",
+            sql
+        );
     }
 }
