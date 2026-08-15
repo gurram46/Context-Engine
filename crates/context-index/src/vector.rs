@@ -491,40 +491,25 @@ pub async fn sync_missing_vectors_for_root_with_batch_size(
         out
     };
 
+    let unique = rep_map.len();
     if missing_hashes.is_empty() {
-        // All reused
-        return Ok((eligible, 0, 0, 0));
+        // All reused - truthful distinct count
+        return Ok((unique, 0, 0, 0));
     }
 
     let missing_distinct = missing_hashes.len();
-    let reused = eligible.saturating_sub(missing_distinct); // approximate, but actual reused distinct? Keep simple.
+    let reused = unique.saturating_sub(missing_distinct);
 
-    // Build texts for missing
+    // Build texts for missing - rep_map must contain every missing hash, otherwise invariant violation
     let mut entries: Vec<(String, String)> = Vec::with_capacity(missing_distinct);
     for h in &missing_hashes {
-        if let Some(text) = rep_map.get(h) {
-            entries.push((h.clone(), text.clone()));
-        } else {
-            // Should not happen, but recompute via fallback query for safety
-            // Find one chunk for this hash
-            if let Ok((file, language, start_byte, end_byte, qname, name)) = conn.query_row(
-                "SELECT c.file, c.language, c.start_byte, c.end_byte, s.qualified_name, s.name FROM semantic_chunk_refs r JOIN chunks c ON c.id=r.chunk_id LEFT JOIN symbols s ON c.parent_symbol=s.id WHERE r.representation_hash=?1 AND r.representation_version=?2 LIMIT 1",
-                params![h, SEMANTIC_REPRESENTATION_VERSION],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as usize, r.get::<_, i64>(3)? as usize, r.get::<_, Option<String>>(4)?, r.get::<_, Option<String>>(5)?)),
-            ) {
-                let abs = root.join(&file);
-                let content = std::fs::read_to_string(&abs).unwrap_or_default();
-                let bytes = content.as_bytes();
-                let slice = if start_byte < bytes.len() && end_byte <= bytes.len() {
-                    String::from_utf8_lossy(&bytes[start_byte..end_byte]).to_string()
-                } else {
-                    String::new()
-                };
-                let qualified = qname.unwrap_or(name.unwrap_or_default());
-                let rendered = render_semantic_representation(&language, &file, &qualified, &slice);
-                entries.push((h.clone(), rendered));
-            }
-        }
+        let text = rep_map.get(h).ok_or_else(|| {
+            anyhow::anyhow!(
+                "semantic invariant violation: missing rendered representation for {}",
+                h
+            )
+        })?;
+        entries.push((h.clone(), text.clone()));
     }
 
     // Sort entries by hash for determinism, already sorted via missing_hashes
@@ -591,9 +576,9 @@ pub async fn sync_changed_files_vectors(
     // Materialize only changed files (cascade will have removed old refs for those files via DELETE FROM chunks trigger)
     // But we need to ensure we recreate refs for new chunks
     let rep_map = materialize_semantic_refs(conn, root, Some(changed_files))?;
+    let distinct_changed = rep_map.len();
 
     // Determine which of the materialized reps are missing vectors
-    // Collect hashes for changed files from rep_map that are missing
     let mut missing: Vec<(String, String)> = Vec::new();
     for (hash, text) in rep_map {
         if get_vector(conn, &hash, &fp)?.is_none() {
@@ -604,21 +589,7 @@ pub async fn sync_changed_files_vectors(
 
     let mut total_embedded = 0usize;
     let mut total_calls = 0usize;
-
-    // reused: count of changed files' chunks that already had vector (hash existed)
-    let changed_refs = {
-        let mut cnt = 0;
-        for f in changed_files {
-            let c: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM chunks WHERE file=?1",
-                params![f],
-                |r| r.get(0),
-            )?;
-            cnt += c as usize;
-        }
-        cnt
-    };
-    let total_reused = changed_refs.saturating_sub(missing.len());
+    let total_reused = distinct_changed.saturating_sub(missing.len());
 
     if missing.is_empty() {
         // No embedding needed, but GC orphan still
@@ -1916,6 +1887,138 @@ mod tests {
         .await;
         assert!(res2.is_ok());
         assert_eq!(semantic_ref_count(&conn2)?, eligible_chunk_count(&conn2)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_representation_text_never_embeds_fallback() -> Result<()> {
+        // Verify that sync does not embed empty representation when rep_map missing hash
+        // Force inconsistency by manually inserting a fake semantic ref that will be missing
+        let tmp = tempfile::TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join("a.py"), b"def foo():\n    pass\n")?;
+        let pr = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx = crate::discovery::ProjectIndex::discover(&pr)?;
+        let si = crate::structural::StructuralIndex::for_path(root.clone());
+        si.build_with_delta(&idx)?;
+        let mut conn = crate::structural::store::open_db(&root)?;
+        // First successful index
+        crate::vector::sync_missing_vectors_for_root(
+            &mut conn,
+            &root,
+            &FakeEmbedder::new("test", 8),
+        )
+        .await?;
+        let before_vectors = count_vectors(&conn, &FakeEmbedder::new("test", 8).fingerprint())?;
+        // Corrupt DB: insert a fake semantic ref for existing chunk with fake hash
+        let chunk_id: String = conn.query_row("SELECT id FROM chunks LIMIT 1", [], |r| r.get(0))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO semantic_chunk_refs (chunk_id, representation_hash, representation_version, content_hash) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![chunk_id, "fake_hash_not_in_rep_map_1234567890abcdef", "v2", "h1"],
+        )?;
+        // Now sync again - materialize will fix the fake hash to correct one, so missing should be 0 and no empty embed
+        // Ensure that after sync, no vector was created for fake_hash and no empty representation was embedded
+        let mut conn2 = crate::structural::store::open_db(&root)?;
+        let res = crate::vector::sync_missing_vectors_for_root(
+            &mut conn2,
+            &root,
+            &FakeEmbedder::new("test", 8),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "sync should succeed after fixing fake hash via materialize"
+        );
+        let fake_exists = get_vector(
+            &conn2,
+            "fake_hash_not_in_rep_map_1234567890abcdef",
+            &FakeEmbedder::new("test", 8).fingerprint(),
+        )?;
+        assert!(
+            fake_exists.is_none(),
+            "no vector should be created for fake hash"
+        );
+        assert_eq!(
+            count_vectors(&conn2, &FakeEmbedder::new("test", 8).fingerprint())?,
+            before_vectors
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reuse_telemetry_duplicate_reps() -> Result<()> {
+        // A: 2 chunks -> same representation, cold index
+        let embedder = FakeEmbedder::new("test-dedup", 8);
+        let content = "same slice content";
+        let tmp = tempfile::TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join("a.py"), content.as_bytes())?;
+        let db_path = crate::structural::store::index_db_path(&root);
+        std::fs::create_dir_all(db_path.parent().unwrap())?;
+        let mut conn_file = crate::structural::store::open_db(&root)?;
+        conn_file.execute(
+            "INSERT OR IGNORE INTO files (path, hash, language) VALUES ('a.py','fh','python')",
+            [],
+        )?;
+        conn_file.execute("INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES ('c1','a.py','python',1,2,0,18,NULL,'h1',18)", [])?;
+        conn_file.execute("INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES ('c2','a.py','python',1,2,0,18,NULL,'h2',18)", [])?;
+        let (reused, created, _calls, _) =
+            crate::vector::sync_missing_vectors_for_root(&mut conn_file, &root, &embedder).await?;
+        // Unique reps =1, so reused 0, created 1
+        assert_eq!(created, 1, "2 chunks same rep should create 1 vector");
+        assert_eq!(reused, 0, "cold should have 0 reused");
+        // B: second sync should have reused 1, created 0
+        let (reused2, created2, _, _) =
+            crate::vector::sync_missing_vectors_for_root(&mut conn_file, &root, &embedder).await?;
+        assert_eq!(reused2, 1, "second sync should have 1 reused distinct");
+        assert_eq!(created2, 0);
+        // C: 2 new chunks same rep in same file, no vector yet => created 1
+        conn_file.execute(
+            "INSERT OR IGNORE INTO files (path, hash, language) VALUES ('c.py','fh','python')",
+            [],
+        )?;
+        for (id, h) in [("c3", "h3"), ("c4", "h4")] {
+            conn_file.execute(
+                "INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,'c.py','python',1,2,0,5,NULL,?2,5)",
+                rusqlite::params![id, h],
+            )?;
+        }
+        let chunk_c1 = Chunk {
+            id: "c3".to_string(),
+            file: "c.py".to_string(),
+            language: Language::Python,
+            start_line: 1,
+            end_line: 2,
+            start_byte: 0,
+            end_byte: 5,
+            parent_symbol: None,
+            content_hash: "h3".to_string(),
+            text_size_bytes: 5,
+        };
+        let chunk_c2 = Chunk {
+            id: "c4".to_string(),
+            file: "c.py".to_string(),
+            language: Language::Python,
+            start_line: 1,
+            end_line: 2,
+            start_byte: 0,
+            end_byte: 5,
+            parent_symbol: None,
+            content_hash: "h4".to_string(),
+            text_size_bytes: 5,
+        };
+        let (reused_c, created_c) = crate::vector::sync_vectors_for_file(
+            &mut conn_file,
+            "c.py",
+            &[chunk_c1, chunk_c2],
+            "hello",
+            &embedder,
+        )
+        .await?;
+        assert_eq!(reused_c, 0, "new duplicate reps should have 0 reused");
+        assert_eq!(created_c, 1, "2 chunks same rep should create 1 vector");
         Ok(())
     }
 }
