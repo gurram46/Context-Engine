@@ -140,6 +140,13 @@ impl ContextService {
         &self,
         override_embedder: Option<Arc<dyn Embedder>>,
     ) -> Result<ReconcileStats, ContextError> {
+        self.reconcile_full_inner(override_embedder).await
+    }
+
+    async fn reconcile_full_inner(
+        &self,
+        override_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Result<ReconcileStats, ContextError> {
         let _guard = self.build_lock.lock().await;
         let t0 = std::time::Instant::now();
         let root = ProjectRoot::resolve(Some(&self.root))
@@ -157,36 +164,29 @@ impl ContextService {
         .map_err(|e| ContextError::Internal(format!("structural build failed: {e}")))?;
 
         let _elapsed_struct = t0.elapsed().as_millis();
-        // Semantic reconcile — Ollama-free structural remains independent
         let mut vectors_created = 0usize;
         let mut vectors_reused = 0usize;
         let mut embedding_calls = 0usize;
 
-        // Determine fingerprint and backend availability
         let fingerprint = if let Some(ref emb) = override_embedder {
             emb.fingerprint()
         } else {
             context_index::embed::configured_fingerprint()
         };
         let backend_available = if override_embedder.is_some() {
-            // test mode: if embedder provided, consider backend available
             true
         } else {
             context_index::embed::is_configured_model_available().await
         };
 
         if backend_available {
-            // Use override embedder if provided else configured ollama embedder
             let embedder: Arc<dyn Embedder> = if let Some(e) = override_embedder {
                 e
             } else {
                 Arc::new(context_index::embed::configured_embedder())
             };
-            // Open DB for vector sync
             match structural_store::open_db(root.path()) {
                 Ok(mut conn) => {
-                    // Sync missing vectors for current fingerprint (handles initial, no-change, one-file, partial)
-                    // We use root-aware sync which reads file contents for missing hashes
                     match context_index::vector::sync_missing_vectors_for_root(
                         &mut conn,
                         root.path(),
@@ -201,10 +201,8 @@ impl ContextService {
                         }
                         Err(e) => {
                             tracing::warn!(error=%e, "semantic sync failed, structural still ok");
-                            // keep ready false, missing truthful
                         }
                     }
-                    // Also ensure orphan GC after sync (sync_missing already does, but for delete case where no missing, still need GC)
                     let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
                 }
                 Err(e) => {
@@ -227,10 +225,105 @@ impl ContextService {
         })
     }
 
-    /// Cheap reconcile — discovery + incremental structural/BM25 + semantic if available.
+    async fn reconcile_fast_inner(
+        &self,
+        override_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Result<ReconcileStats, ContextError> {
+        let _guard = self.build_lock.lock().await;
+        let t0 = std::time::Instant::now();
+        let root = ProjectRoot::resolve(Some(&self.root))
+            .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
+        let idx =
+            ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
+        let root_path = root.path().to_path_buf();
+        let idx_clone = idx.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let si = context_index::structural::StructuralIndex::for_path(root_path);
+            si.build_with_delta(&idx_clone)
+        })
+        .await
+        .map_err(|e| ContextError::Internal(format!("structural build panicked: {e}")))?
+        .map_err(|e| ContextError::Internal(format!("structural build failed: {e}")))?;
+
+        let mut vectors_created = 0usize;
+        let mut vectors_reused = 0usize;
+        let mut embedding_calls = 0usize;
+
+        let fingerprint = if let Some(ref emb) = override_embedder {
+            emb.fingerprint()
+        } else {
+            context_index::embed::configured_fingerprint()
+        };
+        let backend_available = if override_embedder.is_some() {
+            true
+        } else {
+            context_index::embed::is_configured_model_available().await
+        };
+
+        if backend_available {
+            let embedder: Arc<dyn Embedder> = if let Some(e) = override_embedder {
+                e
+            } else {
+                Arc::new(context_index::embed::configured_embedder())
+            };
+            match structural_store::open_db(root.path()) {
+                Ok(mut conn) => {
+                    // Fast path: only incremental when previously ready and small delta
+                    let eligible = context_index::vector::eligible_chunk_count(&conn).unwrap_or(0);
+                    let missing_before = context_index::vector::missing_vector_count(&conn, &fingerprint).unwrap_or(0);
+                    let is_ready_before = eligible > 0 && missing_before == 0;
+                    let small_delta = outcome.changed_files.len() <= 10 && outcome.deleted_files.len() <= 10;
+                    if is_ready_before && small_delta && !outcome.changed_files.is_empty() {
+                        match context_index::vector::sync_changed_files_vectors(
+                            &mut conn,
+                            root.path(),
+                            &outcome.changed_files,
+                            embedder.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok((reused, embedded, calls)) => {
+                                vectors_reused = reused;
+                                vectors_created = embedded;
+                                embedding_calls = calls;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error=%e, "incremental semantic sync failed");
+                            }
+                        }
+                    } else {
+                        // Cold or no-change or large delta: do not full backfill, just GC if deleted
+                        if !outcome.deleted_files.is_empty() {
+                            let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
+                        }
+                    }
+                    // Ensure GC for deleted files even when skipping embedding
+                    if !outcome.deleted_files.is_empty() {
+                        let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error=%e, "open_db for fast semantic sync failed");
+                }
+            }
+        }
+
+        let elapsed = t0.elapsed().as_millis();
+        Ok(ReconcileStats {
+            discovered: idx.stats.discovered,
+            changed_files: outcome.changed_files.len(),
+            deleted_files: outcome.deleted_files.len(),
+            elapsed_ms: elapsed,
+            vectors_created,
+            vectors_reused,
+            embedding_calls,
+        })
+    }
+
+    /// Cheap reconcile — discovery + incremental structural/BM25 + semantic if available (fast, incremental only).
     /// Target <100ms for no-change. Serialized to avoid concurrent SQLite writes.
     pub async fn reconcile(&self) -> Result<ReconcileStats, ContextError> {
-        self.reconcile_inner(None).await
+        self.reconcile_fast_inner(None).await
     }
 
     #[cfg(test)]
@@ -241,12 +334,24 @@ impl ContextService {
         self.reconcile_inner(Some(embedder)).await
     }
 
+    pub async fn full_semantic_index(&self) -> Result<ReconcileStats, ContextError> {
+        self.reconcile_full_inner(None).await
+    }
+
+    #[cfg(test)]
+    pub async fn full_semantic_index_with_embedder(
+        &self,
+        embedder: std::sync::Arc<dyn context_index::embed::Embedder>,
+    ) -> Result<ReconcileStats, ContextError> {
+        self.reconcile_full_inner(Some(embedder)).await
+    }
+
     pub async fn search(
         &self,
         query: &str,
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
-        self.reconcile()
+        self.reconcile_fast_inner(None)
             .await
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
         let root = ProjectRoot::resolve(Some(&self.root))
@@ -673,5 +778,88 @@ mod tests {
         let out3 = si.build_with_delta(&idx3).unwrap();
         assert_eq!(out3.changed_files.len(), 0);
         assert_eq!(out3.deleted_files, vec!["a.py".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cold_search_does_not_full_backfill() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        for i in 0..16 {
+            std::fs::write(root.join(format!("f{i}.py")), format!("def foo_{i}():\n    x={i}\n").as_bytes()).unwrap();
+        }
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        // Use fast reconcile with counting fake (should embed 0 for cold)
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        struct CountingFake2 {
+            inner: context_index::embed::FakeEmbedder,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl context_index::embed::Embedder for CountingFake2 {
+            fn model_id(&self) -> &str { self.inner.model_id() }
+            fn dimension(&self) -> usize { self.inner.dimension() }
+            fn version(&self) -> &str { self.inner.version() }
+            async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> { self.inner.embed_query(q).await }
+            async fn embed_documents(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.embed_documents(texts).await
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fake = Arc::new(CountingFake2 { inner: context_index::embed::FakeEmbedder::new("cold-test", 8), calls: calls.clone() });
+        // fast reconcile should NOT embed all 16 (cold)
+        let stats = svc.reconcile_fast_inner(Some(fake.clone())).await.unwrap();
+        assert_eq!(stats.vectors_created, 0, "cold fast reconcile should embed 0");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // status should be not ready
+        let conn = context_index::structural::store::open_db(&root).unwrap();
+        let fp = fake.fingerprint();
+        assert!(!context_index::vector::is_semantic_ready(&conn, &fp, true).unwrap());
+        assert!(context_index::vector::missing_vector_count(&conn, &fp).unwrap() > 0);
+        // lexical search should still succeed
+        let res = svc.search("foo_0", crate::service::SearchOptions::default()).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn explicit_full_semantic_index_covers_all() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        for i in 0..8 {
+            std::fs::write(root.join(format!("a{i}.py")), format!("def bar_{i}():\n    y={i}\n").as_bytes()).unwrap();
+        }
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let fake = Arc::new(context_index::embed::FakeEmbedder::new("explicit-test", 8));
+        let stats = svc.full_semantic_index_with_embedder(fake.clone()).await.unwrap();
+        assert!(stats.vectors_created > 0);
+        let conn = context_index::structural::store::open_db(&root).unwrap();
+        let fp = fake.fingerprint();
+        assert_eq!(context_index::vector::missing_vector_count(&conn, &fp).unwrap(), 0);
+        assert!(context_index::vector::is_semantic_ready(&conn, &fp, true).unwrap());
+    }
+
+    #[tokio::test]
+    async fn incremental_one_file_change_only_that_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("a.py"), b"def foo():\n    x=1\n").unwrap();
+        std::fs::write(root.join("b.py"), b"def bar():\n    y=2\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let fake = Arc::new(context_index::embed::FakeEmbedder::new("inc-test", 8));
+        // first full
+        svc.full_semantic_index_with_embedder(fake.clone()).await.unwrap();
+        // change one file
+        std::fs::write(root.join("a.py"), b"def foo():\n    x=999\n").unwrap();
+        // fast reconcile should embed only changed file
+        let stats = svc.reconcile_fast_inner(Some(fake.clone())).await.unwrap();
+        assert_eq!(stats.changed_files, 1);
+        assert_eq!(stats.vectors_created, 1, "only changed chunk");
+        // no-change after
+        let stats2 = svc.reconcile_fast_inner(Some(fake.clone())).await.unwrap();
+        assert_eq!(stats2.changed_files, 0);
+        assert_eq!(stats2.vectors_created, 0);
     }
 }

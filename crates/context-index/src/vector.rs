@@ -232,6 +232,16 @@ pub async fn sync_missing_vectors_for_root(
     root: &std::path::Path,
     embedder: &dyn Embedder,
 ) -> Result<(usize, usize, usize, usize)> {
+    sync_missing_vectors_for_root_with_batch_size(conn, root, embedder, 256).await
+}
+
+/// Testable helper with explicit batch_size (production 256, tests use 8).
+pub async fn sync_missing_vectors_for_root_with_batch_size(
+    conn: &mut Connection,
+    root: &std::path::Path,
+    embedder: &dyn Embedder,
+    batch_size: usize,
+) -> Result<(usize, usize, usize, usize)> {
     ensure_vector_schema(conn)?;
     let fp = embedder.fingerprint();
     let _ = delete_stale_vectors(conn, &fp)?;
@@ -272,7 +282,7 @@ pub async fn sync_missing_vectors_for_root(
     let mut hashes: Vec<String> = by_hash.keys().cloned().collect();
     hashes.sort();
     // Prepare texts batching
-    let batch_size = 256usize; // ponytail: larger batch for Ollama throughput, still bounded
+    let batch_size = batch_size;
     let mut total_embedded = 0usize;
     let mut total_calls = 0usize;
     let mut file_cache: std::collections::HashMap<String, String> =
@@ -320,6 +330,69 @@ pub async fn sync_missing_vectors_for_root(
     // GC orphaned after sync (clean stale from deleted files)
     let _ = gc_orphaned_vectors(conn, &fp);
     Ok((reused, total_embedded, total_calls, total_embedded))
+}
+
+/// Load chunks for a file (for incremental sync).
+pub fn load_chunks_for_file(conn: &Connection, file: &str) -> Result<Vec<Chunk>> {
+    ensure_vector_schema(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes FROM chunks WHERE file=?1 ORDER BY start_line, start_byte",
+    )?;
+    let rows = stmt.query_map(params![file], |row| {
+        Ok(Chunk {
+            id: row.get(0)?,
+            file: row.get(1)?,
+            language: crate::structural::language::Language::from_str(&row.get::<_, String>(2)?),
+            start_line: row.get::<_, i64>(3)? as u32,
+            end_line: row.get::<_, i64>(4)? as u32,
+            start_byte: row.get::<_, i64>(5)? as usize,
+            end_byte: row.get::<_, i64>(6)? as usize,
+            parent_symbol: row.get(7)?,
+            content_hash: row.get(8)?,
+            text_size_bytes: row.get::<_, i64>(9)? as usize,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Incremental sync for changed files only (fast, uses changed_files delta).
+/// Returns (reused, embedded, calls).
+pub async fn sync_changed_files_vectors(
+    conn: &mut Connection,
+    root: &std::path::Path,
+    changed_files: &[String],
+    embedder: &dyn Embedder,
+) -> Result<(usize, usize, usize)> {
+    if changed_files.is_empty() {
+        return Ok((0, 0, 0));
+    }
+    let fp = embedder.fingerprint();
+    // delete stale for this fingerprint first
+    let _ = delete_stale_vectors(conn, &fp)?;
+    let mut total_reused = 0usize;
+    let mut total_embedded = 0usize;
+    let mut total_calls = 0usize;
+    for file in changed_files {
+        let chunks = match load_chunks_for_file(conn, file) {
+            Ok(c) if !c.is_empty() => c,
+            _ => continue,
+        };
+        let abs = root.join(file);
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        let (reused, embedded) = sync_vectors_for_file(conn, file, &chunks, &content, embedder).await?;
+        total_reused += reused;
+        total_embedded += embedded;
+        if embedded > 0 {
+            total_calls += 1;
+        }
+    }
+    // GC orphaned after incremental (handles deleted files if caller also calls GC)
+    let _ = gc_orphaned_vectors(conn, &fp);
+    Ok((total_reused, total_embedded, total_calls))
 }
 
 /// Conservative orphan GC: delete vectors whose content_hash is not referenced by any current chunk
@@ -1141,8 +1214,9 @@ mod tests {
         let tmp = tempfile::TempDir::new()?;
         let root = tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join(".git"))?;
-        // create many files to exceed batch size 64 (2 batches)
-        for i in 0..70 {
+        // Use small batch size 8 to test batch-independent partial failure
+        // 16 docs -> 2 batches of 8
+        for i in 0..16 {
             let content = format!("def foo_{}():\n    x = {}\n", i, i);
             std::fs::write(root.join(format!("f{}.py", i)), content.as_bytes())?;
         }
@@ -1153,32 +1227,38 @@ mod tests {
         let mut conn = crate::structural::store::open_db(&root)?;
         let calls = Arc::new(AtomicUsize::new(0));
         let ff = FailingFake::new("j-model", 8, 2, calls.clone());
-        let res = crate::vector::sync_missing_vectors_for_root(&mut conn, &root, &ff).await;
+        let res = crate::vector::sync_missing_vectors_for_root_with_batch_size(
+            &mut conn, &root, &ff, 8,
+        )
+        .await;
         assert!(res.is_err(), "second batch should fail");
-        // first batch 64 should have persisted
+        // first batch 8 should have persisted
         let fp = ff.fingerprint();
         let cnt = count_vectors(&conn, &fp)? as usize;
         assert_eq!(
-            cnt, 64,
+            cnt, 8,
             "first batch persisted despite second failure, got {}",
             cnt
         );
         let missing = missing_vector_count(&conn, &fp)?;
-        assert_eq!(missing, 6, "remaining missing should be 6, got {}", missing);
+        assert_eq!(missing, 8, "remaining missing should be 8, got {}", missing);
         assert!(!is_semantic_ready(&conn, &fp, true)?);
-        // retry with good embedder should embed only remaining 6
+        // retry with good embedder should embed only remaining 8
         let calls2 = Arc::new(AtomicUsize::new(0));
         let docs2 = Arc::new(AtomicUsize::new(0));
         let cf = CountingFake::new("j-model", 8, calls2.clone(), docs2.clone());
         let (reused, embedded, calls_n, _docs) =
-            crate::vector::sync_missing_vectors_for_root(&mut conn, &root, &cf).await?;
+            crate::vector::sync_missing_vectors_for_root_with_batch_size(
+                &mut conn, &root, &cf, 8,
+            )
+            .await?;
         assert_eq!(
-            embedded, 6,
-            "retry should embed only missing 6, got {}",
+            embedded, 8,
+            "retry should embed only missing 8, got {}",
             embedded
         );
         assert_eq!(calls_n, 1);
-        assert_eq!(reused, 64);
+        assert_eq!(reused, 8);
         assert_eq!(missing_vector_count(&conn, &fp)?, 0);
         assert!(is_semantic_ready(&conn, &fp, true)?);
         Ok(())

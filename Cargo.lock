@@ -351,6 +351,7 @@ name = "contextd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "context-core",
  "context-index",
