@@ -57,6 +57,12 @@ pub enum Command {
     Status,
     /// Run MCP stdio server (long-lived)
     Mcp,
+    /// Build or update index (use --semantic for full vector backfill)
+    Index {
+        /// Also build full semantic vectors (explicit, may take minutes for large repos)
+        #[arg(long)]
+        semantic: bool,
+    },
 }
 
 fn opts(cli: &Cli) -> SearchOptions {
@@ -262,9 +268,18 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("symbols: {}", st.symbols);
                 println!("BM25 documents: {}", st.bm25_documents);
                 println!("vectors: {}", st.vector_count);
+                println!("eligible chunks: {}", st.eligible_chunk_count);
+                println!("missing vectors: {}", st.missing_vector_count);
+                println!("stale vectors: {}", st.stale_vector_count);
                 println!("embedding model: {}", st.embedding_model);
+                println!("embedding dimension: {}", st.embedding_dimension);
                 println!("embedding runtime: {}", st.embedding_runtime);
                 println!("semantic available: {}", st.semantic_available);
+                println!(
+                    "semantic backend available: {}",
+                    st.semantic_backend_available
+                );
+                println!("semantic index ready: {}", st.semantic_index_ready);
                 println!("watcher: {}", st.watcher_state);
                 if let Some(g) = st.index_generation {
                     println!("generation: {}", g);
@@ -272,6 +287,47 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 if let Some(v) = st.store_schema_version {
                     println!("schema version: {}", v);
                 }
+            }
+        }
+        Some(Command::Index { semantic }) => {
+            let svc = ContextService::new(root).await?;
+            let stats = if semantic {
+                svc.full_semantic_index().await?
+            } else {
+                svc.reconcile().await?
+            };
+            if is_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "discovered": stats.discovered,
+                        "changed_files": stats.changed_files,
+                        "deleted_files": stats.deleted_files,
+                        "vectors_created": stats.vectors_created,
+                        "vectors_reused": stats.vectors_reused,
+                        "embedding_calls": stats.embedding_calls,
+                        "elapsed_ms": stats.elapsed_ms,
+                    }))?
+                );
+            } else {
+                println!(
+                    "reconcile: discovered {} changed {} deleted {} vectors_created {} reused {} calls {} elapsed {}ms",
+                    stats.discovered,
+                    stats.changed_files,
+                    stats.deleted_files,
+                    stats.vectors_created,
+                    stats.vectors_reused,
+                    stats.embedding_calls,
+                    stats.elapsed_ms
+                );
+                let st = svc.status().await?;
+                println!(
+                    "status: ready {} missing {} eligible {} vectors {}",
+                    st.semantic_index_ready,
+                    st.missing_vector_count,
+                    st.eligible_chunk_count,
+                    st.vector_count
+                );
             }
         }
         None => {

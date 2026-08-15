@@ -107,10 +107,15 @@ pub fn get_vector(
 ) -> Result<Option<Vec<f32>>> {
     ensure_vector_schema(conn)?;
     let mut stmt = conn.prepare(
-        "SELECT vector, dimension FROM vectors WHERE content_hash=?1 AND model_id=?2 AND version=?3",
+        "SELECT vector, dimension FROM vectors WHERE content_hash=?1 AND model_id=?2 AND version=?3 AND dimension=?4",
     )?;
     let row = stmt.query_row(
-        params![content_hash, fingerprint.model_id, fingerprint.version],
+        params![
+            content_hash,
+            fingerprint.model_id,
+            fingerprint.version,
+            fingerprint.dimension as i64
+        ],
         |r| {
             let blob: Vec<u8> = r.get(0)?;
             let dim: i64 = r.get(1)?;
@@ -127,8 +132,12 @@ pub fn get_vector(
 pub fn count_vectors(conn: &Connection, fingerprint: &ModelFingerprint) -> Result<i64> {
     ensure_vector_schema(conn)?;
     Ok(conn.query_row(
-        "SELECT COUNT(*) FROM vectors WHERE model_id=?1 AND version=?2",
-        params![fingerprint.model_id, fingerprint.version],
+        "SELECT COUNT(*) FROM vectors WHERE model_id=?1 AND version=?2 AND dimension=?3",
+        params![
+            fingerprint.model_id,
+            fingerprint.version,
+            fingerprint.dimension as i64
+        ],
         |r| r.get(0),
     )?)
 }
@@ -137,12 +146,14 @@ pub fn count_vectors(conn: &Connection, fingerprint: &ModelFingerprint) -> Resul
 /// Old vectors must not be silently reused.
 pub fn invalidate_stale_model(conn: &Connection, fingerprint: &ModelFingerprint) -> Result<usize> {
     ensure_vector_schema(conn)?;
-    // If dimension or version changed, old entries have different version/dimension, but we keep them? Spec says old vectors must not be reused when model id/version/dim changes.
-    // Our get_vector already keys on version, so old version won't be returned. But to avoid disk bloat, we could delete old versions.
-    // For now, just report count of stale (different version) — caller can delete if needed.
+    // Count stale: same model but version or dimension differs (must not be reused)
     let cnt: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM vectors WHERE model_id=?1 AND version!=?2",
-        params![fingerprint.model_id, fingerprint.version],
+        "SELECT COUNT(*) FROM vectors WHERE model_id=?1 AND (version!=?2 OR dimension!=?3)",
+        params![
+            fingerprint.model_id,
+            fingerprint.version,
+            fingerprint.dimension as i64
+        ],
         |r| r.get(0),
     )?;
     Ok(cnt as usize)
@@ -151,9 +162,237 @@ pub fn invalidate_stale_model(conn: &Connection, fingerprint: &ModelFingerprint)
 pub fn delete_stale_vectors(conn: &Connection, fingerprint: &ModelFingerprint) -> Result<usize> {
     ensure_vector_schema(conn)?;
     Ok(conn.execute(
-        "DELETE FROM vectors WHERE model_id=?1 AND version!=?2",
-        params![fingerprint.model_id, fingerprint.version],
+        "DELETE FROM vectors WHERE model_id=?1 AND (version!=?2 OR dimension!=?3)",
+        params![
+            fingerprint.model_id,
+            fingerprint.version,
+            fingerprint.dimension as i64
+        ],
     )?)
+}
+
+/// Eligible unique chunk hashes (distinct content_hash from current chunks).
+pub fn eligible_chunk_count(conn: &Connection) -> Result<usize> {
+    ensure_vector_schema(conn)?;
+    let cnt: i64 = conn.query_row("SELECT COUNT(DISTINCT content_hash) FROM chunks", [], |r| {
+        r.get(0)
+    })?;
+    Ok(cnt as usize)
+}
+
+/// Vector count for fingerprint (distinct content_hash, primary key ensures distinct).
+pub fn vector_count_for(conn: &Connection, fingerprint: &ModelFingerprint) -> Result<usize> {
+    Ok(count_vectors(conn, fingerprint)? as usize)
+}
+
+/// Missing vectors for fingerprint: eligible distinct - present distinct (via LEFT JOIN for accuracy).
+pub fn missing_vector_count(conn: &Connection, fingerprint: &ModelFingerprint) -> Result<usize> {
+    ensure_vector_schema(conn)?;
+    let cnt: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT c.content_hash) FROM chunks c LEFT JOIN vectors v ON v.content_hash=c.content_hash AND v.model_id=?1 AND v.version=?2 AND v.dimension=?3 WHERE v.content_hash IS NULL",
+        params![fingerprint.model_id, fingerprint.version, fingerprint.dimension as i64],
+        |r| r.get(0),
+    )?;
+    Ok(cnt as usize)
+}
+
+/// Stale vector count (same model, version or dimension mismatch).
+pub fn stale_vector_count(conn: &Connection, fingerprint: &ModelFingerprint) -> Result<usize> {
+    invalidate_stale_model(conn, fingerprint)
+}
+
+/// Whether semantic index is ready: backend available && missing==0 && eligible>0
+pub fn is_semantic_ready(
+    conn: &Connection,
+    fingerprint: &ModelFingerprint,
+    backend_available: bool,
+) -> Result<bool> {
+    if !backend_available {
+        return Ok(false);
+    }
+    let eligible = eligible_chunk_count(conn)?;
+    if eligible == 0 {
+        return Ok(false);
+    }
+    let missing = missing_vector_count(conn, fingerprint)?;
+    Ok(missing == 0)
+}
+
+/// Legacy wrapper — prefers CWD; use sync_missing_vectors_for_root if root known.
+pub async fn sync_missing_vectors(
+    conn: &mut Connection,
+    embedder: &dyn Embedder,
+) -> Result<(usize, usize, usize, usize)> {
+    sync_missing_vectors_for_root(conn, std::path::Path::new("."), embedder).await
+}
+
+/// Root-aware variant for production (preferred): caller provides root for file reads.
+pub async fn sync_missing_vectors_for_root(
+    conn: &mut Connection,
+    root: &std::path::Path,
+    embedder: &dyn Embedder,
+) -> Result<(usize, usize, usize, usize)> {
+    sync_missing_vectors_for_root_with_batch_size(conn, root, embedder, 256).await
+}
+
+/// Testable helper with explicit batch_size (production 256, tests use 8).
+pub async fn sync_missing_vectors_for_root_with_batch_size(
+    conn: &mut Connection,
+    root: &std::path::Path,
+    embedder: &dyn Embedder,
+    batch_size: usize,
+) -> Result<(usize, usize, usize, usize)> {
+    ensure_vector_schema(conn)?;
+    let fp = embedder.fingerprint();
+    let _ = delete_stale_vectors(conn, &fp)?;
+
+    let by_hash: std::collections::HashMap<String, (String, usize, usize, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT c.content_hash, c.file, c.start_byte, c.end_byte, c.parent_symbol FROM chunks c LEFT JOIN vectors v ON v.content_hash=c.content_hash AND v.model_id=?1 AND v.version=?2 AND v.dimension=?3 WHERE v.content_hash IS NULL ORDER BY c.file, c.start_byte",
+        )?;
+        let rows = stmt.query_map(
+            params![fp.model_id, fp.version, fp.dimension as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get::<_, i64>(3)? as usize,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )?;
+        let mut map: std::collections::HashMap<String, (String, usize, usize, Option<String>)> =
+            std::collections::HashMap::new();
+        for r in rows {
+            let (hash, file, sb, eb, sym) = r?;
+            map.entry(hash).or_insert((file, sb, eb, sym));
+        }
+        map
+    };
+    if by_hash.is_empty() {
+        // eligible distinct count for reused
+        let eligible = eligible_chunk_count(conn)?;
+        return Ok((eligible, 0, 0, 0));
+    }
+    let eligible = eligible_chunk_count(conn)?;
+    let missing_distinct = by_hash.len();
+    let reused = eligible.saturating_sub(missing_distinct);
+
+    let mut hashes: Vec<String> = by_hash.keys().cloned().collect();
+    hashes.sort();
+    // Prepare texts batching
+    let mut total_embedded = 0usize;
+    let mut total_calls = 0usize;
+    let mut file_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    // Build all missing entries with combined text
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(missing_distinct);
+    for hash in hashes {
+        let (file, sb, eb, sym) = by_hash.get(&hash).unwrap();
+        let content = if let Some(c) = file_cache.get(file) {
+            c.clone()
+        } else {
+            let abs = root.join(file);
+            let c = std::fs::read_to_string(&abs).unwrap_or_default();
+            file_cache.insert(file.clone(), c.clone());
+            c
+        };
+        let bytes = content.as_bytes();
+        let slice = if *sb < bytes.len() && *eb <= bytes.len() {
+            std::str::from_utf8(&bytes[*sb..*eb])
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
+        let combined = if let Some(sym) = sym {
+            format!("{} {}\n{}", file, sym, slice)
+        } else {
+            format!("{} {}", file, slice)
+        };
+        entries.push((hash.clone(), combined));
+    }
+
+    // Batch embed with persistence per batch for partial failure handling
+    for chunk in entries.chunks(batch_size) {
+        let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
+        let hashes_chunk: Vec<String> = chunk.iter().map(|(h, _)| h.clone()).collect();
+        total_calls += 1;
+        let vectors = embedder.embed_documents(&texts).await?;
+        for (hash, vec) in hashes_chunk.into_iter().zip(vectors) {
+            upsert_vector(conn, &hash, &fp, &vec)?;
+            total_embedded += 1;
+        }
+    }
+    // GC orphaned after sync (clean stale from deleted files)
+    let _ = gc_orphaned_vectors(conn, &fp);
+    Ok((reused, total_embedded, total_calls, total_embedded))
+}
+
+/// Load chunks for a file (for incremental sync).
+pub fn load_chunks_for_file(conn: &Connection, file: &str) -> Result<Vec<Chunk>> {
+    ensure_vector_schema(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes FROM chunks WHERE file=?1 ORDER BY start_line, start_byte",
+    )?;
+    let rows = stmt.query_map(params![file], |row| {
+        Ok(Chunk {
+            id: row.get(0)?,
+            file: row.get(1)?,
+            language: crate::structural::language::Language::from_str(&row.get::<_, String>(2)?),
+            start_line: row.get::<_, i64>(3)? as u32,
+            end_line: row.get::<_, i64>(4)? as u32,
+            start_byte: row.get::<_, i64>(5)? as usize,
+            end_byte: row.get::<_, i64>(6)? as usize,
+            parent_symbol: row.get(7)?,
+            content_hash: row.get(8)?,
+            text_size_bytes: row.get::<_, i64>(9)? as usize,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Incremental sync for changed files only (fast, uses changed_files delta).
+/// Returns (reused, embedded, calls).
+pub async fn sync_changed_files_vectors(
+    conn: &mut Connection,
+    root: &std::path::Path,
+    changed_files: &[String],
+    embedder: &dyn Embedder,
+) -> Result<(usize, usize, usize)> {
+    if changed_files.is_empty() {
+        return Ok((0, 0, 0));
+    }
+    let fp = embedder.fingerprint();
+    // delete stale for this fingerprint first
+    let _ = delete_stale_vectors(conn, &fp)?;
+    let mut total_reused = 0usize;
+    let mut total_embedded = 0usize;
+    let mut total_calls = 0usize;
+    for file in changed_files {
+        let chunks = match load_chunks_for_file(conn, file) {
+            Ok(c) if !c.is_empty() => c,
+            _ => continue,
+        };
+        let abs = root.join(file);
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        let (reused, embedded) =
+            sync_vectors_for_file(conn, file, &chunks, &content, embedder).await?;
+        total_reused += reused;
+        total_embedded += embedded;
+        if embedded > 0 {
+            total_calls += 1;
+        }
+    }
+    // GC orphaned after incremental (handles deleted files if caller also calls GC)
+    let _ = gc_orphaned_vectors(conn, &fp);
+    Ok((total_reused, total_embedded, total_calls))
 }
 
 /// Conservative orphan GC: delete vectors whose content_hash is not referenced by any current chunk
@@ -162,10 +401,10 @@ pub fn delete_stale_vectors(conn: &Connection, fingerprint: &ModelFingerprint) -
 /// For rename/revert: if content reappears, it will be re-embedded (acceptable for bounded storage).
 pub fn gc_orphaned_vectors(conn: &Connection, fingerprint: &ModelFingerprint) -> Result<usize> {
     ensure_vector_schema(conn)?;
-    // Vectors whose hash not in any current chunk
+    // Vectors whose hash not in any current chunk (scoped to fingerprint exact match)
     Ok(conn.execute(
-        "DELETE FROM vectors WHERE model_id=?1 AND version=?2 AND content_hash NOT IN (SELECT content_hash FROM chunks)",
-        params![fingerprint.model_id, fingerprint.version],
+        "DELETE FROM vectors WHERE model_id=?1 AND version=?2 AND dimension=?3 AND content_hash NOT IN (SELECT content_hash FROM chunks)",
+        params![fingerprint.model_id, fingerprint.version, fingerprint.dimension as i64],
     )?)
 }
 
@@ -240,16 +479,23 @@ pub fn search_brute(
     limit: usize,
 ) -> Result<Vec<VectorCandidate>> {
     ensure_vector_schema(conn)?;
-    // Get all vectors for model
+    // Get all vectors for model (dimension must match)
     let mut stmt = conn.prepare(
-        "SELECT content_hash, vector, dimension FROM vectors WHERE model_id=?1 AND version=?2",
+        "SELECT content_hash, vector, dimension FROM vectors WHERE model_id=?1 AND version=?2 AND dimension=?3",
     )?;
-    let rows = stmt.query_map(params![fingerprint.model_id, fingerprint.version], |row| {
-        let hash: String = row.get(0)?;
-        let blob: Vec<u8> = row.get(1)?;
-        let dim: i64 = row.get(2)?;
-        Ok((hash, blob, dim as usize))
-    })?;
+    let rows = stmt.query_map(
+        params![
+            fingerprint.model_id,
+            fingerprint.version,
+            fingerprint.dimension as i64
+        ],
+        |row| {
+            let hash: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let dim: i64 = row.get(2)?;
+            Ok((hash, blob, dim as usize))
+        },
+    )?;
     let mut scored: Vec<(String, f32)> = Vec::new();
     for r in rows {
         let (hash, blob, dim) = r?;
@@ -266,14 +512,19 @@ pub fn search_brute(
         let s = cosine(query_vec, &vec);
         scored.push((hash, s));
     }
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Deterministic ordering: score desc, hash asc tie-breaker, then after mapping file/line/chunk_id
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     scored.truncate(limit * 2); // oversample before dedup via chunk mapping
                                 // Map content_hash -> chunk metadata (choose one chunk per hash, or multiple if same content appears elsewhere)
-                                // For now, pick first chunk per hash from chunks table
+                                // For now, pick first chunk per hash from chunks table with deterministic ordering
     let mut out = Vec::new();
     for (hash, score) in scored {
         let mut stmt2 = conn.prepare(
-            "SELECT id, file, start_line, end_line, parent_symbol, content_hash FROM chunks WHERE content_hash=?1 LIMIT 5",
+            "SELECT id, file, start_line, end_line, parent_symbol, content_hash FROM chunks WHERE content_hash=?1 ORDER BY file ASC, start_line ASC, id ASC LIMIT 5",
         )?;
         let chunk_rows = stmt2.query_map(params![hash], |row| {
             Ok((
@@ -304,6 +555,15 @@ pub fn search_brute(
             break;
         }
     }
+    // Final deterministic ordering for equal scores: score desc file asc start_line asc chunk_id asc
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.start_line.cmp(&b.start_line))
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
     out.truncate(limit);
     Ok(out)
 }
@@ -654,6 +914,418 @@ mod tests {
             "error should mention dimension mismatch"
         );
         assert_eq!(count_vectors(&conn, &fp)?, 0);
+        Ok(())
+    }
+
+    // ---- R5.1-C extended tests ----
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct CountingFake {
+        inner: FakeEmbedder,
+        calls: Arc<AtomicUsize>,
+        docs: Arc<AtomicUsize>,
+    }
+    impl CountingFake {
+        fn new(model: &str, dim: usize, calls: Arc<AtomicUsize>, docs: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: FakeEmbedder::new(model, dim),
+                calls,
+                docs,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::embed::Embedder for CountingFake {
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+        fn version(&self) -> &str {
+            self.inner.version()
+        }
+        async fn embed_query(&self, q: &str) -> Result<Vec<f32>> {
+            self.inner.embed_query(q).await
+        }
+        async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.docs.fetch_add(texts.len(), Ordering::SeqCst);
+            self.inner.embed_documents(texts).await
+        }
+    }
+
+    struct FailingFake {
+        inner: FakeEmbedder,
+        fail_on_call: usize,
+        calls: Arc<AtomicUsize>,
+    }
+    impl FailingFake {
+        fn new(model: &str, dim: usize, fail_on_call: usize, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: FakeEmbedder::new(model, dim),
+                fail_on_call,
+                calls,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::embed::Embedder for FailingFake {
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+        fn version(&self) -> &str {
+            self.inner.version()
+        }
+        async fn embed_query(&self, q: &str) -> Result<Vec<f32>> {
+            self.inner.embed_query(q).await
+        }
+        async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let cur = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if cur == self.fail_on_call {
+                anyhow::bail!("injected failure on call {}", cur);
+            }
+            self.inner.embed_documents(texts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn r5c_a_initial_and_b_no_change() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join("a.py"), b"def foo():\n    pass\n")?;
+        std::fs::write(root.join("b.py"), b"def bar():\n    pass\n")?;
+        let pr = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx = crate::discovery::ProjectIndex::discover(&pr)?;
+        let si = crate::structural::StructuralIndex::for_path(root.clone());
+        let out = si.build_with_delta(&idx)?;
+        assert!(out.changed_files.len() >= 2);
+        let mut conn = crate::structural::store::open_db(&root)?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let docs = Arc::new(AtomicUsize::new(0));
+        let cf = CountingFake::new("test-model", 8, calls.clone(), docs.clone());
+        let (reused, embedded, calls_n, _docs_n) =
+            crate::vector::sync_missing_vectors_for_root(&mut conn, &root, &cf).await?;
+        assert!(embedded > 0, "initial should embed");
+        assert_eq!(calls.load(Ordering::SeqCst), calls_n);
+        assert_eq!(eligible_chunk_count(&conn)?, (reused + embedded));
+        // B no-change: second call 0
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let docs2 = Arc::new(AtomicUsize::new(0));
+        let cf2 = CountingFake::new("test-model", 8, calls2.clone(), docs2.clone());
+        let (reused2, embedded2, calls_n2, _docs_n2) =
+            crate::vector::sync_missing_vectors_for_root(&mut conn, &root, &cf2).await?;
+        assert_eq!(embedded2, 0, "no-change embedded should be 0");
+        assert_eq!(calls_n2, 0, "no-change calls should be 0");
+        assert_eq!(calls2.load(Ordering::SeqCst), 0);
+        assert_eq!(missing_vector_count(&conn, &cf2.fingerprint())?, 0);
+        assert_eq!(reused2, reused + embedded);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r5c_c_one_file_change_only_missing() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        // a.py with two functions -> likely 2 chunks? plus b.py unchanged
+        std::fs::write(
+            root.join("a.py"),
+            b"def foo():\n    x=1\ndef bar():\n    y=2\n",
+        )?;
+        std::fs::write(root.join("b.py"), b"def baz():\n    z=3\n")?;
+        let pr = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx = crate::discovery::ProjectIndex::discover(&pr)?;
+        let si = crate::structural::StructuralIndex::for_path(root.clone());
+        si.build_with_delta(&idx)?;
+        let mut conn = crate::structural::store::open_db(&root)?;
+        let cf = FakeEmbedder::new("c-model", 8);
+        crate::vector::sync_missing_vectors_for_root(&mut conn, &root, &cf).await?;
+        let before_missing = missing_vector_count(&conn, &cf.fingerprint())?;
+        assert_eq!(before_missing, 0);
+        let eligible_before = eligible_chunk_count(&conn)?;
+        // edit one file: change foo body only
+        std::fs::write(
+            root.join("a.py"),
+            b"def foo():\n    x=999\ndef bar():\n    y=2\n",
+        )?;
+        let pr2 = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx2 = crate::discovery::ProjectIndex::discover(&pr2)?;
+        let out2 = si.build_with_delta(&idx2)?;
+        // Only a.py should be changed
+        assert!(out2.changed_files.contains(&"a.py".to_string()));
+        assert!(!out2.changed_files.contains(&"b.py".to_string()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let docs = Arc::new(AtomicUsize::new(0));
+        let cf2 = CountingFake::new("c-model", 8, calls.clone(), docs.clone());
+        let (reused, embedded, calls_n, _docs) =
+            crate::vector::sync_missing_vectors_for_root(&mut conn, &root, &cf2).await?;
+        // Only changed chunk embedded (1), others reused
+        assert_eq!(
+            embedded, 1,
+            "only changed hash should embed, got {}",
+            embedded
+        );
+        assert!(reused >= 1);
+        assert_eq!(calls_n, 1);
+        assert_eq!(docs.load(Ordering::SeqCst), 1);
+        assert_eq!(missing_vector_count(&conn, &cf2.fingerprint())?, 0);
+        let eligible_after = eligible_chunk_count(&conn)?;
+        // eligible may stay same (if chunk count same) but ensure reused+embedded == eligible_after
+        assert_eq!(reused + embedded, eligible_after);
+        assert_eq!(eligible_before, eligible_after);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r5c_d_delete_orphan_and_e_shared_preserved() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        // identical chunk content in two files
+        let same = b"def foo():\n    pass\n";
+        std::fs::write(root.join("a.py"), same)?;
+        std::fs::write(root.join("b.py"), same)?;
+        let pr = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx = crate::discovery::ProjectIndex::discover(&pr)?;
+        let si = crate::structural::StructuralIndex::for_path(root.clone());
+        si.build_with_delta(&idx)?;
+        let mut conn = crate::structural::store::open_db(&root)?;
+        let cf = FakeEmbedder::new("d-model", 4);
+        crate::vector::sync_missing_vectors_for_root(&mut conn, &root, &cf).await?;
+        let cnt_before = count_vectors(&conn, &cf.fingerprint())?;
+        // eligible distinct should be 1 (same chunk hash)
+        assert_eq!(cnt_before, 1);
+        // delete a.py
+        std::fs::remove_file(root.join("a.py"))?;
+        let pr2 = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx2 = crate::discovery::ProjectIndex::discover(&pr2)?;
+        let out = si.build_with_delta(&idx2)?;
+        assert!(out.deleted_files.contains(&"a.py".to_string()));
+        // GC should retain vector because b.py still has same hash
+        let conn2 = crate::structural::store::open_db(&root)?;
+        let _ = crate::vector::gc_orphaned_vectors(&conn2, &cf.fingerprint())?;
+        assert_eq!(
+            count_vectors(&conn2, &cf.fingerprint())?,
+            1,
+            "shared vector should be preserved"
+        );
+        // now delete b.py also
+        std::fs::remove_file(root.join("b.py"))?;
+        let pr3 = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx3 = crate::discovery::ProjectIndex::discover(&pr3)?;
+        let out3 = si.build_with_delta(&idx3)?;
+        assert!(out3.deleted_files.contains(&"b.py".to_string()));
+        let conn3 = crate::structural::store::open_db(&root)?;
+        let deleted = crate::vector::gc_orphaned_vectors(&conn3, &cf.fingerprint())?;
+        assert_eq!(deleted, 1, "orphan should be deleted");
+        assert_eq!(count_vectors(&conn3, &cf.fingerprint())?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r5c_f_model_mismatch_not_reused() -> Result<()> {
+        let mut conn = open_in_memory()?;
+        let e1 = FakeEmbedder::new("modelA", 4);
+        let fp1 = e1.fingerprint();
+        let chunk = Chunk {
+            id: "c1".to_string(),
+            file: "a.py".to_string(),
+            language: Language::Python,
+            start_line: 1,
+            end_line: 2,
+            start_byte: 0,
+            end_byte: 3,
+            parent_symbol: None,
+            content_hash: "h1".to_string(),
+            text_size_bytes: 3,
+        };
+        sync_vectors_for_file(&mut conn, "a.py", &[chunk.clone()], "abc", &e1).await?;
+        assert_eq!(count_vectors(&conn, &fp1)?, 1);
+        // Different model B with same hash should be considered missing (not reused)
+        let e2 = FakeEmbedder::new("modelB", 4);
+        let fp2 = e2.fingerprint();
+        assert_eq!(count_vectors(&conn, &fp2)?, 0);
+        assert_eq!(missing_vector_count(&conn, &fp2)?, 0); // no chunks in this in-mem without chunks table? but we inserted via sync? chunks not in chunks table, eligible 0, so missing 0. Instead test via get_vector
+        assert!(
+            get_vector(&conn, "h1", &fp2)?.is_none(),
+            "different model should not reuse"
+        );
+        // version mismatch
+        let fp_v2 = ModelFingerprint {
+            model_id: "modelA".to_string(),
+            version: "v2".to_string(),
+            dimension: 4,
+        };
+        assert!(get_vector(&conn, "h1", &fp_v2)?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r5c_g_dimension_mismatch_rejected() -> Result<()> {
+        let mut conn = open_in_memory()?;
+        let fp4 = ModelFingerprint {
+            model_id: "test".to_string(),
+            version: "v1".to_string(),
+            dimension: 4,
+        };
+        let fp8 = ModelFingerprint {
+            model_id: "test".to_string(),
+            version: "v1".to_string(),
+            dimension: 8,
+        };
+        // upsert 4-dim vector
+        let vec4 = vec![1.0, 2.0, 3.0, 4.0];
+        upsert_vector(&mut conn, "hash1", &fp4, &vec4)?;
+        assert_eq!(count_vectors(&conn, &fp4)?, 1);
+        assert_eq!(
+            count_vectors(&conn, &fp8)?,
+            0,
+            "dimension mismatch should not count"
+        );
+        assert!(
+            get_vector(&conn, "hash1", &fp8)?.is_none(),
+            "dimension mismatch should not reuse"
+        );
+        // missing should count as missing for fp8 if chunk exists
+        conn.execute(
+            "INSERT OR IGNORE INTO files (path, hash, language) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["a.py", "h", "python"],
+        )?;
+        conn.execute(
+            "INSERT INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params!["c1", "a.py", "python", 1, 2, 0, 3, Option::<String>::None, "hash1", 3],
+        )?;
+        // Now eligible 1, missing for fp8 should be 1 (since fp8 has no vector)
+        assert_eq!(missing_vector_count(&conn, &fp8)?, 1);
+        assert_eq!(missing_vector_count(&conn, &fp4)?, 0);
+        // stale should be 1 for fp8 (same model, dimension diff)
+        assert_eq!(stale_vector_count(&conn, &fp8)?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r5c_j_partial_failure_and_retry() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        // Use small batch size 8 to test batch-independent partial failure
+        // 16 docs -> 2 batches of 8
+        for i in 0..16 {
+            let content = format!("def foo_{}():\n    x = {}\n", i, i);
+            std::fs::write(root.join(format!("f{}.py", i)), content.as_bytes())?;
+        }
+        let pr = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx = crate::discovery::ProjectIndex::discover(&pr)?;
+        let si = crate::structural::StructuralIndex::for_path(root.clone());
+        si.build_with_delta(&idx)?;
+        let mut conn = crate::structural::store::open_db(&root)?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ff = FailingFake::new("j-model", 8, 2, calls.clone());
+        let res =
+            crate::vector::sync_missing_vectors_for_root_with_batch_size(&mut conn, &root, &ff, 8)
+                .await;
+        assert!(res.is_err(), "second batch should fail");
+        // first batch 8 should have persisted
+        let fp = ff.fingerprint();
+        let cnt = count_vectors(&conn, &fp)? as usize;
+        assert_eq!(
+            cnt, 8,
+            "first batch persisted despite second failure, got {}",
+            cnt
+        );
+        let missing = missing_vector_count(&conn, &fp)?;
+        assert_eq!(missing, 8, "remaining missing should be 8, got {}", missing);
+        assert!(!is_semantic_ready(&conn, &fp, true)?);
+        // retry with good embedder should embed only remaining 8
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let docs2 = Arc::new(AtomicUsize::new(0));
+        let cf = CountingFake::new("j-model", 8, calls2.clone(), docs2.clone());
+        let (reused, embedded, calls_n, _docs) =
+            crate::vector::sync_missing_vectors_for_root_with_batch_size(&mut conn, &root, &cf, 8)
+                .await?;
+        assert_eq!(
+            embedded, 8,
+            "retry should embed only missing 8, got {}",
+            embedded
+        );
+        assert_eq!(calls_n, 1);
+        assert_eq!(reused, 8);
+        assert_eq!(missing_vector_count(&conn, &fp)?, 0);
+        assert!(is_semantic_ready(&conn, &fp, true)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r5c_l_determinism_20x() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(
+            root.join("a.py"),
+            b"def alpha():\n    query semantic search test\n",
+        )?;
+        std::fs::write(
+            root.join("b.py"),
+            b"def beta():\n    query semantic search test\n",
+        )?;
+        std::fs::write(root.join("c.py"), b"def gamma():\n    different content\n")?;
+        let pr = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx = crate::discovery::ProjectIndex::discover(&pr)?;
+        let si = crate::structural::StructuralIndex::for_path(root.clone());
+        si.build_with_delta(&idx)?;
+        let mut conn = crate::structural::store::open_db(&root)?;
+        let cf = FakeEmbedder::new("det-model", 8);
+        crate::vector::sync_missing_vectors_for_root(&mut conn, &root, &cf).await?;
+        let qvec = cf.embed_query("query semantic search test").await?;
+        let fp = cf.fingerprint();
+        let first = crate::vector::search_brute(&conn, &qvec, &fp, 10)?;
+        for _ in 0..20 {
+            let next = crate::vector::search_brute(&conn, &qvec, &fp, 10)?;
+            assert_eq!(first.len(), next.len());
+            for (a, b) in first.iter().zip(next.iter()) {
+                assert_eq!(a.file, b.file);
+                assert_eq!(a.chunk_id, b.chunk_id);
+                assert_eq!(a.start_line, b.start_line);
+                assert!((a.score - b.score).abs() < 1e-6);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r5c_k_status_uses_configured_fingerprint() -> Result<()> {
+        // Verify configured_fingerprint reads env and vector counts are per fingerprint
+        let guard = std::sync::Mutex::new(());
+        let _g = guard.lock().unwrap();
+        let orig = std::env::var("CONTEXTD_EMBED_MODEL").ok();
+        std::env::set_var("CONTEXTD_EMBED_MODEL", "nomic-embed-text");
+        let fp = crate::embed::configured_fingerprint();
+        assert_eq!(fp.model_id, "nomic-embed-text");
+        assert_eq!(fp.dimension, 768);
+        assert_eq!(fp.version, "ollama-nomic-embed-text-v1");
+        // ensure different from all-minilm
+        std::env::set_var("CONTEXTD_EMBED_MODEL", "all-minilm");
+        let fp2 = crate::embed::configured_fingerprint();
+        assert_eq!(fp2.dimension, 384);
+        assert_ne!(fp.model_id, fp2.model_id);
+        // Vector count isolation: upsert for fp then count for other should be 0
+        let mut conn = open_in_memory()?;
+        let vec = vec![0.1f32; 768];
+        crate::vector::upsert_vector(&mut conn, "h", &fp, &vec)?;
+        assert_eq!(count_vectors(&conn, &fp)?, 1);
+        assert_eq!(count_vectors(&conn, &fp2)?, 0);
+        // restore
+        if let Some(v) = orig {
+            std::env::set_var("CONTEXTD_EMBED_MODEL", v);
+        } else {
+            std::env::remove_var("CONTEXTD_EMBED_MODEL");
+        }
         Ok(())
     }
 }
