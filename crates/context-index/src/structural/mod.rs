@@ -39,6 +39,14 @@ pub struct IndexStats {
     pub structural_generation: u64,
 }
 
+/// Result of structural reconcile exposing generic delta without semantic knowledge.
+#[derive(Debug, Clone, Default)]
+pub struct StructuralBuildOutcome {
+    pub stats: IndexStats,
+    pub changed_files: Vec<String>,
+    pub deleted_files: Vec<String>,
+}
+
 /// Structural indexer — owns incremental build logic.
 /// Uses hash-based reuse: unchanged hash → skip parse.
 /// Persistent store: SQLite at .context/index/structural.db, worktree-safe.
@@ -70,6 +78,11 @@ impl StructuralIndex {
     /// ProjectIndex respects .opencodeignore which hides crates for V2. Structural needs Rust.
     /// R4: incremental graph — no global rebuild on normal one-file change.
     pub fn build(&self, project: &ProjectIndex) -> Result<IndexStats> {
+        self.build_with_delta(project).map(|o| o.stats)
+    }
+
+    /// Build with generic delta (changed/deleted paths). Ollama-free, deterministic.
+    pub fn build_with_delta(&self, project: &ProjectIndex) -> Result<StructuralBuildOutcome> {
         let t0 = Instant::now();
         let mut conn = store::open_db(&self.root)?;
         let structural_files = collect_structural_files(&self.root, project);
@@ -215,7 +228,14 @@ impl StructuralIndex {
         }
 
         stats.elapsed_ms = t0.elapsed().as_millis();
-        Ok(stats)
+        // deterministic ordering for callers (semantic sync) and tests
+        changed_files.sort();
+        stale_files.sort();
+        Ok(StructuralBuildOutcome {
+            stats,
+            changed_files,
+            deleted_files: stale_files,
+        })
     }
 
     /// Single-file incremental update for watcher path.

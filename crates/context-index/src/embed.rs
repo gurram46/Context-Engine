@@ -48,14 +48,13 @@ pub trait Embedder: Send + Sync {
 /// Deterministic fake embedder for tests and fallback.
 /// Produces fixed vectors via blake3 hash, normalized.
 /// Not for quality benchmarking, but for incremental reuse and unit tests.
-#[cfg(test)]
+// ponytail: simple test helper, kept unconditional for cross-crate tests
 pub struct FakeEmbedder {
     model: String,
     dim: usize,
     version: String,
 }
 
-#[cfg(test)]
 impl FakeEmbedder {
     pub fn new(model: &str, dim: usize) -> Self {
         Self {
@@ -83,7 +82,6 @@ impl FakeEmbedder {
     }
 }
 
-#[cfg(test)]
 #[async_trait]
 impl Embedder for FakeEmbedder {
     fn model_id(&self) -> &str {
@@ -138,6 +136,102 @@ impl Embedder for SlowTestEmbedder {
         tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
         self.inner.embed_documents(texts).await
     }
+}
+
+/// Canonical configured model helpers — single source for indexing/query/status.
+/// CONTEXTD_EMBED_MODEL drives all; DO NOT hardcode elsewhere.
+pub fn configured_model_name() -> String {
+    std::env::var("CONTEXTD_EMBED_MODEL").unwrap_or_else(|_| "all-minilm".to_string())
+}
+
+pub fn configured_fingerprint() -> ModelFingerprint {
+    let model = configured_model_name();
+    match model.as_str() {
+        "all-minilm" => ModelFingerprint {
+            model_id: "all-minilm".to_string(),
+            version: "ollama-all-minilm-v1".to_string(),
+            dimension: 384,
+        },
+        "nomic-embed-text" => ModelFingerprint {
+            model_id: "nomic-embed-text".to_string(),
+            version: "ollama-nomic-embed-text-v1".to_string(),
+            dimension: 768,
+        },
+        other => ModelFingerprint {
+            model_id: other.to_string(),
+            version: format!("ollama-{}-v1", other),
+            dimension: 768,
+        },
+    }
+}
+
+pub fn configured_embedder() -> OllamaEmbedder {
+    let fp = configured_fingerprint();
+    OllamaEmbedder::with_model(&fp.model_id, fp.dimension)
+}
+
+/// Returns true if Ollama daemon reachable AND configured model is listed in /api/tags.
+/// If daemon exists but model absent, returns false (truthful unavailable).
+pub async fn is_configured_model_available() -> bool {
+    // honor semantic disable
+    if let Ok(v) = std::env::var("CONTEXTD_SEMANTIC_ENABLED") {
+        if v == "0" || v.to_lowercase() == "false" {
+            return false;
+        }
+    }
+    let fp = configured_fingerprint();
+    is_model_available(&fp.model_id).await
+}
+
+pub async fn is_model_available(model_id: &str) -> bool {
+    let ollama_host =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let url = format!("{}/api/tags", ollama_host.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_millis(800),
+        client.get(&url).send(),
+    )
+    .await
+    {
+        Ok(Ok(r)) if r.status().is_success() => r,
+        _ => return false,
+    };
+    // Parse tags JSON: {"models": [{"name":"all-minilm:latest", ...}]}
+    if let Ok(json) = resp.json::<serde_json::Value>().await {
+        if let Some(models) = json.get("models").and_then(|v| v.as_array()) {
+            for m in models {
+                if let Some(name) = m.get("name").and_then(|v| v.as_str()) {
+                    // name may contain tag suffix like ":latest" or digest
+                    let base = name.split(':').next().unwrap_or(name);
+                    if base == model_id
+                        || name == model_id
+                        || name.starts_with(&format!("{}:", model_id))
+                    {
+                        return true;
+                    }
+                }
+                if let Some(model) = m.get("model").and_then(|v| v.as_str()) {
+                    let base = model.split(':').next().unwrap_or(model);
+                    if base == model_id {
+                        return true;
+                    }
+                }
+            }
+            // If models array empty, but daemon reachable, we still consider model unavailable
+            return false;
+        }
+        // Some Ollama versions return empty or different shape but daemon reachable — if we expected a specific model, treat as unavailable
+        // However for backward compat: if tags endpoint succeeds but parsing fails, assume daemon reachable but can't verify model -> require model
+        return false;
+    }
+    false
 }
 
 /// Nomic via Ollama (historical baseline).

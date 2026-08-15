@@ -670,108 +670,102 @@ pub async fn retrieve_context(
 
     // Native vector retrieval — REAL semantic only, FakeEmbedder is test-only
     if run_semantic {
-        let t_sem = Instant::now();
-        // Production uses genuine Ollama embedding; Fake is test-only and never used here
-        // Selected winner from real benchmark: all-minilm (384d, Apache-2.0) beats nomic on R@1/MRR with lower memory/disk
-        let embedder: std::sync::Arc<dyn context_index::embed::Embedder> = {
-            let model =
-                std::env::var("CONTEXTD_EMBED_MODEL").unwrap_or_else(|_| "all-minilm".to_string());
-            if model == "nomic-embed-text" {
-                std::sync::Arc::new(context_index::embed::OllamaEmbedder::nomic())
-            } else if model == "all-minilm" {
-                std::sync::Arc::new(context_index::embed::OllamaEmbedder::with_model(
-                    "all-minilm",
-                    384,
-                ))
-            } else {
-                std::sync::Arc::new(context_index::embed::OllamaEmbedder::with_model(
-                    &model, 768,
-                ))
-            }
-        };
-        let fp = embedder.fingerprint();
-        // Check model change invalidation
-        let conn = structural_store::open_db_async(project.root.clone()).await?;
-        let _ = context_index::vector::invalidate_stale_model(&conn, &fp);
-        let semantic_queries: Vec<String> = if !plan.semantic_queries.is_empty() {
-            plan.semantic_queries.clone()
-        } else if classified.query_type == QueryType::Symbol
-            && suff == EvidenceSufficiency::Insufficient
-        {
-            vec![query.to_string()]
+        // respect semantic disable flag without changing ranking
+        let semantic_disabled = std::env::var("CONTEXTD_SEMANTIC_ENABLED")
+            .map(|v| v == "0" || v.to_lowercase() == "false")
+            .unwrap_or(false);
+        if semantic_disabled {
+            retrievers_used.push("rust-semantic:disabled".into());
+            semantic_ms = 0;
         } else {
-            vec![]
-        };
-        for sq in &semantic_queries {
-            let q = sq.clone();
-            // Embed query without holding DB connection (Connection is !Send)
-            let qvec = {
-                let cached = context_index::embed::QUERY_CACHE.get(&fp, &q).await;
-                if let Some(v) = cached {
-                    v
-                } else {
-                    match embedder.embed_query(&q).await {
-                        Ok(v) => {
-                            context_index::embed::QUERY_CACHE
-                                .insert(&fp, &q, v.clone())
-                                .await;
-                            v
-                        }
-                        Err(e) => {
-                            tracing::debug!(error=%e, "query embed failed");
-                            retrievers_used.push("rust-semantic:0".into());
-                            continue;
-                        }
-                    }
-                }
-            };
-            // Now open DB for brute search (moved off async executor thread)
+            let t_sem = Instant::now();
+            // Use canonical configured embedder/fingerprint (CONTEXTD_EMBED_MODEL drives both indexing and query)
+            let embedder: std::sync::Arc<dyn context_index::embed::Embedder> =
+                std::sync::Arc::new(context_index::embed::configured_embedder());
+            let fp = embedder.fingerprint();
+            // Check model change invalidation
             let conn = structural_store::open_db_async(project.root.clone()).await?;
-            let cnt = context_index::vector::count_vectors(&conn, &fp).unwrap_or(0);
-            if cnt == 0 {
-                tracing::debug!("no vectors for model {}, skipping semantic", fp.model_id);
-                retrievers_used.push(format!("rust-semantic:0:{}", fp.model_id));
-                continue;
-            }
-            match context_index::vector::search_brute(&conn, &qvec, &fp, 10) {
-                Ok(results) => {
-                    for (rank, vc) in results.into_iter().enumerate() {
-                        let text = load_file_snippet(&project.root, &vc.file, vc.start_line)
-                            .await
-                            .unwrap_or_else(|| {
-                                format!("{} {}", vc.file, vc.symbol.clone().unwrap_or_default())
-                            });
-                        let ev = Evidence {
-                            source: context_rank::types::RetrievalSource::Semantic,
-                            file: vc.file.clone(),
-                            start_line: Some(vc.start_line),
-                            end_line: Some(vc.end_line),
-                            symbol: vc.symbol.clone(),
-                            symbol_kind: None,
-                            text: Some(text),
-                            score: Some(vc.score),
-                            relation: Some(context_rank::types::EvidenceRelation::Unknown),
-                            authority_score: None,
-                            final_score: None,
-                            provenance: Some("rust:semantic".into()),
-                            metadata: None,
-                        };
-                        vector_candidates.push((ev, rank + 1, vc.score));
+            let _ = context_index::vector::invalidate_stale_model(&conn, &fp);
+            let semantic_queries: Vec<String> = if !plan.semantic_queries.is_empty() {
+                plan.semantic_queries.clone()
+            } else if classified.query_type == QueryType::Symbol
+                && suff == EvidenceSufficiency::Insufficient
+            {
+                vec![query.to_string()]
+            } else {
+                vec![]
+            };
+            for sq in &semantic_queries {
+                let q = sq.clone();
+                // Embed query without holding DB connection (Connection is !Send)
+                let qvec = {
+                    let cached = context_index::embed::QUERY_CACHE.get(&fp, &q).await;
+                    if let Some(v) = cached {
+                        v
+                    } else {
+                        match embedder.embed_query(&q).await {
+                            Ok(v) => {
+                                context_index::embed::QUERY_CACHE
+                                    .insert(&fp, &q, v.clone())
+                                    .await;
+                                v
+                            }
+                            Err(e) => {
+                                tracing::debug!(error=%e, "query embed failed");
+                                retrievers_used.push("rust-semantic:0".into());
+                                continue;
+                            }
+                        }
                     }
-                    retrievers_used.push(format!(
-                        "rust-semantic:{}:{}",
-                        q.chars().take(15).collect::<String>(),
-                        vector_candidates.len()
-                    ));
-                    break;
+                };
+                // Now open DB for brute search (moved off async executor thread)
+                let conn = structural_store::open_db_async(project.root.clone()).await?;
+                let cnt = context_index::vector::count_vectors(&conn, &fp).unwrap_or(0);
+                if cnt == 0 {
+                    tracing::debug!("no vectors for model {}, skipping semantic", fp.model_id);
+                    retrievers_used.push(format!("rust-semantic:0:{}", fp.model_id));
+                    continue;
                 }
-                Err(e) => {
-                    tracing::debug!(error=%e, "vector search failed");
-                    retrievers_used.push("rust-semantic:0".into());
+                match context_index::vector::search_brute(&conn, &qvec, &fp, 10) {
+                    Ok(results) => {
+                        for (rank, vc) in results.into_iter().enumerate() {
+                            let text = load_file_snippet(&project.root, &vc.file, vc.start_line)
+                                .await
+                                .unwrap_or_else(|| {
+                                    format!("{} {}", vc.file, vc.symbol.clone().unwrap_or_default())
+                                });
+                            let ev = Evidence {
+                                source: context_rank::types::RetrievalSource::Semantic,
+                                file: vc.file.clone(),
+                                start_line: Some(vc.start_line),
+                                end_line: Some(vc.end_line),
+                                symbol: vc.symbol.clone(),
+                                symbol_kind: None,
+                                text: Some(text),
+                                score: Some(vc.score),
+                                relation: Some(context_rank::types::EvidenceRelation::Unknown),
+                                authority_score: None,
+                                final_score: None,
+                                provenance: Some("rust:semantic".into()),
+                                metadata: None,
+                            };
+                            vector_candidates.push((ev, rank + 1, vc.score));
+                        }
+                        retrievers_used.push(format!(
+                            "rust-semantic:{}:{}",
+                            q.chars().take(15).collect::<String>(),
+                            vector_candidates.len()
+                        ));
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(error=%e, "vector search failed");
+                        retrievers_used.push("rust-semantic:0".into());
+                    }
                 }
             }
+            semantic_ms = t_sem.elapsed().as_millis();
         }
-        semantic_ms = t_sem.elapsed().as_millis();
     } else {
         retrievers_used.push("rust-semantic:skipped".into());
     }

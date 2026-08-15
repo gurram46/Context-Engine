@@ -262,9 +262,18 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("symbols: {}", st.symbols);
                 println!("BM25 documents: {}", st.bm25_documents);
                 println!("vectors: {}", st.vector_count);
+                println!("eligible chunks: {}", st.eligible_chunk_count);
+                println!("missing vectors: {}", st.missing_vector_count);
+                println!("stale vectors: {}", st.stale_vector_count);
                 println!("embedding model: {}", st.embedding_model);
+                println!("embedding dimension: {}", st.embedding_dimension);
                 println!("embedding runtime: {}", st.embedding_runtime);
                 println!("semantic available: {}", st.semantic_available);
+                println!(
+                    "semantic backend available: {}",
+                    st.semantic_backend_available
+                );
+                println!("semantic index ready: {}", st.semantic_index_ready);
                 println!("watcher: {}", st.watcher_state);
                 if let Some(g) = st.index_generation {
                     println!("generation: {}", g);
