@@ -282,7 +282,6 @@ pub async fn sync_missing_vectors_for_root_with_batch_size(
     let mut hashes: Vec<String> = by_hash.keys().cloned().collect();
     hashes.sort();
     // Prepare texts batching
-    let batch_size = batch_size;
     let mut total_embedded = 0usize;
     let mut total_calls = 0usize;
     let mut file_cache: std::collections::HashMap<String, String> =
@@ -383,7 +382,8 @@ pub async fn sync_changed_files_vectors(
         };
         let abs = root.join(file);
         let content = std::fs::read_to_string(&abs).unwrap_or_default();
-        let (reused, embedded) = sync_vectors_for_file(conn, file, &chunks, &content, embedder).await?;
+        let (reused, embedded) =
+            sync_vectors_for_file(conn, file, &chunks, &content, embedder).await?;
         total_reused += reused;
         total_embedded += embedded;
         if embedded > 0 {
@@ -1227,10 +1227,9 @@ mod tests {
         let mut conn = crate::structural::store::open_db(&root)?;
         let calls = Arc::new(AtomicUsize::new(0));
         let ff = FailingFake::new("j-model", 8, 2, calls.clone());
-        let res = crate::vector::sync_missing_vectors_for_root_with_batch_size(
-            &mut conn, &root, &ff, 8,
-        )
-        .await;
+        let res =
+            crate::vector::sync_missing_vectors_for_root_with_batch_size(&mut conn, &root, &ff, 8)
+                .await;
         assert!(res.is_err(), "second batch should fail");
         // first batch 8 should have persisted
         let fp = ff.fingerprint();
@@ -1248,10 +1247,8 @@ mod tests {
         let docs2 = Arc::new(AtomicUsize::new(0));
         let cf = CountingFake::new("j-model", 8, calls2.clone(), docs2.clone());
         let (reused, embedded, calls_n, _docs) =
-            crate::vector::sync_missing_vectors_for_root_with_batch_size(
-                &mut conn, &root, &cf, 8,
-            )
-            .await?;
+            crate::vector::sync_missing_vectors_for_root_with_batch_size(&mut conn, &root, &cf, 8)
+                .await?;
         assert_eq!(
             embedded, 8,
             "retry should embed only missing 8, got {}",

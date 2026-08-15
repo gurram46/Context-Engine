@@ -233,6 +233,22 @@ impl ContextService {
         let t0 = std::time::Instant::now();
         let root = ProjectRoot::resolve(Some(&self.root))
             .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
+        // Capture semantic readiness BEFORE structural mutation (correct for incremental)
+        let fingerprint = if let Some(ref emb) = override_embedder {
+            emb.fingerprint()
+        } else {
+            context_index::embed::configured_fingerprint()
+        };
+        let (was_semantic_ready, _was_missing_before) = if let Ok(conn) =
+            structural_store::open_db(root.path())
+        {
+            let eligible_before = context_index::vector::eligible_chunk_count(&conn).unwrap_or(0);
+            let missing_before =
+                context_index::vector::missing_vector_count(&conn, &fingerprint).unwrap_or(0);
+            (eligible_before > 0 && missing_before == 0, missing_before)
+        } else {
+            (false, 0)
+        };
         let idx =
             ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
         let root_path = root.path().to_path_buf();
@@ -249,11 +265,6 @@ impl ContextService {
         let mut vectors_reused = 0usize;
         let mut embedding_calls = 0usize;
 
-        let fingerprint = if let Some(ref emb) = override_embedder {
-            emb.fingerprint()
-        } else {
-            context_index::embed::configured_fingerprint()
-        };
         let backend_available = if override_embedder.is_some() {
             true
         } else {
@@ -268,12 +279,10 @@ impl ContextService {
             };
             match structural_store::open_db(root.path()) {
                 Ok(mut conn) => {
-                    // Fast path: only incremental when previously ready and small delta
-                    let eligible = context_index::vector::eligible_chunk_count(&conn).unwrap_or(0);
-                    let missing_before = context_index::vector::missing_vector_count(&conn, &fingerprint).unwrap_or(0);
-                    let is_ready_before = eligible > 0 && missing_before == 0;
-                    let small_delta = outcome.changed_files.len() <= 10 && outcome.deleted_files.len() <= 10;
-                    if is_ready_before && small_delta && !outcome.changed_files.is_empty() {
+                    // Fast path: only incremental when previously ready and small delta (using pre-mutation readiness)
+                    let small_delta =
+                        outcome.changed_files.len() <= 10 && outcome.deleted_files.len() <= 10;
+                    if was_semantic_ready && small_delta && !outcome.changed_files.is_empty() {
                         match context_index::vector::sync_changed_files_vectors(
                             &mut conn,
                             root.path(),
@@ -786,31 +795,52 @@ mod tests {
         let root = tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join(".git")).unwrap();
         for i in 0..16 {
-            std::fs::write(root.join(format!("f{i}.py")), format!("def foo_{i}():\n    x={i}\n").as_bytes()).unwrap();
+            std::fs::write(
+                root.join(format!("f{i}.py")),
+                format!("def foo_{i}():\n    x={i}\n").as_bytes(),
+            )
+            .unwrap();
         }
         let svc = ContextService::new(Some(root.clone())).await.unwrap();
         // Use fast reconcile with counting fake (should embed 0 for cold)
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
         struct CountingFake2 {
             inner: context_index::embed::FakeEmbedder,
             calls: Arc<AtomicUsize>,
         }
         #[async_trait::async_trait]
         impl context_index::embed::Embedder for CountingFake2 {
-            fn model_id(&self) -> &str { self.inner.model_id() }
-            fn dimension(&self) -> usize { self.inner.dimension() }
-            fn version(&self) -> &str { self.inner.version() }
-            async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> { self.inner.embed_query(q).await }
+            fn model_id(&self) -> &str {
+                self.inner.model_id()
+            }
+            fn dimension(&self) -> usize {
+                self.inner.dimension()
+            }
+            fn version(&self) -> &str {
+                self.inner.version()
+            }
+            async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> {
+                self.inner.embed_query(q).await
+            }
             async fn embed_documents(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.inner.embed_documents(texts).await
             }
         }
         let calls = Arc::new(AtomicUsize::new(0));
-        let fake = Arc::new(CountingFake2 { inner: context_index::embed::FakeEmbedder::new("cold-test", 8), calls: calls.clone() });
+        let fake = Arc::new(CountingFake2 {
+            inner: context_index::embed::FakeEmbedder::new("cold-test", 8),
+            calls: calls.clone(),
+        });
         // fast reconcile should NOT embed all 16 (cold)
         let stats = svc.reconcile_fast_inner(Some(fake.clone())).await.unwrap();
-        assert_eq!(stats.vectors_created, 0, "cold fast reconcile should embed 0");
+        assert_eq!(
+            stats.vectors_created, 0,
+            "cold fast reconcile should embed 0"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         // status should be not ready
         let conn = context_index::structural::store::open_db(&root).unwrap();
@@ -818,7 +848,9 @@ mod tests {
         assert!(!context_index::vector::is_semantic_ready(&conn, &fp, true).unwrap());
         assert!(context_index::vector::missing_vector_count(&conn, &fp).unwrap() > 0);
         // lexical search should still succeed
-        let res = svc.search("foo_0", crate::service::SearchOptions::default()).await;
+        let res = svc
+            .search("foo_0", crate::service::SearchOptions::default())
+            .await;
         assert!(res.is_ok());
     }
 
@@ -828,15 +860,25 @@ mod tests {
         let root = tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join(".git")).unwrap();
         for i in 0..8 {
-            std::fs::write(root.join(format!("a{i}.py")), format!("def bar_{i}():\n    y={i}\n").as_bytes()).unwrap();
+            std::fs::write(
+                root.join(format!("a{i}.py")),
+                format!("def bar_{i}():\n    y={i}\n").as_bytes(),
+            )
+            .unwrap();
         }
         let svc = ContextService::new(Some(root.clone())).await.unwrap();
         let fake = Arc::new(context_index::embed::FakeEmbedder::new("explicit-test", 8));
-        let stats = svc.full_semantic_index_with_embedder(fake.clone()).await.unwrap();
+        let stats = svc
+            .full_semantic_index_with_embedder(fake.clone())
+            .await
+            .unwrap();
         assert!(stats.vectors_created > 0);
         let conn = context_index::structural::store::open_db(&root).unwrap();
         let fp = fake.fingerprint();
-        assert_eq!(context_index::vector::missing_vector_count(&conn, &fp).unwrap(), 0);
+        assert_eq!(
+            context_index::vector::missing_vector_count(&conn, &fp).unwrap(),
+            0
+        );
         assert!(context_index::vector::is_semantic_ready(&conn, &fp, true).unwrap());
     }
 
@@ -850,7 +892,9 @@ mod tests {
         let svc = ContextService::new(Some(root.clone())).await.unwrap();
         let fake = Arc::new(context_index::embed::FakeEmbedder::new("inc-test", 8));
         // first full
-        svc.full_semantic_index_with_embedder(fake.clone()).await.unwrap();
+        svc.full_semantic_index_with_embedder(fake.clone())
+            .await
+            .unwrap();
         // change one file
         std::fs::write(root.join("a.py"), b"def foo():\n    x=999\n").unwrap();
         // fast reconcile should embed only changed file

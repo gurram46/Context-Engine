@@ -323,7 +323,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 let st = svc.status().await?;
                 println!(
                     "status: ready {} missing {} eligible {} vectors {}",
-                    st.semantic_index_ready, st.missing_vector_count, st.eligible_chunk_count, st.vector_count
+                    st.semantic_index_ready,
+                    st.missing_vector_count,
+                    st.eligible_chunk_count,
+                    st.vector_count
                 );
             }
         }
