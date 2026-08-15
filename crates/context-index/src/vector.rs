@@ -7,7 +7,7 @@
 use crate::embed::{Embedder, ModelFingerprint, QUERY_CACHE};
 use crate::structural::types::Chunk;
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 
 // --- Constants ---
 
@@ -289,18 +289,12 @@ pub fn is_semantic_ready(
 #[allow(dead_code)]
 fn resolve_qualified(conn: &Connection, parent_symbol: Option<&str>) -> String {
     if let Some(id) = parent_symbol {
-        if let Ok(Some((qname, name))) = conn
-            .query_row(
-                "SELECT qualified_name, name FROM symbols WHERE id=?1",
-                params![id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })
-        {
+        let res: Result<(String, String), rusqlite::Error> = conn.query_row(
+            "SELECT qualified_name, name FROM symbols WHERE id=?1",
+            params![id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        );
+        if let Ok((qname, name)) = res {
             if !qname.is_empty() {
                 return qname;
             }
@@ -308,14 +302,7 @@ fn resolve_qualified(conn: &Connection, parent_symbol: Option<&str>) -> String {
                 return name;
             }
         }
-        // fallback: if symbols lookup failed, treat parent_symbol as opaque hash -> do NOT embed hash, return empty
-        // heuristic: if it looks like hex hash 64 chars, return empty
-        if id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()) {
-            return String::new();
-        }
-        // otherwise for tests where parent_symbol is actually name like "foo", use it
-        // but only if it doesn't look like hash
-        return id.to_string();
+        return String::new();
     }
     String::new()
 }
@@ -402,25 +389,30 @@ fn materialize_semantic_refs(
     let mut file_cache: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    // Use transaction for refs upsert
+    // Use transaction for refs upsert - failure must not commit partial refs
     let tx = conn.transaction()?;
     for (chunk_id, file, language, start_byte, end_byte, content_hash, qname, name) in rows {
         let content = if let Some(c) = file_cache.get(&file) {
             c.clone()
         } else {
             let abs = root.join(&file);
-            let c = std::fs::read_to_string(&abs).unwrap_or_default();
+            let c = std::fs::read_to_string(&abs)?;
             file_cache.insert(file.clone(), c.clone());
             c
         };
         let bytes = content.as_bytes();
-        let slice = if start_byte < bytes.len() && end_byte <= bytes.len() && start_byte <= end_byte
-        {
-            // safe UTF-8
-            String::from_utf8_lossy(&bytes[start_byte..end_byte]).to_string()
-        } else {
-            String::new()
-        };
+        if start_byte > end_byte || end_byte > bytes.len() {
+            anyhow::bail!(
+                "invalid byte range for {}: start {} end {} len {}",
+                file,
+                start_byte,
+                end_byte,
+                bytes.len()
+            );
+        }
+        let slice_bytes = &bytes[start_byte..end_byte];
+        let slice = std::str::from_utf8(slice_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid utf8 slice for {}: {}", file, e))?;
         let qualified = if let Some(q) = qname {
             if !q.is_empty() {
                 q
@@ -430,9 +422,7 @@ fn materialize_semantic_refs(
         } else {
             name.unwrap_or_default()
         };
-        // Need also to handle opaque parent_symbol hash fallback: but we already resolved via JOIN, so qualified is either proper name or empty.
-        // No opaque ID should be embedded.
-        let rendered = render_semantic_representation(&language, &file, &qualified, &slice);
+        let rendered = render_semantic_representation(&language, &file, &qualified, slice);
         let rep_hash = representation_hash(&rendered);
         map.insert(rep_hash.clone(), rendered);
         tx.execute(
@@ -680,69 +670,46 @@ pub async fn sync_vectors_for_file(
     ensure_semantic_schema(conn)?;
     let fp = embedder.fingerprint();
     let bytes = file_content.as_bytes();
-    // Build representation map for this file's chunks
     let mut missing: Vec<(String, String)> = Vec::new();
     let mut reused = 0usize;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for chunk in chunks {
-        // Resolve qualified name: try DB lookup first, fallback to chunk.parent_symbol string or empty
-        let qualified = if let Some(sym_id) = &chunk.parent_symbol {
-            // try to resolve via symbols table
-            let q: Option<String> = conn
-                .query_row(
-                    "SELECT COALESCE(qualified_name, name) FROM symbols WHERE id=?1",
-                    params![sym_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(q) = q {
-                if !q.is_empty() {
-                    q
-                } else {
-                    // if qualified empty, fallback logic similar to resolve_qualified but avoid opaque hash
-                    if sym_id.len() == 64 && sym_id.chars().all(|c| c.is_ascii_hexdigit()) {
-                        String::new()
-                    } else {
-                        sym_id.clone()
-                    }
-                }
-            } else {
-                if sym_id.len() == 64 && sym_id.chars().all(|c| c.is_ascii_hexdigit()) {
-                    String::new()
-                } else {
-                    sym_id.clone()
-                }
-            }
-        } else {
-            String::new()
-        };
-        let slice = if chunk.start_byte < bytes.len() && chunk.end_byte <= bytes.len() {
-            String::from_utf8_lossy(&bytes[chunk.start_byte..chunk.end_byte]).to_string()
-        } else {
-            String::new()
-        };
-        let rendered = render_semantic_representation(
-            chunk.language.as_str(),
-            &chunk.file,
-            &qualified,
-            &slice,
-        );
+        // Structural ownership: chunk must exist in structural storage; otherwise error and no mutation
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chunks WHERE id=?1)",
+            params![chunk.id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            anyhow::bail!("chunk {} not found in structural storage", chunk.id);
+        }
+        // Resolve qualified via central LEFT JOIN path (never raw parent_symbol)
+        let qualified: String = conn
+            .query_row(
+                "SELECT COALESCE(s.qualified_name, s.name, '') FROM chunks c LEFT JOIN symbols s ON c.parent_symbol = s.id WHERE c.id=?1",
+                params![chunk.id],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "".to_string());
+        if chunk.start_byte > chunk.end_byte || chunk.end_byte > bytes.len() {
+            anyhow::bail!(
+                "invalid byte range for {}: {}..{} len {}",
+                chunk.file,
+                chunk.start_byte,
+                chunk.end_byte,
+                bytes.len()
+            );
+        }
+        let slice_bytes = &bytes[chunk.start_byte..chunk.end_byte];
+        let slice = std::str::from_utf8(slice_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid utf8 slice for {}: {}", chunk.file, e))?;
+        let rendered =
+            render_semantic_representation(chunk.language.as_str(), &chunk.file, &qualified, slice);
         let rep_hash = representation_hash(&rendered);
-        // Dedup within file's chunks for counting
         if !seen.insert(rep_hash.clone()) {
-            // duplicate representation within same file batch already counted, check vector existence once
             continue;
         }
-        // Ensure files/chunks exist for FK (tests may call without prior structural insert)
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO files (path, hash, language) VALUES (?1, ?2, ?3)",
-            params![chunk.file, "testhash", chunk.language.as_str()],
-        );
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![chunk.id, chunk.file, chunk.language.as_str(), chunk.start_line as i64, chunk.end_line as i64, chunk.start_byte as i64, chunk.end_byte as i64, chunk.parent_symbol, chunk.content_hash, chunk.text_size_bytes as i64],
-        );
-        // Ensure semantic ref exists (upsert)
+        // Ensure semantic ref exists (upsert) - semantic layer only mutates semantic refs, never files/chunks
         conn.execute(
             "INSERT OR REPLACE INTO semantic_chunk_refs (chunk_id, representation_hash, representation_version, content_hash) VALUES (?1,?2,?3,?4)",
             params![chunk.id, rep_hash, SEMANTIC_REPRESENTATION_VERSION, chunk.content_hash],
@@ -756,7 +723,6 @@ pub async fn sync_vectors_for_file(
     if missing.is_empty() {
         return Ok((reused, 0));
     }
-    // Deduplicate missing by hash (already)
     missing.sort_by(|a, b| a.0.cmp(&b.0));
     missing.dedup_by(|a, b| a.0 == b.0);
     let texts: Vec<String> = missing.iter().map(|(_, t)| t.clone()).collect();
@@ -947,6 +913,17 @@ mod tests {
             text_size_bytes: 4,
         };
         let content = "hello world";
+        // Insert structural fixtures before semantic sync (semantic must not create structural rows)
+        for ch in &[chunk_a.clone(), chunk_b.clone()] {
+            conn.execute(
+                "INSERT OR IGNORE INTO files (path, hash, language) VALUES (?1, ?2, ?3)",
+                rusqlite::params![ch.file, "testhash", ch.language.as_str()],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                rusqlite::params![ch.id, ch.file, ch.language.as_str(), ch.start_line as i64, ch.end_line as i64, ch.start_byte as i64, ch.end_byte as i64, ch.parent_symbol, ch.content_hash, ch.text_size_bytes as i64],
+            )?;
+        }
         // First sync: both embedded
         let (reused, embedded) = sync_vectors_for_file(
             &mut conn,
@@ -1027,7 +1004,17 @@ mod tests {
                 text_size_bytes: 5,
             })
             .collect();
-        let content = "a".repeat(50);
+        let content = "AAAAAAAAAABBBBBBBBBBCCCCCCCCCCDDDDDDDDDD".to_string() + &"E".repeat(10);
+        for ch in &chunks {
+            conn.execute(
+                "INSERT OR IGNORE INTO files (path, hash, language) VALUES (?1, ?2, ?3)",
+                rusqlite::params![ch.file, "testhash", ch.language.as_str()],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                rusqlite::params![ch.id, ch.file, ch.language.as_str(), ch.start_line as i64, ch.end_line as i64, ch.start_byte as i64, ch.end_byte as i64, ch.parent_symbol, ch.content_hash, ch.text_size_bytes as i64],
+            )?;
+        }
         let (r1, e1) =
             sync_vectors_for_file(&mut conn, "f.rs", &chunks, &content, &embedder).await?;
         assert_eq!(e1, 4);
@@ -1062,6 +1049,14 @@ mod tests {
             content_hash: "h1".to_string(),
             text_size_bytes: 3,
         };
+        conn.execute(
+            "INSERT OR IGNORE INTO files (path, hash, language) VALUES (?1, ?2, ?3)",
+            rusqlite::params![chunk.file, "testhash", chunk.language.as_str()],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![chunk.id, chunk.file, chunk.language.as_str(), chunk.start_line as i64, chunk.end_line as i64, chunk.start_byte as i64, chunk.end_byte as i64, chunk.parent_symbol, chunk.content_hash, chunk.text_size_bytes as i64],
+        )?;
         sync_vectors_for_file(&mut conn, "a.py", &[chunk.clone()], "abc", &e1).await?;
         assert_eq!(count_vectors(&conn, &fp1)?, 1);
         let e2 = FakeEmbedder::new("modelB", 4);
@@ -1152,6 +1147,17 @@ mod tests {
         let start = Instant::now();
         let handle = tokio::spawn(async move {
             let mut c = open_mem().unwrap();
+            // Insert structural fixture for chunk (semantic must not create structural rows)
+            c.execute(
+                "INSERT OR IGNORE INTO files (path, hash, language) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["a.py", "testhash", "python"],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                rusqlite::params![fast_chunk.id, fast_chunk.file, "python", fast_chunk.start_line as i64, fast_chunk.end_line as i64, fast_chunk.start_byte as i64, fast_chunk.end_byte as i64, fast_chunk.parent_symbol, fast_chunk.content_hash, fast_chunk.text_size_bytes as i64],
+            )
+            .unwrap();
             let s = SlowTestEmbedder::new(2000);
             let _ = sync_vectors_for_file(&mut c, "a.py", &[fast_chunk], "hello", &s).await;
         });
@@ -1506,6 +1512,14 @@ mod tests {
             content_hash: "h1".to_string(),
             text_size_bytes: 3,
         };
+        conn.execute(
+            "INSERT OR IGNORE INTO files (path, hash, language) VALUES (?1, ?2, ?3)",
+            rusqlite::params![chunk.file, "testhash", chunk.language.as_str()],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![chunk.id, chunk.file, chunk.language.as_str(), chunk.start_line as i64, chunk.end_line as i64, chunk.start_byte as i64, chunk.end_byte as i64, chunk.parent_symbol, chunk.content_hash, chunk.text_size_bytes as i64],
+        )?;
         sync_vectors_for_file(&mut conn, "a.py", &[chunk.clone()], "abc", &e1).await?;
         assert_eq!(count_vectors(&conn, &fp1)?, 1);
         let e2 = FakeEmbedder::new("modelB", 4);
@@ -1730,5 +1744,178 @@ mod tests {
         let r = render_semantic_representation("python", "a\\b\\c.py", "foo", "pass");
         assert!(r.contains("a/b/c.py"));
         assert!(!r.contains("\\"));
+    }
+
+    #[tokio::test]
+    async fn materialization_read_failure_does_not_create_ref() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join("a.py"), b"def foo():\n    pass\n")?;
+        let pr = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx = crate::discovery::ProjectIndex::discover(&pr)?;
+        let si = crate::structural::StructuralIndex::for_path(root.clone());
+        si.build_with_delta(&idx)?;
+        let mut conn = crate::structural::store::open_db(&root)?;
+        // Remove source file to cause read failure
+        std::fs::remove_file(root.join("a.py"))?;
+        let res = crate::vector::sync_missing_vectors_for_root(
+            &mut conn,
+            &root,
+            &FakeEmbedder::new("test", 8),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "materialization should fail when source missing"
+        );
+        // No semantic refs should have been committed
+        assert_eq!(semantic_ref_count(&conn)?, 0);
+        assert_eq!(
+            count_vectors(&conn, &FakeEmbedder::new("test", 8).fingerprint())? as usize,
+            0
+        );
+        // Ready must be false
+        let fp = FakeEmbedder::new("test", 8).fingerprint();
+        assert!(!is_semantic_ready(&conn, &fp, true)?);
+        // Also test invalid byte range
+        let conn2 = open_in_memory()?;
+        conn2.execute(
+            "INSERT INTO files (path, hash, language) VALUES ('a.py','h','python')",
+            [],
+        )?;
+        conn2.execute("INSERT INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES ('c1','a.py','python',1,2,10,5,NULL,'ch','5')", [])?; // start > end invalid
+        std::fs::create_dir_all(tmp.path().join("invalid_test"))?;
+        let invalid_root = tmp.path().join("invalid_test");
+        std::fs::create_dir_all(invalid_root.join(".git"))?;
+        std::fs::write(invalid_root.join("a.py"), b"abc")?;
+        // Directly call materialize via sync_missing_vectors_for_root_with_batch_size which will attempt to materialize invalid range
+        // We need to set up DB for that root
+        let db_path = crate::structural::store::index_db_path(&invalid_root);
+        std::fs::create_dir_all(db_path.parent().unwrap())?;
+        // Copy the invalid chunk DB into that root's DB
+        {
+            let conn_invalid = crate::structural::store::open_db(&invalid_root)?;
+            conn_invalid.execute(
+                "INSERT OR IGNORE INTO files (path, hash, language) VALUES ('a.py','h','python')",
+                [],
+            )?;
+            conn_invalid.execute("INSERT OR REPLACE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES ('c1','a.py','python',1,2,10,5,NULL,'ch','5')", [])?;
+        }
+        let mut conn3 = crate::structural::store::open_db(&invalid_root)?;
+        let res2 = crate::vector::sync_missing_vectors_for_root(
+            &mut conn3,
+            &invalid_root,
+            &FakeEmbedder::new("test", 8),
+        )
+        .await;
+        assert!(res2.is_err(), "invalid byte range should error");
+        assert_eq!(semantic_ref_count(&conn3)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_sync_does_not_create_structural_rows() -> Result<()> {
+        let mut conn = open_in_memory()?;
+        let chunk = Chunk {
+            id: "unattached".to_string(),
+            file: "ghost.py".to_string(),
+            language: Language::Python,
+            start_line: 1,
+            end_line: 2,
+            start_byte: 0,
+            end_byte: 3,
+            parent_symbol: None,
+            content_hash: "h1".to_string(),
+            text_size_bytes: 3,
+        };
+        let res = sync_vectors_for_file(
+            &mut conn,
+            "ghost.py",
+            &[chunk],
+            "abc",
+            &FakeEmbedder::new("test", 8),
+        )
+        .await;
+        assert!(res.is_err(), "should error for unattached chunk");
+        let files: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+        let refs: i64 =
+            conn.query_row("SELECT COUNT(*) FROM semantic_chunk_refs", [], |r| r.get(0))?;
+        assert_eq!(files, 0);
+        assert_eq!(chunks, 0);
+        assert_eq!(refs, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_parent_symbol_is_empty() {
+        let rendered = render_semantic_representation("python", "a.py", "", "def foo():\n    pass");
+        // Simulate unresolved parent_symbol "arbitrary-symbol-id-that-does-not-resolve" should not be embedded
+        let arbitrary = "arbitrary-symbol-id-that-does-not-resolve";
+        assert!(!rendered.contains(arbitrary));
+        // Ensure empty qualified path yields double newline
+        let rendered2 = render_semantic_representation("python", "a.py", "", "pass");
+        // Should be language, path, empty, slice with correct newlines
+        assert_eq!(rendered2, "python\na.py\n\npass");
+        // Also via DB resolution: create chunk with arbitrary parent_symbol and ensure resolved is empty
+        let conn = open_in_memory().unwrap();
+        conn.execute(
+            "INSERT INTO files (path, hash, language) VALUES ('a.py','h','python')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES ('c1','a.py','python',1,2,0,4,'arbitrary-symbol-id-that-does-not-resolve','ch','4')", []).unwrap();
+        let qualified: String = conn
+            .query_row(
+                "SELECT COALESCE(s.qualified_name, s.name, '') FROM chunks c LEFT JOIN symbols s ON c.parent_symbol = s.id WHERE c.id='c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(qualified, "");
+        let rendered3 = render_semantic_representation("python", "a.py", &qualified, "pass");
+        assert!(!rendered3.contains(arbitrary));
+    }
+
+    #[tokio::test]
+    async fn failure_atomic_refs() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::write(root.join("a.py"), b"def foo():\n    pass\n")?;
+        std::fs::write(root.join("b.py"), b"def bar():\n    pass\n")?;
+        let pr = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx = crate::discovery::ProjectIndex::discover(&pr)?;
+        let si = crate::structural::StructuralIndex::for_path(root.clone());
+        si.build_with_delta(&idx)?;
+        let mut conn = crate::structural::store::open_db(&root)?;
+        // Make b.py unreadable to cause failure on second chunk materialization (remove file)
+        std::fs::remove_file(root.join("b.py"))?;
+        let res = crate::vector::sync_missing_vectors_for_root(
+            &mut conn,
+            &root,
+            &FakeEmbedder::new("test", 8),
+        )
+        .await;
+        assert!(res.is_err());
+        // No refs should be committed due to transaction atomicity
+        assert_eq!(semantic_ref_count(&conn)?, 0);
+        // Restore b.py and ensure next successful materialization works and does not corrupt
+        std::fs::write(root.join("b.py"), b"def bar():\n    pass\n")?;
+        // Need to rebuild structural index to re-discover b.py (it was deleted then restored)
+        let pr2 = crate::project_root::ProjectRoot::resolve(Some(&root))?;
+        let idx2 = crate::discovery::ProjectIndex::discover(&pr2)?;
+        si.build_with_delta(&idx2)?;
+        let mut conn2 = crate::structural::store::open_db(&root)?;
+        let res2 = crate::vector::sync_missing_vectors_for_root(
+            &mut conn2,
+            &root,
+            &FakeEmbedder::new("test", 8),
+        )
+        .await;
+        assert!(res2.is_ok());
+        assert_eq!(semantic_ref_count(&conn2)?, eligible_chunk_count(&conn2)?);
+        Ok(())
     }
 }
