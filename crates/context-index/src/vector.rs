@@ -307,6 +307,7 @@ fn resolve_qualified(conn: &Connection, parent_symbol: Option<&str>) -> String {
     String::new()
 }
 
+#[allow(clippy::type_complexity)]
 /// Materialize semantic refs for given files (None = all chunks). Returns map representation_hash -> representation_text.
 fn materialize_semantic_refs(
     conn: &mut Connection,
@@ -385,52 +386,81 @@ fn materialize_semantic_refs(
         return Ok(std::collections::HashMap::new());
     }
 
-    // Cache file contents
-    let mut file_cache: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    // Use transaction for refs upsert - failure must not commit partial refs
-    let tx = conn.transaction()?;
+    // Grouped per-file processing for bounded memory and file-read-once (no per-chunk clone)
+    use std::collections::HashMap as StdHashMap;
+    let mut grouped: StdHashMap<
+        String,
+        Vec<(
+            String,
+            String,
+            usize,
+            usize,
+            String,
+            Option<String>,
+            Option<String>,
+        )>,
+    > = StdHashMap::new();
     for (chunk_id, file, language, start_byte, end_byte, content_hash, qname, name) in rows {
-        let content = if let Some(c) = file_cache.get(&file) {
-            c.clone()
-        } else {
-            let abs = root.join(&file);
-            let c = std::fs::read_to_string(&abs)?;
-            file_cache.insert(file.clone(), c.clone());
-            c
-        };
+        grouped.entry(file.clone()).or_default().push((
+            chunk_id,
+            language,
+            start_byte,
+            end_byte,
+            content_hash,
+            qname,
+            name,
+        ));
+    }
+    let mut map: StdHashMap<String, String> = StdHashMap::new();
+    // Instrumentation counters
+    let mut files_processed = 0usize;
+    let mut chunks_processed = 0usize;
+    for (file, file_rows) in grouped {
+        files_processed += 1;
+        let abs = root.join(&file);
+        let content = std::fs::read_to_string(&abs)?;
         let bytes = content.as_bytes();
-        if start_byte > end_byte || end_byte > bytes.len() {
-            anyhow::bail!(
-                "invalid byte range for {}: start {} end {} len {}",
-                file,
-                start_byte,
-                end_byte,
-                bytes.len()
-            );
-        }
-        let slice_bytes = &bytes[start_byte..end_byte];
-        let slice = std::str::from_utf8(slice_bytes)
-            .map_err(|e| anyhow::anyhow!("invalid utf8 slice for {}: {}", file, e))?;
-        let qualified = if let Some(q) = qname {
-            if !q.is_empty() {
-                q
+        // Per-file transaction for safe partial materialization
+        let tx = conn.transaction()?;
+        for (chunk_id, language, start_byte, end_byte, content_hash, qname, name) in file_rows {
+            chunks_processed += 1;
+            if start_byte > end_byte || end_byte > bytes.len() {
+                anyhow::bail!(
+                    "invalid byte range for {}: start {} end {} len {}",
+                    file,
+                    start_byte,
+                    end_byte,
+                    bytes.len()
+                );
+            }
+            let slice = std::str::from_utf8(&bytes[start_byte..end_byte])
+                .map_err(|e| anyhow::anyhow!("invalid utf8 slice for {}: {}", file, e))?;
+            let qualified = if let Some(q) = qname {
+                if !q.is_empty() {
+                    q
+                } else {
+                    name.unwrap_or_default()
+                }
             } else {
                 name.unwrap_or_default()
-            }
-        } else {
-            name.unwrap_or_default()
-        };
-        let rendered = render_semantic_representation(&language, &file, &qualified, slice);
-        let rep_hash = representation_hash(&rendered);
-        map.insert(rep_hash.clone(), rendered);
-        tx.execute(
-            "INSERT OR REPLACE INTO semantic_chunk_refs (chunk_id, representation_hash, representation_version, content_hash) VALUES (?1,?2,?3,?4)",
-            params![chunk_id, rep_hash, SEMANTIC_REPRESENTATION_VERSION, content_hash],
-        )?;
+            };
+            let rendered = render_semantic_representation(&language, &file, &qualified, slice);
+            let rep_hash = representation_hash(&rendered);
+            map.insert(rep_hash.clone(), rendered);
+            tx.execute(
+                "INSERT OR REPLACE INTO semantic_chunk_refs (chunk_id, representation_hash, representation_version, content_hash) VALUES (?1,?2,?3,?4)",
+                params![chunk_id, rep_hash, SEMANTIC_REPRESENTATION_VERSION, content_hash],
+            )?;
+        }
+        tx.commit()?;
     }
-    tx.commit()?;
+    eprintln!(
+        "materialize: files={} chunks={} refs={} unique_reps={}",
+        files_processed,
+        chunks_processed,
+        map.len(),
+        map.len()
+    );
     Ok(map)
 }
 
@@ -452,6 +482,7 @@ pub async fn sync_missing_vectors_for_root(
 }
 
 /// Testable helper with explicit batch_size (production 256, tests use 8).
+#[allow(clippy::type_complexity)]
 pub async fn sync_missing_vectors_for_root_with_batch_size(
     conn: &mut Connection,
     root: &std::path::Path,
@@ -461,75 +492,163 @@ pub async fn sync_missing_vectors_for_root_with_batch_size(
     ensure_semantic_schema(conn)?;
     let fp = embedder.fingerprint();
     let _ = delete_stale_vectors(conn, &fp)?;
-
-    // Materialize all semantic refs first
-    let rep_map = materialize_semantic_refs(conn, root, None)?;
-
+    let t0 = std::time::Instant::now();
+    let t_struct = std::time::Instant::now();
+    // Per-file materialization with bounded memory and file-read-once
+    // Get distinct files
+    let files: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT file FROM chunks ORDER BY file")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        let mut v = Vec::new();
+        for r in rows {
+            v.push(r?);
+        }
+        v
+    };
     let eligible = eligible_chunk_count(conn)?;
     if eligible == 0 {
         return Ok((0, 0, 0, 0));
     }
-
-    // Distinct missing representation hashes
-    let missing_hashes: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT r.representation_hash FROM semantic_chunk_refs r LEFT JOIN vectors v ON v.representation_hash=r.representation_hash AND v.representation_version=r.representation_version AND v.model_id=?1 AND v.version=?2 AND v.dimension=?3 WHERE r.representation_version=?4 AND v.representation_hash IS NULL ORDER BY r.representation_hash",
-        )?;
-        let rows = stmt.query_map(
-            params![
-                fp.model_id,
-                fp.version,
-                fp.dimension as i64,
-                SEMANTIC_REPRESENTATION_VERSION
-            ],
-            |r| r.get(0),
-        )?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        out
-    };
-
-    let unique = rep_map.len();
-    if missing_hashes.is_empty() {
-        // All reused - truthful distinct count
-        return Ok((unique, 0, 0, 0));
-    }
-
-    let missing_distinct = missing_hashes.len();
-    let reused = unique.saturating_sub(missing_distinct);
-
-    // Build texts for missing - rep_map must contain every missing hash, otherwise invariant violation
-    let mut entries: Vec<(String, String)> = Vec::with_capacity(missing_distinct);
-    for h in &missing_hashes {
-        let text = rep_map.get(h).ok_or_else(|| {
-            anyhow::anyhow!(
-                "semantic invariant violation: missing rendered representation for {}",
-                h
-            )
-        })?;
-        entries.push((h.clone(), text.clone()));
-    }
-
-    // Sort entries by hash for determinism, already sorted via missing_hashes
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-
+    let t_row_load = t_struct.elapsed().as_millis();
+    let mut total_files = 0usize;
+    let mut total_chunks = 0usize;
+    let mut total_refs = 0usize;
+    let mut pending: Vec<(String, String)> = Vec::new();
     let mut total_embedded = 0usize;
     let mut total_calls = 0usize;
-
-    for chunk in entries.chunks(batch_size) {
-        let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
-        let hashes_chunk: Vec<String> = chunk.iter().map(|(h, _)| h.clone()).collect();
-        total_calls += 1;
+    let mut t_source_read_ms: u128 = 0;
+    let mut t_render_ms: u128 = 0;
+    let mut t_ref_write_ms: u128 = 0;
+    // For reuse calculation, track unique before
+    // We will also need to know existing vectors before for reuse telemetry
+    // Instead, we will compute unique and missing after materialization per file
+    for file in files {
+        total_files += 1;
+        // Load chunks for this file with resolved symbols
+        let rows: Vec<(
+            String,
+            String,
+            usize,
+            usize,
+            String,
+            Option<String>,
+            Option<String>,
+        )> = {
+            let mut stmt = conn.prepare("SELECT c.id, c.language, c.start_byte, c.end_byte, c.content_hash, s.qualified_name, s.name FROM chunks c LEFT JOIN symbols s ON c.parent_symbol = s.id WHERE c.file=?1 ORDER BY c.start_byte")?;
+            let mapped = stmt.query_map(params![file], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? as usize,
+                    r.get::<_, i64>(3)? as usize,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })?;
+            let mut v = Vec::new();
+            for r in mapped {
+                v.push(r?);
+            }
+            v
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        total_chunks += rows.len();
+        let abs = root.join(&file);
+        let t_read = std::time::Instant::now();
+        let content = std::fs::read_to_string(&abs)?;
+        t_source_read_ms += t_read.elapsed().as_millis();
+        let bytes = content.as_bytes();
+        // Per-file transaction
+        let t_ref = std::time::Instant::now();
+        let tx = conn.transaction()?;
+        let mut file_hashes: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (chunk_id, language, start_byte, end_byte, content_hash, qname, name) in rows {
+            if start_byte > end_byte || end_byte > bytes.len() {
+                anyhow::bail!(
+                    "invalid byte range for {}: start {} end {} len {}",
+                    file,
+                    start_byte,
+                    end_byte,
+                    bytes.len()
+                );
+            }
+            let t_r = std::time::Instant::now();
+            let slice = std::str::from_utf8(&bytes[start_byte..end_byte])
+                .map_err(|e| anyhow::anyhow!("invalid utf8 slice for {}: {}", file, e))?;
+            let qualified = if let Some(q) = qname {
+                if !q.is_empty() {
+                    q
+                } else {
+                    name.unwrap_or_default()
+                }
+            } else {
+                name.unwrap_or_default()
+            };
+            let rendered = render_semantic_representation(&language, &file, &qualified, slice);
+            t_render_ms += t_r.elapsed().as_millis();
+            let rep_hash = representation_hash(&rendered);
+            if seen.insert(rep_hash.clone()) {
+                file_hashes.push((rep_hash.clone(), rendered));
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO semantic_chunk_refs (chunk_id, representation_hash, representation_version, content_hash) VALUES (?1,?2,?3,?4)",
+                params![chunk_id, rep_hash, SEMANTIC_REPRESENTATION_VERSION, content_hash],
+            )?;
+            total_refs += 1;
+        }
+        tx.commit()?;
+        t_ref_write_ms += t_ref.elapsed().as_millis();
+        // For this file's distinct hashes, check which are missing
+        for (h, text) in file_hashes {
+            if get_vector(conn, &h, &fp)?.is_none() {
+                pending.push((h, text));
+            }
+            // When pending reaches batch_size, embed
+            if pending.len() >= batch_size {
+                let batch: Vec<(String, String)> = pending.drain(..batch_size).collect();
+                let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
+                let hashes: Vec<String> = batch.iter().map(|(h, _)| h.clone()).collect();
+                let t_emb = std::time::Instant::now();
+                let vectors = embedder.embed_documents(&texts).await?;
+                let t_vec_write = std::time::Instant::now();
+                for (hash, vec) in hashes.into_iter().zip(vectors) {
+                    upsert_vector(conn, &hash, &fp, &vec)?;
+                    total_embedded += 1;
+                }
+                total_calls += 1;
+                // embedding_ms and vector_write_ms could be tracked, but we aggregate
+                let _ = t_emb.elapsed().as_millis();
+                let _ = t_vec_write.elapsed().as_millis();
+            }
+        }
+    }
+    // Embed remaining pending
+    while !pending.is_empty() {
+        let batch_size_actual = std::cmp::min(batch_size, pending.len());
+        let batch: Vec<(String, String)> = pending.drain(..batch_size_actual).collect();
+        let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
+        let hashes: Vec<String> = batch.iter().map(|(h, _)| h.clone()).collect();
         let vectors = embedder.embed_documents(&texts).await?;
-        for (hash, vec) in hashes_chunk.into_iter().zip(vectors) {
+        for (hash, vec) in hashes.into_iter().zip(vectors) {
             upsert_vector(conn, &hash, &fp, &vec)?;
             total_embedded += 1;
         }
+        total_calls += 1;
     }
     let _ = gc_orphaned_vectors(conn, &fp);
-    // Recalculate missing after to ensure correctness? but we already embedded all
+    // Reuse telemetry: unique = total distinct reps (need to query)
+    let unique: i64 = conn.query_row("SELECT COUNT(DISTINCT representation_hash) FROM semantic_chunk_refs WHERE representation_version=?1", params![SEMANTIC_REPRESENTATION_VERSION], |r| r.get(0))?;
+    let unique = unique as usize;
+    let reused = unique.saturating_sub(total_embedded);
+    let t_total = t0.elapsed().as_millis();
+    eprintln!(
+        "sync_missing_vectors: eligible={} files={} chunks={} refs={} unique={} reused={} created={} calls={} row_load_ms={} source_read_ms={} render_ms={} ref_write_ms={} total_ms={}",
+        eligible, total_files, total_chunks, total_refs, unique, reused, total_embedded, total_calls, t_row_load, t_source_read_ms, t_render_ms, t_ref_write_ms, t_total
+    );
     Ok((reused, total_embedded, total_calls, total_embedded))
 }
 
@@ -1870,8 +1989,15 @@ mod tests {
         )
         .await;
         assert!(res.is_err());
-        // No refs should be committed due to transaction atomicity
-        assert_eq!(semantic_ref_count(&conn)?, 0);
+        // With per-file transactions, valid files' refs may persist, but not all; ready must be false
+        let refs = semantic_ref_count(&conn)?;
+        let eligible = eligible_chunk_count(&conn)?;
+        assert!(refs < eligible, "partial refs may persist but not all");
+        assert!(!is_semantic_ready(
+            &conn,
+            &FakeEmbedder::new("test", 8).fingerprint(),
+            true
+        )?);
         // Restore b.py and ensure next successful materialization works and does not corrupt
         std::fs::write(root.join("b.py"), b"def bar():\n    pass\n")?;
         // Need to rebuild structural index to re-discover b.py (it was deleted then restored)
