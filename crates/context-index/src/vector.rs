@@ -796,14 +796,16 @@ pub async fn sync_vectors_for_file(
         let rendered =
             render_semantic_representation(chunk.language.as_str(), &chunk.file, &qualified, slice);
         let rep_hash = representation_hash(&rendered);
-        if !seen.insert(rep_hash.clone()) {
-            continue;
-        }
-        // Ensure semantic ref exists (upsert) - semantic layer only mutates semantic refs, never files/chunks
+        // ALWAYS upsert semantic_chunk_refs for every valid chunk (even if representation hash duplicates)
         conn.execute(
             "INSERT OR REPLACE INTO semantic_chunk_refs (chunk_id, representation_hash, representation_version, content_hash) VALUES (?1,?2,?3,?4)",
             params![chunk.id, rep_hash, SEMANTIC_REPRESENTATION_VERSION, chunk.content_hash],
         )?;
+        // Deduplicate embedding work by representation_hash
+        if !seen.insert(rep_hash.clone()) {
+            // Already queued or reused check for this hash in current batch; ref already created
+            continue;
+        }
         if get_vector(conn, &rep_hash, &fp)?.is_some() {
             reused += 1;
         } else {
@@ -2145,6 +2147,148 @@ mod tests {
         .await?;
         assert_eq!(reused_c, 0, "new duplicate reps should have 0 reused");
         assert_eq!(created_c, 1, "2 chunks same rep should create 1 vector");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_representation_ref_invariant() -> Result<()> {
+        // Two chunks may legitimately share same representation hash (same slice, same file, same symbol)
+        // Correct invariant: semantic_ref_count == eligible_chunk_count (2 refs) even though vectors ==1
+        let mut conn = open_in_memory()?;
+        let embedder = FakeEmbedder::new("dup-invariant", 8);
+        let fp = embedder.fingerprint();
+        // Create two chunks with identical representation: same file, same language, same parent_symbol, same slice
+        let file_content = "hello";
+        for (id, ch) in [("c1", "h1"), ("c2", "h2")] {
+            conn.execute(
+                "INSERT OR IGNORE INTO files (path, hash, language) VALUES ('a.py','fh','python')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,'a.py','python',1,2,0,5,NULL,?2,5)",
+                rusqlite::params![id, ch],
+            )?;
+        }
+        let chunks = vec![
+            Chunk {
+                id: "c1".to_string(),
+                file: "a.py".to_string(),
+                language: Language::Python,
+                start_line: 1,
+                end_line: 2,
+                start_byte: 0,
+                end_byte: 5,
+                parent_symbol: None,
+                content_hash: "h1".to_string(),
+                text_size_bytes: 5,
+            },
+            Chunk {
+                id: "c2".to_string(),
+                file: "a.py".to_string(),
+                language: Language::Python,
+                start_line: 1,
+                end_line: 2,
+                start_byte: 0,
+                end_byte: 5,
+                parent_symbol: None,
+                content_hash: "h2".to_string(),
+                text_size_bytes: 5,
+            },
+        ];
+        let (reused, created) =
+            sync_vectors_for_file(&mut conn, "a.py", &chunks, file_content, &embedder).await?;
+        assert_eq!(reused, 0);
+        assert_eq!(created, 1, "duplicate reps should create 1 vector");
+        assert_eq!(
+            eligible_chunk_count(&conn)?,
+            2,
+            "eligible should be 2"
+        );
+        assert_eq!(
+            semantic_ref_count(&conn)?,
+            2,
+            "semantic refs must equal eligible even with duplicate hash"
+        );
+        assert_eq!(count_vectors(&conn, &fp)?, 1, "vectors should be 1 for duplicate hash");
+        assert_eq!(missing_vector_count(&conn, &fp)?, 0);
+        assert!(is_semantic_ready(&conn, &fp, true)?);
+        // Search should fan out to both refs (both chunks share same vector)
+        let qvec = embedder.embed_query(file_content).await?;
+        let res = search_brute(&conn, &qvec, &fp, 5)?;
+        // Both chunks should be returned (2 results) since they share same hash but are separate refs
+        let ids: Vec<String> = res.iter().map(|c| c.chunk_id.clone()).collect();
+        assert!(ids.contains(&"c1".to_string()), "c1 should be found");
+        assert!(ids.contains(&"c2".to_string()), "c2 should be found");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_changed_file_duplicate_handling() -> Result<()> {
+        // Incremental path with changed file containing duplicate reps
+        let mut conn = open_in_memory()?;
+        let embedder = FakeEmbedder::new("inc-dup", 8);
+        let file_content = "hello";
+        // Setup initial file with one chunk
+        conn.execute(
+            "INSERT OR IGNORE INTO files (path, hash, language) VALUES ('a.py','fh','python')",
+            [],
+        )?;
+        conn.execute("INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES ('c0','a.py','python',1,2,0,5,NULL,'h0',5)", [])?;
+        let c0 = Chunk {
+            id: "c0".to_string(),
+            file: "a.py".to_string(),
+            language: Language::Python,
+            start_line: 1,
+            end_line: 2,
+            start_byte: 0,
+            end_byte: 5,
+            parent_symbol: None,
+            content_hash: "h0".to_string(),
+            text_size_bytes: 5,
+        };
+        let _ = sync_vectors_for_file(&mut conn, "a.py", &[c0], file_content, &embedder).await?;
+        // Now simulate changed file with 2 chunks sharing same rep (e.g., file edit creates duplicate)
+        conn.execute("DELETE FROM chunks WHERE id='c0'", [])?;
+        conn.execute("DELETE FROM semantic_chunk_refs WHERE chunk_id='c0'", [])?;
+        let _ = gc_orphaned_vectors(&conn, &embedder.fingerprint())?;
+        for (id, ch) in [("c1", "h1"), ("c2", "h2")] {
+            conn.execute(
+                "INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,'a.py','python',1,2,0,5,NULL,?2,5)",
+                rusqlite::params![id, ch],
+            )?;
+        }
+        let chunks = vec![
+            Chunk {
+                id: "c1".to_string(),
+                file: "a.py".to_string(),
+                language: Language::Python,
+                start_line: 1,
+                end_line: 2,
+                start_byte: 0,
+                end_byte: 5,
+                parent_symbol: None,
+                content_hash: "h1".to_string(),
+                text_size_bytes: 5,
+            },
+            Chunk {
+                id: "c2".to_string(),
+                file: "a.py".to_string(),
+                language: Language::Python,
+                start_line: 1,
+                end_line: 2,
+                start_byte: 0,
+                end_byte: 5,
+                parent_symbol: None,
+                content_hash: "h2".to_string(),
+                text_size_bytes: 5,
+            },
+        ];
+        let (reused, created) =
+            sync_vectors_for_file(&mut conn, "a.py", &chunks, file_content, &embedder).await?;
+        assert_eq!(created, 1);
+        assert_eq!(semantic_ref_count(&conn)?, 2);
+        assert_eq!(eligible_chunk_count(&conn)?, 2);
+        assert_eq!(count_vectors(&conn, &embedder.fingerprint())?, 1);
         Ok(())
     }
 }
