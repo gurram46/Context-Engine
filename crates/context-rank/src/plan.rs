@@ -120,11 +120,8 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
         }
         QueryType::Conceptual => {
             semantic_queries.push(raw.to_string());
-            for id in ids.iter().take(2) {
-                if id.len() >= 4 {
-                    exact_queries.push(ExactQuery::Literal(id.clone()));
-                }
-            }
+            // ponytail: no exact Literal for conceptual — keyword rg hits (transaction, handling, etc.) drown semantic with authority 58 vs 10
+            // semantic + BM25 are the intended retrievers for conceptual; exact is noise here
         }
         QueryType::Mixed => {
             semantic_queries.push(raw.to_string());
@@ -409,5 +406,22 @@ mod tests {
         let p = build_retrieval_plan("Where is Searcher implemented?");
         assert_eq!(p.classified.query_type, QueryType::Symbol);
         assert!(p.symbol_queries.contains(&"Searcher".to_string()));
+    }
+    #[test]
+    fn conceptual_has_no_exact_literal() {
+        let p = build_retrieval_plan("How is transaction atomic implemented?");
+        assert_eq!(p.classified.query_type, QueryType::Conceptual);
+        assert!(
+            p.exact_queries.is_empty(),
+            "conceptual should have no exact Literal, got {:?}",
+            p.exact_queries
+        );
+        assert!(!p.semantic_queries.is_empty());
+    }
+    #[test]
+    fn conceptual_middleware_no_exact() {
+        let p = build_retrieval_plan("How is middleware implemented in NestJS?");
+        assert_eq!(p.classified.query_type, QueryType::Conceptual);
+        assert!(p.exact_queries.is_empty());
     }
 }

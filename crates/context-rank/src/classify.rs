@@ -123,6 +123,22 @@ pub fn classify_query(raw: &str) -> ClassifiedQuery {
         };
     }
 
+    // ponytail: How-is conceptual queries must not be misclassified as Symbol due to framework Pascal like NestJS
+    // e.g., "How is middleware implemented in NestJS?" is conceptual, not symbol definition
+    let word_count_early = normalized.split_whitespace().count();
+    if word_count_early >= 4
+        && (lower.starts_with("how is") || lower.starts_with("how are"))
+        && CONCEPT_HINT_RE.is_match(&lower)
+    {
+        hints.push("conceptual".to_string());
+        return ClassifiedQuery {
+            query_type: QueryType::Conceptual,
+            raw: raw.to_string(),
+            normalized,
+            hints,
+        };
+    }
+
     if looks_like_identifier(&normalized)
         || (SYM_DEF_RE.is_match(&lower) && has_identifier(&normalized))
     {
@@ -476,6 +492,14 @@ mod tests {
     fn conceptual_regex_matching() {
         assert_eq!(
             classify_query("How is regex matching implemented?").query_type,
+            QueryType::Conceptual
+        );
+    }
+    #[test]
+    fn how_is_middleware_nestjs_is_conceptual() {
+        // ponytail: How-is with framework Pascal must stay conceptual, not symbol
+        assert_eq!(
+            classify_query("How is middleware implemented in NestJS?").query_type,
             QueryType::Conceptual
         );
     }

@@ -24,6 +24,10 @@ fn to_snake_case(s: &str) -> String {
     out
 }
 
+fn fusion_trace_enabled() -> bool {
+    std::env::var("CONTEXTD_FUSION_TRACE").is_ok()
+}
+
 /// Retrieval providers — R5 production uses no V2/OCI providers.
 /// Kept as empty struct for API compatibility; legacy CandidateProvider is LEGACY only.
 pub struct Providers {}
@@ -140,10 +144,12 @@ fn sufficiency(
 
 /// RRF fusion for BM25 + vector.
 /// Do NOT naively add BM25 score + cosine (scales differ). Use rank normalization.
+/// ponytail: semantic_weight allows conceptual queries to prioritize vector over BM25 (generic, not benchmark-specific)
 fn fuse_rrf(
     bm25: Vec<(Evidence, usize, f64)>,
     vector: Vec<(Evidence, usize, f64)>,
     k: usize,
+    semantic_weight: f64,
 ) -> Vec<Evidence> {
     let k = k as f64;
     let mut map: HashMap<String, (Evidence, f64)> = HashMap::new(); // key = file::chunk_id or file::line
@@ -169,7 +175,7 @@ fn fuse_rrf(
             ev.symbol.clone().unwrap_or_default(),
             ev.start_line.unwrap_or(0)
         );
-        let rrf = 1.0 / (k + rank as f64);
+        let rrf = semantic_weight * 1.0 / (k + rank as f64);
         let entry = map.entry(key.clone()).or_insert_with(|| (ev.clone(), 0.0));
         entry.1 += rrf;
         // Merge provenance to indicate fused
@@ -210,6 +216,18 @@ fn fuse_rrf(
 /// Main Rust retrieval pipeline for R4.
 /// 1. classify, 2. plan, 3. Rust exact, 4. Rust structural, 5. BM25 + vector (fused), 6. authority, 7. fuse, 8. pack.
 #[allow(unused_assignments, unused_variables, clippy::too_many_lines)]
+fn semantic_weight_for_query(qt: QueryType) -> f64 {
+    if let Ok(v) = std::env::var("CONTEXTD_SEMANTIC_WEIGHT") {
+        if let Ok(w) = v.parse::<f64>() {
+            return w;
+        }
+    }
+    match qt {
+        QueryType::Conceptual => 2.0, // ponytail: generic conceptual boost, semantic is primary for How/Where is ... implemented
+        _ => 1.0,
+    }
+}
+
 pub async fn retrieve_context(
     query: &str,
     project: &ProjectIndex,
@@ -220,6 +238,26 @@ pub async fn retrieve_context(
     let t0 = Instant::now();
     let classified = classify_query(query);
     let plan = build_retrieval_plan(query);
+    if fusion_trace_enabled() {
+        eprintln!(
+            "TRACE classify: query={:?} type={:?} hints={:?}",
+            query, classified.query_type, classified.hints
+        );
+        eprintln!(
+            "TRACE plan: exact={:?} symbol={:?} semantic={:?} graph={:?} test={:?}",
+            plan.exact_queries
+                .iter()
+                .map(|q| q.as_str().to_string())
+                .collect::<Vec<_>>(),
+            plan.symbol_queries,
+            plan.semantic_queries,
+            plan.graph_queries
+                .iter()
+                .map(|g| format!("{}:{}", g.symbol, g.direction))
+                .collect::<Vec<_>>(),
+            plan.test_queries
+        );
+    }
 
     let mut candidates: Vec<Evidence> = Vec::new();
     let mut retrievers_used = Vec::new();
@@ -664,7 +702,6 @@ pub async fn retrieve_context(
         }
         bm25_ms = t_bm25.elapsed().as_millis();
     } else {
-        bm25_ms = 0;
         retrievers_used.push("rust-bm25:skipped".into());
     }
 
@@ -777,7 +814,41 @@ pub async fn retrieve_context(
 
     // Fuse BM25 + vector via RRF (rank-normalized)
     if !bm25_candidates.is_empty() || !vector_candidates.is_empty() {
-        let fused = fuse_rrf(bm25_candidates, vector_candidates, 60);
+        let w = semantic_weight_for_query(classified.query_type);
+        if fusion_trace_enabled() {
+            eprintln!(
+                "TRACE fuse_rrf weight: semantic_weight={} for {:?}",
+                w, classified.query_type
+            );
+        }
+        let fused = fuse_rrf(bm25_candidates.clone(), vector_candidates.clone(), 60, w);
+        if fusion_trace_enabled() {
+            eprintln!(
+                "TRACE fuse_rrf: bm25={} vector={} fused={}",
+                bm25_candidates.len(),
+                vector_candidates.len(),
+                fused.len()
+            );
+            for ev in &fused {
+                eprintln!(
+                    "  fused {}:{} score={:?} prov={:?} src={:?}",
+                    ev.file,
+                    ev.start_line.unwrap_or(0),
+                    ev.score,
+                    ev.provenance,
+                    ev.source
+                );
+            }
+            for (ev, rank, score) in &bm25_candidates {
+                eprintln!("  bm25 rank={} score={:.4} file={}", rank, score, ev.file);
+            }
+            for (ev, rank, score) in &vector_candidates {
+                eprintln!(
+                    "  vector rank={} score={:.4} file={} lines={:?}",
+                    rank, score, ev.file, ev.start_line
+                );
+            }
+        }
         // Add fused evidences — high semantic docs must not auto-beat verified definitions, but RRF already rank-normalized
         // Authority will still penalize docs when impl wanted, so we keep.
         for ev in fused {
@@ -789,6 +860,22 @@ pub async fn retrieve_context(
     let t_auth = Instant::now();
     let scored = apply_authority(candidates, classified.query_type, query);
     let rank_ms = t_auth.elapsed().as_millis();
+    if fusion_trace_enabled() {
+        eprintln!("TRACE authority: candidates={}", scored.len());
+        for e in &scored {
+            eprintln!(
+                "  auth {}:{} final={:?} auth={:?} base={:?} prov={:?} src={:?} rel={:?}",
+                e.file,
+                e.start_line.unwrap_or(0),
+                e.final_score,
+                e.authority_score,
+                e.score,
+                e.provenance,
+                e.source,
+                e.relation
+            );
+        }
+    }
 
     // Fuse
     let t_fuse = Instant::now();
@@ -801,6 +888,25 @@ pub async fn retrieve_context(
         },
     );
     let fuse_ms = t_fuse.elapsed().as_millis();
+    if fusion_trace_enabled() {
+        eprintln!(
+            "TRACE fuse: ranked={} deduped={} collapsed={}",
+            fused.ranked.len(),
+            fused.deduped,
+            fused.collapsed
+        );
+        for (i, e) in fused.ranked.iter().enumerate() {
+            eprintln!(
+                "  final {}: {}:{} final={:?} auth={:?} prov={:?}",
+                i + 1,
+                e.file,
+                e.start_line.unwrap_or(0),
+                e.final_score,
+                e.authority_score,
+                e.provenance
+            );
+        }
+    }
 
     // Pack
     let t_pack = Instant::now();

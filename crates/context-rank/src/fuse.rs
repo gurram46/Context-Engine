@@ -112,6 +112,15 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
     }
     let mut collapsed_list = Vec::new();
     let mut collapsed = 0;
+    // ponytail: per-file limit prevents one file (e.g., dir.rs with many chunks) from dominating conceptual Top5 and pushing lib.rs out
+    let per_file_limit = match opts.query_type {
+        QueryType::Conceptual => 2,
+        _ => 4,
+    };
+    let per_file_keep_high = match opts.query_type {
+        QueryType::Conceptual => false, // conceptual: strict limit, no high-score bypass
+        _ => true,
+    };
     for (_file, mut list) in by_file {
         list.sort_by(|a, b| {
             b.final_score
@@ -132,17 +141,25 @@ pub fn fuse_evidence(evidence: Vec<Evidence>, opts: FuseOptions) -> FuseResult {
                 } else {
                     collapsed += 1;
                 }
-            } else if kept.len() < 4 || e.final_score.unwrap_or(0.0) > 15.0 {
+            } else if kept.len() < per_file_limit
+                || (per_file_keep_high && e.final_score.unwrap_or(0.0) > 15.0)
+            {
                 kept.push(e);
             } else {
                 collapsed += 1;
             }
         }
         let final_len = kept.len();
-        let final_kept = if kept.len() > 3 {
+        let keep_n = match opts.query_type {
+            QueryType::Conceptual => 2,
+            _ => 3,
+        };
+        let final_kept = if kept.len() > keep_n {
             kept.into_iter()
                 .enumerate()
-                .filter(|(i, e)| *i < 3 || e.authority_score.unwrap_or(0) > 10)
+                .filter(|(i, e)| {
+                    *i < keep_n || (per_file_keep_high && e.authority_score.unwrap_or(0) > 10)
+                })
                 .map(|(_, e)| e)
                 .collect::<Vec<_>>()
         } else {
@@ -300,6 +317,118 @@ mod tests {
                 .iter()
                 .any(|e| e.relation == Some(EvidenceRelation::Definition)),
             "definition should be preserved even when top_n=1 and doc outranks initially"
+        );
+    }
+
+    #[test]
+    fn conceptual_per_file_limit_two() {
+        // 5 chunks from same file, all high score, conceptual should keep only 2 per file
+        let mut evs = Vec::new();
+        for i in 0..5 {
+            let mut e = mk_ev(
+                "crates/ignore/src/dir.rs",
+                RetrievalSource::Semantic,
+                EvidenceRelation::Unknown,
+                None,
+                &format!("chunk {}", i),
+                1.0 - i as f64 * 0.05,
+            );
+            e.start_line = Some(10 + i * 10);
+            e.end_line = Some(12 + i * 10);
+            e.source = RetrievalSource::Semantic;
+            evs.push(e);
+        }
+        // add one from different file with slightly lower score
+        let mut other = mk_ev(
+            "crates/ignore/src/lib.rs",
+            RetrievalSource::Semantic,
+            EvidenceRelation::Unknown,
+            None,
+            "lib chunk",
+            0.8,
+        );
+        other.start_line = Some(10);
+        other.end_line = Some(12);
+        evs.push(other);
+        let opts = FuseOptions {
+            top_n: 5,
+            query_type: QueryType::Conceptual,
+            raw_query: "Where is ignore handling implemented?".into(),
+        };
+        let res = fuse_evidence(evs, opts);
+        let dir_count = res
+            .ranked
+            .iter()
+            .filter(|e| e.file == "crates/ignore/src/dir.rs")
+            .count();
+        assert_eq!(
+            dir_count, 2,
+            "conceptual should keep at most 2 per file, got {}",
+            dir_count
+        );
+        assert!(
+            res.ranked
+                .iter()
+                .any(|e| e.file == "crates/ignore/src/lib.rs"),
+            "lib.rs should survive when dir.rs limited to 2"
+        );
+    }
+
+    #[test]
+    fn strong_semantic_survives_lexical_noise() {
+        // BM25 noise with high lexical score but lower authority should not drown semantic for conceptual
+        let sem = mk_ev(
+            "src/real.rs",
+            RetrievalSource::Semantic,
+            EvidenceRelation::Unknown,
+            None,
+            "real impl",
+            0.03,
+        );
+        let noise = mk_ev(
+            "src/noise.rs",
+            RetrievalSource::Bm25,
+            EvidenceRelation::Unknown,
+            None,
+            "noise",
+            0.016,
+        );
+        let opts = FuseOptions {
+            top_n: 1,
+            query_type: QueryType::Conceptual,
+            raw_query: "How is foo implemented?".into(),
+        };
+        let res = fuse_evidence(vec![noise, sem.clone()], opts);
+        assert_eq!(res.ranked[0].file, "src/real.rs");
+    }
+
+    #[test]
+    fn deterministic_ordering_stable() {
+        let evs: Vec<Evidence> = (0..5)
+            .map(|i| {
+                let mut e = mk_ev(
+                    &format!("src/file{}.rs", i),
+                    RetrievalSource::Semantic,
+                    EvidenceRelation::Unknown,
+                    None,
+                    "text",
+                    1.0,
+                );
+                e.final_score = Some(10.0);
+                e.authority_score = Some(10);
+                e
+            })
+            .collect();
+        let opts = FuseOptions {
+            top_n: 5,
+            query_type: QueryType::Conceptual,
+            raw_query: "query".into(),
+        };
+        let r1 = fuse_evidence(evs.clone(), opts.clone());
+        let r2 = fuse_evidence(evs, opts);
+        assert_eq!(
+            r1.ranked.iter().map(|e| &e.file).collect::<Vec<_>>(),
+            r2.ranked.iter().map(|e| &e.file).collect::<Vec<_>>()
         );
     }
 }
