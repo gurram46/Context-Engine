@@ -235,7 +235,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
             )?;
         }
         Some(v) if v == SCHEMA_VERSION => {
-            // Ensure new tables exist even if DB was created with intermediate version (idempotent)
+            // ponytail: SCHEMA_VERSION 3 with representation_hash was introduced in f58e54c (R5.1-C2).
+            // No released/merged history had v3 with old content_hash shape (v2 was 2, v3 is new), so
+            // CREATE IF NOT EXISTS is safe for idempotent re-create. No shape validation/migration
+            // for hypothetical intermediate dev DBs with v3+old shape — not a supported upgrade path.
+            // Supported path is v2->v3 via the Some(2) branch below.
             conn.execute_batch(
                 r#"
                 CREATE TABLE IF NOT EXISTS vectors (
