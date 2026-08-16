@@ -216,10 +216,12 @@ fn fuse_rrf(
 /// Main Rust retrieval pipeline for R4.
 /// 1. classify, 2. plan, 3. Rust exact, 4. Rust structural, 5. BM25 + vector (fused), 6. authority, 7. fuse, 8. pack.
 #[allow(unused_assignments, unused_variables, clippy::too_many_lines)]
-fn semantic_weight_for_query(qt: QueryType) -> f64 {
+pub(crate) fn semantic_weight_for_query(qt: QueryType) -> f64 {
     if let Ok(v) = std::env::var("CONTEXTD_SEMANTIC_WEIGHT") {
         if let Ok(w) = v.parse::<f64>() {
-            return w;
+            if w.is_finite() && w > 0.0 && w <= 10.0 {
+                return w;
+            }
         }
     }
     match qt {
@@ -1130,5 +1132,36 @@ mod tests {
         }];
         let suff = sufficiency(QueryType::Symbol, &candidates, "Foo");
         assert_eq!(suff, EvidenceSufficiency::Insufficient);
+    }
+
+    #[test]
+    fn semantic_weight_validation() {
+        // Default without env
+        std::env::remove_var("CONTEXTD_SEMANTIC_WEIGHT");
+        assert_eq!(semantic_weight_for_query(QueryType::Conceptual), 2.0);
+        assert_eq!(semantic_weight_for_query(QueryType::Symbol), 1.0);
+        // Valid
+        std::env::set_var("CONTEXTD_SEMANTIC_WEIGHT", "2.0");
+        assert_eq!(semantic_weight_for_query(QueryType::Conceptual), 2.0);
+        // Invalid: 0, negative, NaN, inf, huge, non-finite
+        std::env::set_var("CONTEXTD_SEMANTIC_WEIGHT", "0");
+        assert_eq!(semantic_weight_for_query(QueryType::Conceptual), 2.0);
+        std::env::set_var("CONTEXTD_SEMANTIC_WEIGHT", "-1");
+        assert_eq!(semantic_weight_for_query(QueryType::Conceptual), 2.0);
+        std::env::set_var("CONTEXTD_SEMANTIC_WEIGHT", "NaN");
+        assert_eq!(semantic_weight_for_query(QueryType::Conceptual), 2.0);
+        std::env::set_var("CONTEXTD_SEMANTIC_WEIGHT", "inf");
+        assert_eq!(semantic_weight_for_query(QueryType::Conceptual), 2.0);
+        std::env::set_var("CONTEXTD_SEMANTIC_WEIGHT", "100000");
+        assert_eq!(semantic_weight_for_query(QueryType::Conceptual), 2.0);
+        std::env::set_var("CONTEXTD_SEMANTIC_WEIGHT", "10.0");
+        assert_eq!(semantic_weight_for_query(QueryType::Conceptual), 10.0);
+        std::env::set_var("CONTEXTD_SEMANTIC_WEIGHT", "10.1");
+        assert_eq!(semantic_weight_for_query(QueryType::Conceptual), 2.0);
+        std::env::remove_var("CONTEXTD_SEMANTIC_WEIGHT");
+        // Deterministic: same input yields same output
+        let w1 = semantic_weight_for_query(QueryType::Conceptual);
+        let w2 = semantic_weight_for_query(QueryType::Conceptual);
+        assert_eq!(w1, w2);
     }
 }
