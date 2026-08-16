@@ -2199,17 +2199,17 @@ mod tests {
             sync_vectors_for_file(&mut conn, "a.py", &chunks, file_content, &embedder).await?;
         assert_eq!(reused, 0);
         assert_eq!(created, 1, "duplicate reps should create 1 vector");
-        assert_eq!(
-            eligible_chunk_count(&conn)?,
-            2,
-            "eligible should be 2"
-        );
+        assert_eq!(eligible_chunk_count(&conn)?, 2, "eligible should be 2");
         assert_eq!(
             semantic_ref_count(&conn)?,
             2,
             "semantic refs must equal eligible even with duplicate hash"
         );
-        assert_eq!(count_vectors(&conn, &fp)?, 1, "vectors should be 1 for duplicate hash");
+        assert_eq!(
+            count_vectors(&conn, &fp)?,
+            1,
+            "vectors should be 1 for duplicate hash"
+        );
         assert_eq!(missing_vector_count(&conn, &fp)?, 0);
         assert!(is_semantic_ready(&conn, &fp, true)?);
         // Search should fan out to both refs (both chunks share same vector)
@@ -2283,7 +2283,7 @@ mod tests {
                 text_size_bytes: 5,
             },
         ];
-        let (reused, created) =
+        let (_reused, created) =
             sync_vectors_for_file(&mut conn, "a.py", &chunks, file_content, &embedder).await?;
         assert_eq!(created, 1);
         assert_eq!(semantic_ref_count(&conn)?, 2);

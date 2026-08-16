@@ -42,6 +42,7 @@ pub const AUTHORITY_WEIGHTS: &[(&str, i32)] = &[
     ("staleDoc", -30),
     ("shadowPenalty", -12),
     ("legacyScriptPenalty", -10),
+    ("conceptualSemantic", 15), // ponytail: generic boost for semantic when query is conceptual — lets high-value semantic survive lexical noise
 ];
 
 fn get_weight(name: &str) -> i32 {
@@ -457,6 +458,52 @@ pub fn score_authority(
             reasons.push("-15 definition for caller query".to_string());
         }
     }
+    // ponytail: generic conceptual semantic boost — semantic is primary for conceptual queries
+    if query_type == QueryType::Conceptual && evidence.source == RetrievalSource::Semantic {
+        let w = get_weight("conceptualSemantic");
+        score += w;
+        reasons.push(format!("+{} conceptual semantic", w));
+        // ponytail: file path contains query token (e.g., middleware, ignore, transaction) — generic, not repo-specific
+        let lower_file = file.to_lowercase();
+        let lower_q = raw_query.to_lowercase();
+        let stop: std::collections::HashSet<&str> = [
+            "where",
+            "what",
+            "who",
+            "how",
+            "which",
+            "when",
+            "why",
+            "the",
+            "is",
+            "are",
+            "for",
+            "and",
+            "or",
+            "to",
+            "in",
+            "of",
+            "a",
+            "an",
+            "with",
+            "implemented",
+        ]
+        .into_iter()
+        .collect();
+        for tok in lower_q.split(|c: char| !c.is_alphanumeric()) {
+            if tok.len() < 5 {
+                continue;
+            }
+            if stop.contains(tok) {
+                continue;
+            }
+            if lower_file.contains(tok) {
+                score += 5;
+                reasons.push(format!("+5 file contains query token {}", tok));
+                break;
+            }
+        }
+    }
 
     (score, reasons)
 }
@@ -564,5 +611,79 @@ mod tests {
             is_true_definition(&method_target, "Where is Start implemented?"),
             "method with receiver should be true when target matches"
         );
+    }
+
+    #[test]
+    fn conceptual_semantic_gets_boost() {
+        let sem = Evidence {
+            source: RetrievalSource::Semantic,
+            file: "src/foo.rs".into(),
+            start_line: Some(1),
+            end_line: Some(2),
+            symbol: None,
+            symbol_kind: None,
+            text: Some("foo".into()),
+            score: Some(0.03),
+            relation: Some(EvidenceRelation::Unknown),
+            authority_score: None,
+            final_score: None,
+            provenance: None,
+            metadata: None,
+        };
+        let (score_conceptual, _) = score_authority(
+            &sem,
+            crate::types::QueryType::Conceptual,
+            "How is foo implemented?",
+            false,
+        );
+        let (score_other, _) = score_authority(
+            &sem,
+            crate::types::QueryType::Symbol,
+            "Where is foo implemented?",
+            false,
+        );
+        assert!(
+            score_conceptual > score_other,
+            "conceptual semantic should have higher authority than symbol semantic"
+        );
+    }
+
+    #[test]
+    fn file_contains_query_token_boost() {
+        let mut sem = Evidence {
+            source: RetrievalSource::Semantic,
+            file: "packages/core/middleware/container.ts".into(),
+            start_line: Some(1),
+            end_line: Some(2),
+            symbol: None,
+            symbol_kind: None,
+            text: Some("foo".into()),
+            score: Some(0.03),
+            relation: Some(EvidenceRelation::Unknown),
+            authority_score: None,
+            final_score: None,
+            provenance: None,
+            metadata: None,
+        };
+        let (score_match, reasons_match) = score_authority(
+            &sem,
+            crate::types::QueryType::Conceptual,
+            "How is middleware implemented?",
+            false,
+        );
+        sem.file = "packages/core/nest-application.ts".into();
+        let (score_nomatch, _) = score_authority(
+            &sem,
+            crate::types::QueryType::Conceptual,
+            "How is middleware implemented?",
+            false,
+        );
+        assert!(
+            score_match > score_nomatch,
+            "file containing query token should get boost"
+        );
+        assert!(reasons_match
+            .iter()
+            .any(|r| r.contains("file contains query token")));
     }
 }

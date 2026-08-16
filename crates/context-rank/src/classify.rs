@@ -123,6 +123,52 @@ pub fn classify_query(raw: &str) -> ClassifiedQuery {
         };
     }
 
+    // ponytail: How-is conceptual must not be misclassified as Symbol due to framework Pascal like NestJS,
+    // but concrete symbol questions like "How is Model implemented?" must stay Symbol.
+    // Use generic rule: if the token immediately after "how is/are" is a concrete identifier, preserve Symbol.
+    let word_count_early = normalized.split_whitespace().count();
+    if word_count_early >= 4
+        && (lower.starts_with("how is") || lower.starts_with("how are"))
+        && CONCEPT_HINT_RE.is_match(&lower)
+    {
+        // Use normalized (preserves case) for identifier check, but lower for prefix match
+        let after_how = if lower.starts_with("how is") {
+            normalized.get(6..).unwrap_or("").trim_start()
+        } else if lower.starts_with("how are") {
+            normalized.get(7..).unwrap_or("").trim_start()
+        } else {
+            ""
+        };
+        let first_token = after_how
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| {
+                c == '"'
+                    || c == '\''
+                    || c == '`'
+                    || c == '?'
+                    || c == '!'
+                    || c == ','
+                    || c == ';'
+                    || c == ':'
+            })
+            .split(['.', ':'])
+            .next_back()
+            .unwrap_or("");
+        let is_concrete = is_identifier_token(first_token) || has_qualified_symbol(first_token);
+        if !is_concrete {
+            hints.push("conceptual".to_string());
+            return ClassifiedQuery {
+                query_type: QueryType::Conceptual,
+                raw: raw.to_string(),
+                normalized,
+                hints,
+            };
+        }
+        // else: concrete symbol after How is — let it fall through to Symbol logic
+    }
+
     if looks_like_identifier(&normalized)
         || (SYM_DEF_RE.is_match(&lower) && has_identifier(&normalized))
     {
@@ -476,6 +522,49 @@ mod tests {
     fn conceptual_regex_matching() {
         assert_eq!(
             classify_query("How is regex matching implemented?").query_type,
+            QueryType::Conceptual
+        );
+    }
+    #[test]
+    fn how_is_middleware_nestjs_is_conceptual() {
+        // ponytail: How-is with framework Pascal must stay conceptual, not symbol
+        assert_eq!(
+            classify_query("How is middleware implemented in NestJS?").query_type,
+            QueryType::Conceptual
+        );
+    }
+    #[test]
+    fn how_is_model_is_symbol() {
+        assert_eq!(
+            classify_query("How is Model implemented?").query_type,
+            QueryType::Symbol
+        );
+    }
+    #[test]
+    fn how_is_queryset_is_symbol() {
+        assert_eq!(
+            classify_query("How is QuerySet implemented?").query_type,
+            QueryType::Symbol
+        );
+    }
+    #[test]
+    fn how_is_searcher_is_symbol() {
+        assert_eq!(
+            classify_query("How is Searcher implemented?").query_type,
+            QueryType::Symbol
+        );
+    }
+    #[test]
+    fn how_is_authentication_is_conceptual() {
+        assert_eq!(
+            classify_query("How is authentication implemented?").query_type,
+            QueryType::Conceptual
+        );
+    }
+    #[test]
+    fn how_is_transaction_atomic_is_conceptual() {
+        assert_eq!(
+            classify_query("How is transaction atomic implemented?").query_type,
             QueryType::Conceptual
         );
     }
