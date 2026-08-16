@@ -390,12 +390,275 @@ impl ContextService {
         direction: Direction,
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
-        let q = match direction {
-            Direction::Callers => format!("What calls {}?", symbol),
-            Direction::Callees => format!("What does {} call?", symbol),
-            Direction::Both => format!("dependency of {}", symbol),
+        // Graph-native dependency retrieval: directly query call graph, not via generic search
+        self.reconcile_fast_inner(None)
+            .await
+            .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
+        let root = ProjectRoot::resolve(Some(&self.root))
+            .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
+        let _project =
+            ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
+        let t0 = std::time::Instant::now();
+        let mut candidates: Vec<context_rank::types::Evidence> = Vec::new();
+        let mut retrievers_used = Vec::new();
+        let conn = structural_store::open_db(root.path())
+            .map_err(|e| ContextError::Internal(e.to_string()))?;
+        let t_graph = std::time::Instant::now();
+        // Helper to build Evidence from CallEdge
+        let build_evidence_for_edge = |edge: &context_index::structural::types::CallEdge,
+                                       rel: context_rank::types::EvidenceRelation,
+                                       provenance: String|
+         -> anyhow::Result<context_rank::types::Evidence> {
+            // Try to load caller/callee symbol for richer snippet
+            let symbol_info: Option<context_index::structural::types::Symbol> =
+                if rel == context_rank::types::EvidenceRelation::Caller {
+                    structural_store::find_symbol_by_id(&conn, &edge.caller_symbol_id)
+                        .ok()
+                        .flatten()
+                } else if rel == context_rank::types::EvidenceRelation::Callee {
+                    edge.resolved_symbol_id
+                        .as_deref()
+                        .and_then(|id| {
+                            structural_store::find_symbol_by_id(&conn, id)
+                                .ok()
+                                .flatten()
+                        })
+                        .or_else(|| {
+                            structural_store::find_definitions(&conn, &edge.callee_name)
+                                .ok()
+                                .and_then(|v| v.into_iter().next())
+                        })
+                } else {
+                    None
+                };
+            let (file, start_line, end_line, sym_name, sym_kind, text) = if let Some(sym) =
+                symbol_info
+            {
+                let txt = {
+                    let p = root.path().join(&sym.file);
+                    std::fs::read_to_string(&p)
+                        .ok()
+                        .and_then(|c| {
+                            let bytes = c.as_bytes();
+                            let start = sym.start_byte.min(bytes.len());
+                            let end = sym.end_byte.min(bytes.len());
+                            if end > start {
+                                let slice = &c[start..end];
+                                Some(
+                                    slice
+                                        .chars()
+                                        .take(400)
+                                        .collect::<String>()
+                                        .trim()
+                                        .to_string(),
+                                )
+                            } else {
+                                c.lines()
+                                    .nth((sym.start_line as usize).saturating_sub(1))
+                                    .map(|l| l.chars().take(400).collect())
+                            }
+                        })
+                        .unwrap_or_else(|| format!("{} {}", sym.kind.as_str(), sym.qualified_name))
+                };
+                (
+                    sym.file.clone(),
+                    Some(sym.start_line),
+                    Some(sym.end_line),
+                    Some(sym.name.clone()),
+                    Some(sym.kind.as_str().to_string()),
+                    Some(txt),
+                )
+            } else {
+                // Fallback: use edge file/line
+                let txt = {
+                    let p = root.path().join(&edge.file);
+                    std::fs::read_to_string(&p).ok().and_then(|c| {
+                        c.lines()
+                            .nth((edge.line as usize).saturating_sub(1))
+                            .map(|l| l.chars().take(400).collect::<String>())
+                    })
+                };
+                (
+                    edge.file.clone(),
+                    Some(edge.line),
+                    Some(edge.line),
+                    Some(edge.callee_name.clone()),
+                    None,
+                    txt,
+                )
+            };
+            let score = match edge.confidence {
+                context_index::structural::types::CallConfidence::Resolved => 1.0,
+                context_index::structural::types::CallConfidence::Probable => 0.8,
+                context_index::structural::types::CallConfidence::Unresolved => 0.6,
+            };
+            Ok(context_rank::types::Evidence {
+                source: context_rank::types::RetrievalSource::Graph,
+                file,
+                start_line,
+                end_line,
+                symbol: sym_name,
+                symbol_kind: sym_kind,
+                text,
+                score: Some(score),
+                relation: Some(rel),
+                authority_score: None,
+                final_score: None,
+                provenance: Some(provenance),
+                metadata: None,
+            })
         };
-        self.search(&q, opts).await
+        if direction == Direction::Callers || direction == Direction::Both {
+            if let Ok(callers) = structural_store::find_callers(&conn, symbol) {
+                for edge in callers.iter().take(50) {
+                    if let Ok(ev) = build_evidence_for_edge(
+                        edge,
+                        context_rank::types::EvidenceRelation::Caller,
+                        format!("rust:graph:callers:{}", edge.confidence.as_str()),
+                    ) {
+                        candidates.push(ev);
+                    }
+                }
+                retrievers_used.push(format!("rust-graph:callers:{}:{}", symbol, callers.len()));
+            } else {
+                retrievers_used.push(format!("rust-graph:callers:{}:0", symbol));
+            }
+        }
+        if direction == Direction::Callees || direction == Direction::Both {
+            if let Ok(callees) = structural_store::find_callees(&conn, symbol) {
+                for edge in callees.iter().take(20) {
+                    if let Ok(ev) = build_evidence_for_edge(
+                        edge,
+                        context_rank::types::EvidenceRelation::Callee,
+                        format!("rust:graph:callees:{}", edge.confidence.as_str()),
+                    ) {
+                        candidates.push(ev);
+                    }
+                }
+                retrievers_used.push(format!("rust-graph:callees:{}:{}", symbol, callees.len()));
+            } else {
+                retrievers_used.push(format!("rust-graph:callees:{}:0", symbol));
+            }
+        }
+        drop(conn);
+        let graph_ms_total = t_graph.elapsed().as_millis();
+        // If graph returned nothing, still try to provide at least symbol definition as fallback (truthful)
+        if candidates.is_empty() {
+            // Fallback: try symbol definition for the queried symbol itself (not its caller)
+            if let Ok(defs) = structural_store::find_definitions(
+                &structural_store::open_db(root.path()).unwrap(),
+                symbol,
+            ) {
+                for def in defs.iter().take(2) {
+                    let txt = {
+                        let p = root.path().join(&def.file);
+                        std::fs::read_to_string(&p)
+                            .ok()
+                            .and_then(|c| {
+                                let bytes = c.as_bytes();
+                                let start = def.start_byte.min(bytes.len());
+                                let end = def.end_byte.min(bytes.len());
+                                if end > start {
+                                    let slice = &c[start..end];
+                                    Some(
+                                        slice
+                                            .chars()
+                                            .take(400)
+                                            .collect::<String>()
+                                            .trim()
+                                            .to_string(),
+                                    )
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| {
+                                format!("{} {}", def.kind.as_str(), def.qualified_name)
+                            })
+                    };
+                    candidates.push(context_rank::types::Evidence {
+                        source: context_rank::types::RetrievalSource::Symbol,
+                        file: def.file.clone(),
+                        start_line: Some(def.start_line),
+                        end_line: Some(def.end_line),
+                        symbol: Some(def.name.clone()),
+                        symbol_kind: Some(def.kind.as_str().to_string()),
+                        text: Some(txt),
+                        score: Some(1.0),
+                        relation: Some(context_rank::types::EvidenceRelation::Definition),
+                        authority_score: None,
+                        final_score: None,
+                        provenance: Some("rust:symbol".into()),
+                        metadata: None,
+                    });
+                }
+                if !candidates.is_empty() {
+                    retrievers_used.push(format!("rust-symbol:{}:{}", symbol, candidates.len()));
+                }
+            }
+        }
+        // Authority, fuse, pack (reuse pipeline helpers)
+        let t_auth = std::time::Instant::now();
+        // For dependency, use Symbol query type for authority (generic)
+        let scored = context_rank::apply_authority(
+            candidates,
+            context_rank::types::QueryType::Dependency,
+            symbol,
+        );
+        let rank_ms = t_auth.elapsed().as_millis();
+        let t_fuse = std::time::Instant::now();
+        let fused = context_rank::fuse_evidence(
+            scored,
+            context_rank::FuseOptions {
+                top_n: opts.max_results,
+                query_type: context_rank::types::QueryType::Dependency,
+                raw_query: symbol.to_string(),
+            },
+        );
+        let fuse_ms = t_fuse.elapsed().as_millis();
+        let t_pack = std::time::Instant::now();
+        let packed = context_rank::pack_evidence(
+            &fused.ranked,
+            symbol,
+            context_rank::types::QueryType::Dependency,
+            context_rank::PackOptions {
+                budget: opts.budget_tokens,
+                max_files: opts.max_results,
+            },
+        );
+        let pack_ms = t_pack.elapsed().as_millis();
+        let elapsed_ms = t0.elapsed().as_millis();
+        let candidate_count = fused.ranked.len() + fused.deduped + fused.collapsed;
+        let stats = crate::pipeline::PipelineStats {
+            candidate_count,
+            evidence_count: fused.ranked.len(),
+            files_returned: packed.files.len(),
+            packed_tokens: packed.token_estimate,
+            retrievers_used: retrievers_used
+                .into_iter()
+                .chain(vec![
+                    format!("authority:{}", rank_ms),
+                    format!("fuse:{}", fuse_ms),
+                    format!("pack:{}", pack_ms),
+                    format!("graph_ms:{}", graph_ms_total),
+                    format!("structural_ms:{}", graph_ms_total),
+                ])
+                .collect(),
+            elapsed_ms,
+            exact_ms: 0,
+            structural_ms: graph_ms_total,
+            bm25_ms: 0,
+            semantic_ms: 0,
+            rank_ms,
+            pack_ms,
+        };
+        Ok(crate::pipeline::ContextResult {
+            query: symbol.to_string(),
+            query_type: context_rank::types::QueryType::Dependency,
+            evidence: fused.ranked,
+            packed,
+            stats,
+        })
     }
 
     pub async fn tests(

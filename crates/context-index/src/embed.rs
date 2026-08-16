@@ -157,6 +157,16 @@ pub fn configured_fingerprint() -> ModelFingerprint {
             version: "ollama-nomic-embed-text-v1".to_string(),
             dimension: 768,
         },
+        "qwen3-embedding:0.6b" => ModelFingerprint {
+            model_id: "qwen3-embedding:0.6b".to_string(),
+            version: "ollama-qwen3-embedding:0.6b-v1".to_string(),
+            dimension: 1024,
+        },
+        "qwen3-embedding" => ModelFingerprint {
+            model_id: "qwen3-embedding".to_string(),
+            version: "ollama-qwen3-embedding-v1".to_string(),
+            dimension: 1024,
+        },
         other => ModelFingerprint {
             model_id: other.to_string(),
             version: format!("ollama-{}-v1", other),

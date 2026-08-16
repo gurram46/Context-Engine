@@ -358,7 +358,7 @@ pub async fn retrieve_context(
         let conn = structural_store::open_db_async(project.root.clone()).await?;
         if gq.direction == "callers" || gq.direction == "both" {
             if let Ok(callers) = structural_store::find_callers(&conn, &gq.symbol) {
-                for edge in callers.iter().take(5) {
+                for edge in callers.iter().take(50) {
                     let caller_sym = if edge.caller_symbol_id.is_empty() {
                         None
                     } else {
@@ -400,7 +400,7 @@ pub async fn retrieve_context(
         }
         if gq.direction == "callees" || gq.direction == "both" {
             if let Ok(callees) = structural_store::find_callees(&conn, &gq.symbol) {
-                for edge in callees.iter().take(5) {
+                for edge in callees.iter().take(20) {
                     let callee_sym = edge
                         .resolved_symbol_id
                         .as_deref()

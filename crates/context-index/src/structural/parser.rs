@@ -420,14 +420,25 @@ fn walk_rust(
                 let parent_id = enclosing.last().cloned();
                 let line = (node.start_position().row + 1) as u32;
                 references.push(Reference {
-                    name: short,
+                    name: short.clone(),
                     file: file.to_string(),
                     line,
-                    parent_symbol: parent_id,
+                    parent_symbol: parent_id.clone(),
                     kind: ReferenceKind::Call,
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                 });
+                if callee != short {
+                    references.push(Reference {
+                        name: callee.clone(),
+                        file: file.to_string(),
+                        line,
+                        parent_symbol: parent_id,
+                        kind: ReferenceKind::Call,
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                    });
+                }
             }
         }
         _ => {}
@@ -621,7 +632,7 @@ fn walk_py(
                 let line = (node.start_position().row + 1) as u32;
                 let parent_id = enclosing.last().cloned();
                 references.push(Reference {
-                    name: short,
+                    name: short.clone(),
                     file: file.to_string(),
                     line,
                     parent_symbol: parent_id.clone(),
@@ -629,6 +640,17 @@ fn walk_py(
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                 });
+                if callee_full != short {
+                    references.push(Reference {
+                        name: callee_full.clone(),
+                        file: file.to_string(),
+                        line,
+                        parent_symbol: parent_id.clone(),
+                        kind: ReferenceKind::Call,
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                    });
+                }
                 // Also record function-valued arguments for wiring calls (e.g. ctx.invoke(bundle),
                 // cli.add_command(bundle_command.bundle)) so dependency_trace can
                 // discover registration/dispatch call sites. Avoid `process(user_id)` false edges.
@@ -938,14 +960,25 @@ fn walk_go(
                 let line = (node.start_position().row + 1) as u32;
                 let parent_id = enclosing.last().cloned();
                 references.push(Reference {
-                    name: short,
+                    name: short.clone(),
                     file: file.to_string(),
                     line,
-                    parent_symbol: parent_id,
+                    parent_symbol: parent_id.clone(),
                     kind: ReferenceKind::Call,
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                 });
+                if callee_full != short {
+                    references.push(Reference {
+                        name: callee_full.clone(),
+                        file: file.to_string(),
+                        line,
+                        parent_symbol: parent_id,
+                        kind: ReferenceKind::Call,
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                    });
+                }
             }
         }
         _ => {}
@@ -1335,14 +1368,25 @@ fn walk_ts(
                 let line = (node.start_position().row + 1) as u32;
                 let parent_id = enclosing.last().cloned();
                 references.push(Reference {
-                    name: short,
+                    name: short.clone(),
                     file: file.to_string(),
                     line,
-                    parent_symbol: parent_id,
+                    parent_symbol: parent_id.clone(),
                     kind: ReferenceKind::Call,
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                 });
+                if callee_full != short {
+                    references.push(Reference {
+                        name: callee_full.clone(),
+                        file: file.to_string(),
+                        line,
+                        parent_symbol: parent_id,
+                        kind: ReferenceKind::Call,
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                    });
+                }
             }
         }
         _ => {}

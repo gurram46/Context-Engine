@@ -561,7 +561,7 @@ pub fn find_symbol_exact(conn: &Connection, name: &str) -> Result<Vec<Symbol>> {
 pub fn find_symbol_prefix(conn: &Connection, prefix: &str) -> Result<Vec<Symbol>> {
     let pattern = format!("{}%", prefix);
     let mut stmt = conn.prepare(
-        "SELECT id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent FROM symbols WHERE name LIKE ?1 OR qualified_name LIKE ?1 ORDER BY name LIMIT 50",
+        "SELECT id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent FROM symbols WHERE name LIKE ?1 OR qualified_name LIKE ?1 ORDER BY name LIMIT 100",
     )?;
     let rows = stmt.query_map(params![pattern], |row| {
         Ok(Symbol {
@@ -621,7 +621,7 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
     if !ids.is_empty() {
         for id in &ids {
             let mut stmt = conn.prepare(
-                "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE resolved_symbol_id=?1 ORDER BY file, line LIMIT 50",
+                "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE resolved_symbol_id=?1 ORDER BY file, line LIMIT 100",
             )?;
             let rows = stmt.query_map(params![id], |row| {
                 Ok(CallEdge {
@@ -645,9 +645,9 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
             return Ok(out);
         }
     }
-    // Fallback: search by callee_name
+    // Fallback: search by callee_name (also try short name for qualified calls like NestFactory.create)
     let mut stmt = conn.prepare(
-        "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE callee_name=?1 ORDER BY file, line LIMIT 50",
+        "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE callee_name=?1 ORDER BY file, line LIMIT 100",
     )?;
     let rows = stmt.query_map(params![symbol_id_or_name], |row| {
         Ok(CallEdge {
@@ -666,6 +666,70 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
     for r in rows {
         out.push(r?);
     }
+    if !out.is_empty() {
+        return Ok(out);
+    }
+    // For qualified names like NestFactory.create or Foo::bar, also try short name (create, bar)
+    // because call_edges store the short callee for cross-file calls.
+    let short = symbol_id_or_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(symbol_id_or_name)
+        .rsplit("::")
+        .next()
+        .unwrap_or(symbol_id_or_name);
+    if short != symbol_id_or_name {
+        let syms_short = find_definitions(conn, short).unwrap_or_default();
+        let ids_short: Vec<String> = syms_short.iter().map(|s| s.id.clone()).collect();
+        if !ids_short.is_empty() {
+            for id in &ids_short {
+                let mut stmt2 = conn.prepare(
+                    "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE resolved_symbol_id=?1 ORDER BY file, line LIMIT 100",
+                )?;
+                let rows2 = stmt2.query_map(params![id], |row| {
+                    Ok(CallEdge {
+                        caller_symbol_id: row.get(0)?,
+                        callee_name: row.get(1)?,
+                        resolved_symbol_id: row.get(2)?,
+                        confidence: match row.get::<_, String>(3)?.as_str() {
+                            "resolved" => CallConfidence::Resolved,
+                            "probable" => CallConfidence::Probable,
+                            _ => CallConfidence::Unresolved,
+                        },
+                        file: row.get(4)?,
+                        line: row.get(5)?,
+                    })
+                })?;
+                for r in rows2 {
+                    out.push(r?);
+                }
+            }
+            if !out.is_empty() {
+                return Ok(out);
+            }
+        }
+        // Fallback short name by callee_name
+        let mut stmt3 = conn.prepare(
+            "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE callee_name=?1 ORDER BY file, line LIMIT 100",
+        )?;
+        let rows3 = stmt3.query_map(params![short], |row| {
+            Ok(CallEdge {
+                caller_symbol_id: row.get(0)?,
+                callee_name: row.get(1)?,
+                resolved_symbol_id: row.get(2)?,
+                confidence: match row.get::<_, String>(3)?.as_str() {
+                    "resolved" => CallConfidence::Resolved,
+                    "probable" => CallConfidence::Probable,
+                    _ => CallConfidence::Unresolved,
+                },
+                file: row.get(4)?,
+                line: row.get(5)?,
+            })
+        })?;
+        for r in rows3 {
+            out.push(r?);
+        }
+    }
     Ok(out)
 }
 
@@ -681,7 +745,7 @@ pub fn find_callees(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
     let mut out = Vec::new();
     for id in ids {
         let mut stmt = conn.prepare(
-            "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE caller_symbol_id=?1 ORDER BY file, line LIMIT 50",
+            "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE caller_symbol_id=?1 ORDER BY file, line LIMIT 100",
         )?;
         let rows = stmt.query_map(params![id], |row| {
             Ok(CallEdge {
