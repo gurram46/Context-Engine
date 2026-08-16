@@ -269,6 +269,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 println!("BM25 documents: {}", st.bm25_documents);
                 println!("vectors: {}", st.vector_count);
                 println!("eligible chunks: {}", st.eligible_chunk_count);
+                println!("semantic refs: {}", st.semantic_ref_count);
+                println!("representation version: {}", st.representation_version);
                 println!("missing vectors: {}", st.missing_vector_count);
                 println!("stale vectors: {}", st.stale_vector_count);
                 println!("embedding model: {}", st.embedding_model);
