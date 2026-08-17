@@ -51,6 +51,24 @@ if ContextEngineHotAdapter is not None:
     ADAPTERS["context_engine_hot"] = ContextEngineHotAdapter
 
 
+def _timing_record(cold_res, warm_res, one_res, neutral_query="Model", had_index_before=True, adapter="context_engine", repo="test", profile="official"):
+    return {
+        "type": "timing",
+        "adapter": adapter,
+        "repo": repo,
+        "profile": profile,
+        "neutral_query": neutral_query,
+        "had_index_before": had_index_before,
+        "label": "cold first-search wall time (not pure index time)",
+        "cold_wall_ms": getattr(cold_res, "wall_ms", None),
+        "cold_internal_ms": getattr(cold_res, "internal_ms", None),
+        "warm_wall_ms": getattr(warm_res, "wall_ms", None),
+        "warm_internal_ms": getattr(warm_res, "internal_ms", None),
+        "one_file_wall_ms": getattr(one_res, "wall_ms", None),
+        "one_file_internal_ms": getattr(one_res, "internal_ms", None),
+    }
+
+
 def load_questions():
     qs = []
     for p in QUESTIONS_DIR.glob("*.jsonl"):
@@ -229,9 +247,10 @@ def main():
                   "!sample/01-cats-app/src/main.ts\n",
     }
     for repo_name in list(by_repo.keys()):
-        repo_path = REPO_ROOT / "bench" / "repos" / repo_name
-        if not repo_path.exists():
+        entry = repo_map.get(repo_name)
+        if entry is None:
             continue
+        repo_path = ensure_repo(repo_name, entry)
         ignore_path = repo_path / ".ignore"
         is_smoke_ignore = ignore_path.exists() and "bench smoke profile" in ignore_path.read_text(encoding="utf-8", errors="ignore")[:500]
         if profile == "official":
@@ -346,7 +365,6 @@ def main():
                     t0 = time.perf_counter()
                     # Use adapter.search which will trigger reconcile+build if index missing
                     cold_res = adapter.search(neutral_q, repo_path, top_n=5)
-                    cold_wall = cold_res.elapsed_ms
                     # restore backups? Actually keep rebuilt index for subsequent warm measurement; remove backups
                     for orig, bak in backups:
                         try:
@@ -357,14 +375,12 @@ def main():
                     # warm measurement (no change)
                     t1 = time.perf_counter()
                     warm_res = adapter.search(neutral_q, repo_path, top_n=5)
-                    warm_wall = warm_res.elapsed_ms
                     # one-file-change: create disposable file, measure, restore exactly
                     tmp_file = repo_path / "__bench_tmp_one_file_change__.txt"
                     try:
                         tmp_file.write_text("bench timing probe", encoding="utf-8")
                         t2 = time.perf_counter()
                         one_res = adapter.search(neutral_q, repo_path, top_n=5)
-                        one_wall = one_res.elapsed_ms
                     finally:
                         try:
                             if tmp_file.exists():
@@ -376,21 +392,10 @@ def main():
                         adapter.search(neutral_q, repo_path, top_n=5)
                     except Exception:
                         pass
-                    timing_rec = {
-                        "type": "timing",
-                        "adapter": adapter.name,
-                        "repo": repo_name,
-                        "profile": profile,
-                        "neutral_query": neutral_q,
-                        "cold_first_search_wall_ms": cold_wall,
-                        "warm_no_change_wall_ms": warm_wall,
-                        "one_file_change_wall_ms": one_wall,
-                        "had_index_before": had_index,
-                        "label": "cold first-search wall time (not pure index time)",
-                    }
+                    timing_rec = _timing_record(cold_res, warm_res, one_res, neutral_query=neutral_q, had_index_before=had_index, adapter=adapter.name, repo=repo_name, profile=profile)
                     with out_path.open("a", encoding="utf-8") as f:
                         f.write(json.dumps(timing_rec) + "\n")
-                    print(f"[{adapter.name}] timing {repo_name}: cold {cold_wall}ms warm {warm_wall}ms one-file {one_wall}ms", flush=True)
+                    print(f"[{adapter.name}] timing {repo_name}: cold {timing_rec['cold_wall_ms']}ms warm {timing_rec['warm_wall_ms']}ms one-file {timing_rec['one_file_wall_ms']}ms", flush=True)
                 except Exception as e:
                     print(f"[{adapter.name}] timing {repo_name} failed: {e}", file=sys.stderr)
             else:
@@ -398,14 +403,11 @@ def main():
                 try:
                     t0 = time.perf_counter()
                     cold_res = adapter.search(neutral_q, repo_path, top_n=5)
-                    cold_wall = cold_res.elapsed_ms
                     warm_res = adapter.search(neutral_q, repo_path, top_n=5)
-                    warm_wall = warm_res.elapsed_ms
                     tmp_file = repo_path / "__bench_tmp_one_file_change__.txt"
                     try:
                         tmp_file.write_text("bench timing probe", encoding="utf-8")
                         one_res = adapter.search(neutral_q, repo_path, top_n=5)
-                        one_wall = one_res.elapsed_ms
                     finally:
                         try:
                             if tmp_file.exists():
@@ -416,21 +418,10 @@ def main():
                         adapter.search(neutral_q, repo_path, top_n=5)
                     except Exception:
                         pass
-                    timing_rec = {
-                        "type": "timing",
-                        "adapter": adapter.name,
-                        "repo": repo_name,
-                        "profile": profile,
-                        "neutral_query": neutral_q,
-                        "cold_first_search_wall_ms": cold_wall,
-                        "warm_no_change_wall_ms": warm_wall,
-                        "one_file_change_wall_ms": one_wall,
-                        "had_index_before": False,
-                        "label": "cold first-search wall time (not pure index time)",
-                    }
+                    timing_rec = _timing_record(cold_res, warm_res, one_res, neutral_query=neutral_q, had_index_before=False, adapter=adapter.name, repo=repo_name, profile=profile)
                     with out_path.open("a", encoding="utf-8") as f:
                         f.write(json.dumps(timing_rec) + "\n")
-                    print(f"[{adapter.name}] timing {repo_name}: cold {cold_wall}ms warm {warm_wall}ms one-file {one_wall}ms (no prior index)", flush=True)
+                    print(f"[{adapter.name}] timing {repo_name}: cold {timing_rec['cold_wall_ms']}ms warm {timing_rec['warm_wall_ms']}ms one-file {timing_rec['one_file_wall_ms']}ms (no prior index)", flush=True)
                 except Exception as e:
                     print(f"[{adapter.name}] timing {repo_name} failed: {e}", file=sys.stderr)
 
