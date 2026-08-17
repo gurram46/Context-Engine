@@ -371,17 +371,10 @@ impl ContextService {
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
         let t_search = std::time::Instant::now();
-        let (reconcile_stats, _first_project, first_discovery_ms) = self
+        let (reconcile_stats, project, discovery_ms) = self
             .reconcile_fast_with_index_inner(None)
             .await
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
-        let root = ProjectRoot::resolve(Some(&self.root))
-            .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
-        let t_second_discover = std::time::Instant::now();
-        let project =
-            ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
-        let second_discovery_ms = t_second_discover.elapsed().as_millis();
-        let total_discovery_ms = first_discovery_ms.saturating_add(second_discovery_ms);
         let providers = Providers {};
         let mut res = retrieve_context(
             query,
@@ -394,11 +387,11 @@ impl ContextService {
         .map_err(|e| ContextError::Internal(e.to_string()))?;
         // Fill stage telemetry at service layer
         let total_ms = t_search.elapsed().as_millis();
-        let generation = structural_store::open_db(root.path())
+        let generation = structural_store::open_db(&project.root)
             .ok()
             .and_then(|c| structural_store::get_generation(&c).ok());
         res.stats.total_ms = Some(total_ms);
-        res.stats.discovery_ms = Some(total_discovery_ms);
+        res.stats.discovery_ms = Some(discovery_ms);
         res.stats.reconcile_ms = Some(reconcile_stats.elapsed_ms);
         res.stats.generation = generation;
         // dirty_file_count stays None until E2 (no dirty tracking yet)
@@ -429,13 +422,12 @@ impl ContextService {
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
         // Graph-native dependency retrieval: directly query call graph, not via generic search
+        // E1: reconcile already does one discovery; remove duplicate unused ProjectIndex::discover
         self.reconcile_fast_inner(None)
             .await
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
         let root = ProjectRoot::resolve(Some(&self.root))
             .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
-        let _project =
-            ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
         let t0 = std::time::Instant::now();
         let mut candidates: Vec<context_rank::types::Evidence> = Vec::new();
         let mut retrievers_used = Vec::new();

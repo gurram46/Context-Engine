@@ -861,14 +861,15 @@ pub async fn retrieve_context(
                             q.chars().take(15).collect::<String>(),
                             vector_candidates.len()
                         ));
+                        total_search = total_search.saturating_add(t_search.elapsed().as_millis());
                         break;
                     }
                     Err(e) => {
                         tracing::debug!(error=%e, "vector search failed");
                         retrievers_used.push("rust-semantic:0".into());
+                        total_search = total_search.saturating_add(t_search.elapsed().as_millis());
                     }
                 }
-                total_search = total_search.saturating_add(t_search.elapsed().as_millis());
             }
             semantic_ms = t_sem.elapsed().as_millis();
             semantic_embed_ms = Some(total_embed);

@@ -505,6 +505,9 @@ def main():
                     "dirty_file_count": getattr(res, "dirty_file_count", None),
                     "vector_count_scanned": getattr(res, "vector_count_scanned", None),
                     "cache_hit": getattr(res, "cache_hit", None),
+                    "process_pid": getattr(res, "process_pid", None),
+                    "startup_ms": getattr(res, "startup_ms", None),
+                    "transport_ms": (getattr(res, "wall_ms", None) - getattr(res, "total_ms", None)) if getattr(res, "wall_ms", None) is not None and getattr(res, "total_ms", None) is not None else None,
                 }
                 with out_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(record) + "\n")

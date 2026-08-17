@@ -61,6 +61,8 @@ class SearchResult:
     dirty_file_count: Optional[int] = None
     vector_count_scanned: Optional[int] = None
     cache_hit: Optional[bool] = None
+    process_pid: Optional[int] = None
+    startup_ms: Optional[int] = None
     # Raw for debugging
     raw: Optional[Dict] = None
 

@@ -73,6 +73,7 @@ class _McpClient:
     def __init__(self, repo_path: Path):
         self.repo_path = repo_path
         self.bin = _ensure_built()
+        t_start = time.perf_counter()
         self.proc = subprocess.Popen(
             [str(self.bin), "--root", str(repo_path), "mcp"],
             stdin=subprocess.PIPE,
@@ -89,6 +90,9 @@ class _McpClient:
         self._reader_thread = threading.Thread(target=self._reader, daemon=True)
         self._reader_thread.start()
         self._initialize()
+        self.startup_ms = int((time.perf_counter() - t_start) * 1000)
+        self.os_pid = self.proc.pid
+        self.contextd_pid = self.os_pid
 
     def _send(self, obj: dict):
         line = json.dumps(obj, ensure_ascii=False)
@@ -396,22 +400,38 @@ class ContextEngineHotAdapter(BenchmarkAdapter):
         vector_scanned = g("vector_count_scanned", "vectorCountScanned", None)
 
         # hot must report both wall and internal
-        # we store wall in retrievers for visibility and keep elapsed_ms as internal per spec? But spec says report BOTH.
-        # So we put internal in elapsed_ms, and wall in separate field via retrievers and also use wall_ms for timing.
-        # For compatibility, we return SearchResult with elapsed_ms = internal, but we stash wall in retrievers and also raw.
+        # wall is adapter-measured per query (excludes startup), internal is engine pipeline
+        # transport = wall - total_ms (total includes discovery+reconcile+pipeline)
+        total_for_transport = total_ms if total_ms is not None else internal_ms
+        transport = wall_ms - total_for_transport if total_for_transport is not None else None
         retrievers = list(retrievers) if isinstance(retrievers, list) else []
         # append wall vs internal for debugging
         retrievers.append(f"wall:{wall_ms}")
         retrievers.append(f"internal:{internal_ms}")
+        if total_ms is not None:
+            retrievers.append(f"total:{total_ms}")
+        if transport is not None:
+            retrievers.append(f"transport:{transport}")
         if discovery_ms is not None:
             retrievers.append(f"discovery:{discovery_ms}")
         if reconcile_ms is not None:
             retrievers.append(f"reconcile:{reconcile_ms}")
+        # PID diagnostic
+        pid_for_query = client.contextd_pid
+        startup_for_query = client.startup_ms
 
         # SearchResult currently has fields for stage timings, we map them
         # It does not have discovery/reconcile fields yet; we will extend it via raw and also via new fields if present
         from .interface import SearchResult as SR
 
+        # determine cache hit: if semantic ran and embed 0, likely cache hit
+        cache_hit_val = None
+        if semantic_embed_ms is not None and semantic_search_ms is not None:
+            # if embed 0 but search >0, we had cache hit (or semantic skipped)
+            if semantic_embed_ms == 0 and vector_scanned is not None and vector_scanned > 0:
+                cache_hit_val = True
+            elif semantic_embed_ms is not None and semantic_embed_ms > 0:
+                cache_hit_val = False
         res = SR(
             query=query,
             hits=hits,
@@ -440,10 +460,16 @@ class ContextEngineHotAdapter(BenchmarkAdapter):
             generation=int(generation) if generation is not None else None,
             dirty_file_count=int(dirty) if dirty is not None else None,
             vector_count_scanned=int(vector_scanned) if vector_scanned is not None else None,
-            cache_hit=None,
+            cache_hit=cache_hit_val,
+            process_pid=pid_for_query,
+            startup_ms=startup_for_query,
             raw={
                 "wall_ms": wall_ms,
                 "internal_ms": internal_ms,
+                "total_ms": total_ms,
+                "transport_ms": transport,
+                "startup_ms": startup_for_query,
+                "process_pid": pid_for_query,
                 "stats": stats,
                 "data": data,
                 "discovery_ms": discovery_ms,
@@ -456,6 +482,7 @@ class ContextEngineHotAdapter(BenchmarkAdapter):
                 "generation": generation,
                 "dirty_file_count": dirty,
                 "vector_count_scanned": vector_scanned,
+                "cache_hit": cache_hit_val,
             },
         )
         return res

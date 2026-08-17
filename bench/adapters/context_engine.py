@@ -310,6 +310,13 @@ class ContextEngineAdapter(BenchmarkAdapter):
         if "candidate_tokens" in stats:
             candidate_tokens = stats["candidate_tokens"]
 
+        # infer cache hit
+        cache_hit_inferred = cache_hit
+        if cache_hit_inferred is None and semantic_embed_ms is not None and semantic_search_ms is not None:
+            if semantic_embed_ms == 0 and vector_scanned is not None and vector_scanned > 0:
+                cache_hit_inferred = True
+            elif semantic_embed_ms is not None and semantic_embed_ms > 0:
+                cache_hit_inferred = False
         # retrievers: append wall vs internal for visibility
         retrievers = list(retrievers) if isinstance(retrievers, list) else []
         retrievers.append(f"wall:{wall_ms}")
@@ -347,6 +354,8 @@ class ContextEngineAdapter(BenchmarkAdapter):
             generation=int(generation) if generation is not None else None,
             dirty_file_count=int(dirty) if dirty is not None else None,
             vector_count_scanned=int(vector_scanned) if vector_scanned is not None else None,
-            cache_hit=bool(cache_hit) if cache_hit is not None else None,
-            raw=data,
+            cache_hit=bool(cache_hit_inferred) if cache_hit_inferred is not None else None,
+            process_pid=None,
+            startup_ms=None,
+            raw={**data, "wall_ms": wall_ms, "internal_ms": internal_ms, "cache_hit_inferred": cache_hit_inferred},
         )
