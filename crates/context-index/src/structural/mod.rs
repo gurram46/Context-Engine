@@ -21,6 +21,12 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// Structural extraction version — increments when parser/extraction semantics change
+/// (e.g., storing both short+qualified for qualified calls). Separate from SQLite SCHEMA_VERSION.
+/// Stored in structural_meta as EXTRACTION_VERSION_KEY. When mismatch, forces one-time reparse.
+pub const STRUCTURAL_EXTRACTION_VERSION: u32 = 2;
+pub const EXTRACTION_VERSION_KEY: &str = "structural_extraction_version";
+
 /// Indexer stats.
 #[derive(Debug, Clone, Default)]
 pub struct IndexStats {
@@ -85,6 +91,17 @@ impl StructuralIndex {
     pub fn build_with_delta(&self, project: &ProjectIndex) -> Result<StructuralBuildOutcome> {
         let t0 = Instant::now();
         let mut conn = store::open_db(&self.root)?;
+        // Check structural extraction version — if mismatch, force reparse of all files
+        let stored_version = store::get_meta(&conn, EXTRACTION_VERSION_KEY).unwrap_or(None);
+        let current_version_str = STRUCTURAL_EXTRACTION_VERSION.to_string();
+        let needs_extraction_upgrade = stored_version.as_deref() != Some(&current_version_str);
+        if needs_extraction_upgrade {
+            tracing::info!(
+                stored = ?stored_version,
+                current = STRUCTURAL_EXTRACTION_VERSION,
+                "structural extraction version mismatch, forcing reparse of all structural files"
+            );
+        }
         let structural_files = collect_structural_files(&self.root, project);
         let mut stats = IndexStats {
             files_discovered: structural_files.len(),
@@ -113,11 +130,13 @@ impl StructuralIndex {
             if cur_hash.is_empty() {
                 continue;
             }
-            if let Some(prev_hash) = existing_map.get(rel) {
-                if prev_hash == cur_hash {
-                    stats.files_skipped += 1;
-                    existing_map.remove(rel);
-                    continue;
+            if !needs_extraction_upgrade {
+                if let Some(prev_hash) = existing_map.get(rel) {
+                    if prev_hash == cur_hash {
+                        stats.files_skipped += 1;
+                        existing_map.remove(rel);
+                        continue;
+                    }
                 }
             }
             // Capture old definitions before overwrite for affected detection
@@ -225,6 +244,14 @@ impl StructuralIndex {
             stats.structural_generation = gen;
         } else {
             stats.structural_generation = store::get_generation(&conn).unwrap_or(0);
+        }
+
+        // Store extraction version after successful build
+        if needs_extraction_upgrade {
+            let _ = store::set_meta(&conn, EXTRACTION_VERSION_KEY, &current_version_str);
+        } else if stored_version.is_none() {
+            // First build with no version stored
+            let _ = store::set_meta(&conn, EXTRACTION_VERSION_KEY, &current_version_str);
         }
 
         stats.elapsed_ms = t0.elapsed().as_millis();
@@ -1071,6 +1098,181 @@ mod tests {
             let nxt = si.find_callers("foo")?;
             assert_eq!(format!("{:?}", nxt), first_str, "20x determinism");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn extraction_version_upgrade_forces_reparse() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        // Create file with qualified call Factory.create()
+        std::fs::write(
+            tmp.path().join("a.py"),
+            b"class Factory:\n    @staticmethod\n    def create():\n        pass\ndef caller():\n    Factory.create()\n",
+        )?;
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let si = StructuralIndex::new(&root);
+        let out1 = si.build(&idx).unwrap();
+        assert!(out1.files_parsed >= 1);
+        // Verify current extraction version stored and qualified ref exists
+        let conn = store::open_db(tmp.path())?;
+        let ver: Option<String> = store::get_meta(&conn, EXTRACTION_VERSION_KEY)?;
+        let cur = STRUCTURAL_EXTRACTION_VERSION.to_string();
+        assert_eq!(ver.as_deref(), Some(cur.as_str()));
+        let refs: Vec<String> = conn
+            .prepare("SELECT name FROM refs WHERE file='a.py'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            refs.contains(&"Factory.create".to_string()),
+            "new parser should store qualified, got {:?}",
+            refs
+        );
+        assert!(refs.contains(&"create".to_string()));
+        // Simulate old index: delete qualified refs and downgrade version to 1
+        conn.execute("DELETE FROM refs WHERE name='Factory.create'", [])?;
+        store::set_meta(&conn, EXTRACTION_VERSION_KEY, "1")?;
+        // Also delete call_edges for qualified to simulate old
+        conn.execute(
+            "DELETE FROM call_edges WHERE callee_name='Factory.create'",
+            [],
+        )?;
+        // Verify qualified gone, short remains
+        let remaining: Vec<String> = conn
+            .prepare("SELECT name FROM refs WHERE file='a.py'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(!remaining.contains(&"Factory.create".to_string()));
+        assert!(remaining.contains(&"create".to_string()));
+        // Reconcile with unchanged source hash — should force reparse due to version mismatch
+        let idx2 = ProjectIndex::discover(&root).unwrap();
+        let out2 = si.build(&idx2).unwrap();
+        // Should have reparsed despite same hash
+        assert_eq!(
+            out2.files_skipped, 0,
+            "upgrade should not skip, files_skipped=0"
+        );
+        assert!(out2.files_parsed >= 1, "upgrade should reparse");
+        // Verify qualified restored
+        let conn2 = store::open_db(tmp.path())?;
+        let refs2: Vec<String> = conn2
+            .prepare("SELECT name FROM refs WHERE file='a.py'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            refs2.contains(&"Factory.create".to_string()),
+            "after upgrade qualified should exist, got {:?}",
+            refs2
+        );
+        let ver2: Option<String> = store::get_meta(&conn2, EXTRACTION_VERSION_KEY)?;
+        let cur2 = STRUCTURAL_EXTRACTION_VERSION.to_string();
+        assert_eq!(ver2.as_deref(), Some(cur2.as_str()));
+        // Second reconcile with same hash and current version should skip
+        let idx3 = ProjectIndex::discover(&root).unwrap();
+        let out3 = si.build(&idx3).unwrap();
+        assert_eq!(out3.files_skipped, 1);
+        assert_eq!(out3.files_parsed, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn qualified_name_collision_isolation() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        std::fs::write(
+            tmp.path().join("foo_def.py"),
+            b"class Foo:\n    @staticmethod\n    def create():\n        pass\n",
+        )?;
+        std::fs::write(
+            tmp.path().join("bar_def.py"),
+            b"class Bar:\n    @staticmethod\n    def create():\n        pass\n",
+        )?;
+        std::fs::write(
+            tmp.path().join("caller_foo.py"),
+            b"def callerFoo():\n    Foo.create()\n",
+        )?;
+        std::fs::write(
+            tmp.path().join("caller_bar.py"),
+            b"def callerBar():\n    Bar.create()\n",
+        )?;
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let si = StructuralIndex::new(&root);
+        si.build(&idx).unwrap();
+        let callers_foo = si.find_callers("Foo.create")?;
+        let callers_bar = si.find_callers("Bar.create")?;
+        let callers_short = si.find_callers("create")?;
+        assert!(
+            callers_foo.iter().any(|e| e.file == "caller_foo.py"),
+            "Foo.create should find callerFoo"
+        );
+        assert!(
+            !callers_foo.iter().any(|e| e.file == "caller_bar.py"),
+            "Foo.create must NOT find callerBar, got {:?}",
+            callers_foo
+        );
+        assert!(
+            callers_bar.iter().any(|e| e.file == "caller_bar.py"),
+            "Bar.create should find callerBar"
+        );
+        assert!(
+            !callers_bar.iter().any(|e| e.file == "caller_foo.py"),
+            "Bar.create must NOT find callerFoo"
+        );
+        // Short query may return both (intentionally ambiguous)
+        assert!(
+            callers_short.iter().any(|e| e.file == "caller_foo.py"),
+            "short create should find foo"
+        );
+        assert!(
+            callers_short.iter().any(|e| e.file == "caller_bar.py"),
+            "short create should find bar"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn same_line_callee_both_survive() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        // Python: two calls on same line
+        std::fs::write(
+            tmp.path().join("callee_defs.py"),
+            b"def foo():\n    pass\ndef bar():\n    pass\n",
+        )?;
+        std::fs::write(
+            tmp.path().join("target.py"),
+            b"def target():\n    foo(); bar()\n",
+        )?;
+        // Also Go: same line
+        std::fs::write(
+            tmp.path().join("go_target.go"),
+            b"package main\nfunc foo_go(){}\nfunc bar_go(){}\nfunc target_go(){ foo_go(); bar_go() }\n",
+        )?;
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let si = StructuralIndex::new(&root);
+        si.build(&idx).unwrap();
+        let callees = si.find_callees("target")?;
+        let callee_names: Vec<_> = callees.iter().map(|e| e.callee_name.clone()).collect();
+        assert!(
+            callee_names.contains(&"foo".to_string()),
+            "same-line foo should survive, got {:?}",
+            callee_names
+        );
+        assert!(
+            callee_names.contains(&"bar".to_string()),
+            "same-line bar should survive, got {:?}",
+            callee_names
+        );
+        assert!(
+            callees.len() >= 2,
+            "distinct callees >=2, got {}",
+            callees.len()
+        );
+        // Go same-line
+        let callees_go = si.find_callees("target_go")?;
+        let callee_go_names: Vec<_> = callees_go.iter().map(|e| e.callee_name.clone()).collect();
+        assert!(callee_go_names.contains(&"foo_go".to_string()), "go foo_go");
+        assert!(callee_go_names.contains(&"bar_go".to_string()), "go bar_go");
         Ok(())
     }
 }

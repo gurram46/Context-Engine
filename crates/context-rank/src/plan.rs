@@ -89,34 +89,11 @@ pub fn build_retrieval_plan(raw: &str) -> RetrievalPlan {
                 symbol: id.clone(),
                 direction: "callers".to_string(),
             });
-            // For qualified calls like NestFactory.create or Foo::bar, also query the short name
-            // because call_edges store the short callee (create, bar) for cross-file calls.
-            let short = id
-                .rsplit('.')
-                .next()
-                .unwrap_or(&id)
-                .rsplit("::")
-                .next()
-                .unwrap_or(&id)
-                .to_string();
-            if short != id {
-                graph_queries.push(GraphRequest {
-                    symbol: short.clone(),
-                    direction: "callers".to_string(),
-                });
-                symbol_queries.push(short.clone());
-            }
             if raw.to_lowercase().contains("callees") || raw.to_lowercase().contains("what does") {
                 graph_queries.push(GraphRequest {
                     symbol: id.clone(),
                     direction: "callees".to_string(),
                 });
-                if short != id {
-                    graph_queries.push(GraphRequest {
-                        symbol: short,
-                        direction: "callees".to_string(),
-                    });
-                }
             }
             exact_queries.push(ExactQuery::Literal(id.clone()));
         }

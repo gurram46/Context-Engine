@@ -616,7 +616,11 @@ fn dedup_call_edges(edges: Vec<CallEdge>) -> Vec<CallEdge> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for e in edges {
-        let key = format!("{}:{}:{}", e.file, e.line, e.caller_symbol_id);
+        let target = e
+            .resolved_symbol_id
+            .clone()
+            .unwrap_or_else(|| e.callee_name.clone());
+        let key = format!("{}:{}:{}:{}", e.file, e.line, e.caller_symbol_id, target);
         if seen.insert(key) {
             out.push(e);
         }
@@ -680,67 +684,6 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
     }
     if !out.is_empty() {
         return Ok(dedup_call_edges(out));
-    }
-    // For qualified names like NestFactory.create or Foo::bar, also try short name (create, bar)
-    // because call_edges store the short callee for cross-file calls.
-    let short = symbol_id_or_name
-        .rsplit('.')
-        .next()
-        .unwrap_or(symbol_id_or_name)
-        .rsplit("::")
-        .next()
-        .unwrap_or(symbol_id_or_name);
-    if short != symbol_id_or_name {
-        let syms_short = find_definitions(conn, short).unwrap_or_default();
-        let ids_short: Vec<String> = syms_short.iter().map(|s| s.id.clone()).collect();
-        if !ids_short.is_empty() {
-            for id in &ids_short {
-                let mut stmt2 = conn.prepare(
-                    "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE resolved_symbol_id=?1 ORDER BY file, line LIMIT 100",
-                )?;
-                let rows2 = stmt2.query_map(params![id], |row| {
-                    Ok(CallEdge {
-                        caller_symbol_id: row.get(0)?,
-                        callee_name: row.get(1)?,
-                        resolved_symbol_id: row.get(2)?,
-                        confidence: match row.get::<_, String>(3)?.as_str() {
-                            "resolved" => CallConfidence::Resolved,
-                            "probable" => CallConfidence::Probable,
-                            _ => CallConfidence::Unresolved,
-                        },
-                        file: row.get(4)?,
-                        line: row.get(5)?,
-                    })
-                })?;
-                for r in rows2 {
-                    out.push(r?);
-                }
-            }
-            if !out.is_empty() {
-                return Ok(dedup_call_edges(out));
-            }
-        }
-        // Fallback short name by callee_name
-        let mut stmt3 = conn.prepare(
-            "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE callee_name=?1 ORDER BY file, line LIMIT 100",
-        )?;
-        let rows3 = stmt3.query_map(params![short], |row| {
-            Ok(CallEdge {
-                caller_symbol_id: row.get(0)?,
-                callee_name: row.get(1)?,
-                resolved_symbol_id: row.get(2)?,
-                confidence: match row.get::<_, String>(3)?.as_str() {
-                    "resolved" => CallConfidence::Resolved,
-                    "probable" => CallConfidence::Probable,
-                    _ => CallConfidence::Unresolved,
-                },
-                file: row.get(4)?,
-                line: row.get(5)?,
-            })
-        })?;
-        for r in rows3 {
-            out.push(r?);
-        }
     }
     Ok(dedup_call_edges(out))
 }

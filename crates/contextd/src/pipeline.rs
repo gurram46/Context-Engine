@@ -360,7 +360,11 @@ pub async fn retrieve_context(
         if gq.direction == "callers" || gq.direction == "both" {
             if let Ok(callers) = structural_store::find_callers(&conn, &gq.symbol) {
                 for edge in callers.iter().take(50) {
-                    let graph_key = format!("caller:{}:{}", edge.file, edge.line);
+                    let target = edge
+                        .resolved_symbol_id
+                        .clone()
+                        .unwrap_or_else(|| edge.callee_name.clone());
+                    let graph_key = format!("caller:{}:{}:{}", edge.file, edge.line, target);
                     if !seen_graph.insert(graph_key.clone()) {
                         continue;
                     }
@@ -406,7 +410,14 @@ pub async fn retrieve_context(
         if gq.direction == "callees" || gq.direction == "both" {
             if let Ok(callees) = structural_store::find_callees(&conn, &gq.symbol) {
                 for edge in callees.iter().take(20) {
-                    let graph_key = format!("callee:{}:{}", edge.file, edge.line);
+                    let target = edge
+                        .resolved_symbol_id
+                        .clone()
+                        .unwrap_or_else(|| edge.callee_name.clone());
+                    let graph_key = format!(
+                        "callee:{}:{}:{}:{}",
+                        edge.caller_symbol_id, edge.file, edge.line, target
+                    );
                     if !seen_graph.insert(graph_key.clone()) {
                         continue;
                     }
