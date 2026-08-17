@@ -296,6 +296,12 @@ pub fn score_authority(
             w,
             evidence.relation.unwrap().as_str()
         ));
+        if query_type == QueryType::Dependency
+            && evidence.relation == Some(EvidenceRelation::Caller)
+        {
+            score += 30;
+            reasons.push("+30 dependency graph caller".to_string());
+        }
     }
     if kind == FileKind::Source {
         let w = get_weight("sameLanguageImpl");

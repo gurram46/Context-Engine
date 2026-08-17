@@ -561,7 +561,7 @@ pub fn find_symbol_exact(conn: &Connection, name: &str) -> Result<Vec<Symbol>> {
 pub fn find_symbol_prefix(conn: &Connection, prefix: &str) -> Result<Vec<Symbol>> {
     let pattern = format!("{}%", prefix);
     let mut stmt = conn.prepare(
-        "SELECT id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent FROM symbols WHERE name LIKE ?1 OR qualified_name LIKE ?1 ORDER BY name LIMIT 50",
+        "SELECT id, name, qualified_name, kind, file, language, start_line, end_line, start_byte, end_byte, visibility, parent FROM symbols WHERE name LIKE ?1 OR qualified_name LIKE ?1 ORDER BY name LIMIT 100",
     )?;
     let rows = stmt.query_map(params![pattern], |row| {
         Ok(Symbol {
@@ -612,6 +612,22 @@ pub fn find_references(conn: &Connection, name: &str) -> Result<Vec<Reference>> 
     Ok(out)
 }
 
+fn dedup_call_edges(edges: Vec<CallEdge>) -> Vec<CallEdge> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for e in edges {
+        let target = e
+            .resolved_symbol_id
+            .clone()
+            .unwrap_or_else(|| e.callee_name.clone());
+        let key = format!("{}:{}:{}:{}", e.file, e.line, e.caller_symbol_id, target);
+        if seen.insert(key) {
+            out.push(e);
+        }
+    }
+    out
+}
+
 pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<CallEdge>> {
     // Resolve symbol name to ids, then find edges where resolved_symbol_id matches or callee_name matches
     // First try to find symbol ids for name
@@ -621,7 +637,7 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
     if !ids.is_empty() {
         for id in &ids {
             let mut stmt = conn.prepare(
-                "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE resolved_symbol_id=?1 ORDER BY file, line LIMIT 50",
+                "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE resolved_symbol_id=?1 ORDER BY file, line LIMIT 100",
             )?;
             let rows = stmt.query_map(params![id], |row| {
                 Ok(CallEdge {
@@ -642,12 +658,12 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
             }
         }
         if !out.is_empty() {
-            return Ok(out);
+            return Ok(dedup_call_edges(out));
         }
     }
-    // Fallback: search by callee_name
+    // Fallback: search by exact qualified callee_name
     let mut stmt = conn.prepare(
-        "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE callee_name=?1 ORDER BY file, line LIMIT 50",
+        "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE callee_name=?1 ORDER BY file, line LIMIT 100",
     )?;
     let rows = stmt.query_map(params![symbol_id_or_name], |row| {
         Ok(CallEdge {
@@ -666,7 +682,10 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
     for r in rows {
         out.push(r?);
     }
-    Ok(out)
+    if !out.is_empty() {
+        return Ok(dedup_call_edges(out));
+    }
+    Ok(dedup_call_edges(out))
 }
 
 pub fn find_callees(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<CallEdge>> {
@@ -681,7 +700,7 @@ pub fn find_callees(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
     let mut out = Vec::new();
     for id in ids {
         let mut stmt = conn.prepare(
-            "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE caller_symbol_id=?1 ORDER BY file, line LIMIT 50",
+            "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE caller_symbol_id=?1 ORDER BY file, line LIMIT 100",
         )?;
         let rows = stmt.query_map(params![id], |row| {
             Ok(CallEdge {
@@ -701,7 +720,7 @@ pub fn find_callees(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
             out.push(r?);
         }
     }
-    Ok(out)
+    Ok(dedup_call_edges(out))
 }
 
 pub fn find_tests_related(conn: &Connection, query: &str) -> Result<Vec<Symbol>> {
