@@ -56,6 +56,29 @@ pub struct PipelineStats {
     pub semantic_ms: u128,
     pub rank_ms: u128,
     pub pack_ms: u128,
+    // E1 precise stage telemetry — Option<null> when not measurable yet
+    #[serde(default)]
+    pub total_ms: Option<u128>,
+    #[serde(default)]
+    pub discovery_ms: Option<u128>,
+    #[serde(default)]
+    pub reconcile_ms: Option<u128>,
+    #[serde(default)]
+    pub semantic_embed_ms: Option<u128>,
+    #[serde(default)]
+    pub semantic_search_ms: Option<u128>,
+    #[serde(default)]
+    pub fusion_ms: Option<u128>,
+    #[serde(default)]
+    pub authority_ms: Option<u128>,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub dirty_file_count: Option<usize>,
+    #[serde(default)]
+    pub vector_count_scanned: Option<usize>,
+    #[serde(default)]
+    pub cache_hit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,6 +667,9 @@ pub async fn retrieve_context(
     let mut vector_candidates: Vec<(Evidence, usize, f64)> = Vec::new();
     let mut bm25_ms: u128 = 0;
     let mut semantic_ms: u128 = 0;
+    let semantic_embed_ms: Option<u128>;
+    let semantic_search_ms: Option<u128>;
+    let mut vector_count_scanned: Option<usize> = None;
 
     // BM25 native — for SYMBOL/DEPENDENCY insufficient, fallback to raw query if no semantic_queries
     if run_bm25 {
@@ -736,8 +762,13 @@ pub async fn retrieve_context(
         if semantic_disabled {
             retrievers_used.push("rust-semantic:disabled".into());
             semantic_ms = 0;
+            semantic_embed_ms = Some(0);
+            semantic_search_ms = Some(0);
+            vector_count_scanned = None;
         } else {
             let t_sem = Instant::now();
+            let mut total_embed: u128 = 0;
+            let mut total_search: u128 = 0;
             // Use canonical configured embedder/fingerprint (CONTEXTD_EMBED_MODEL drives both indexing and query)
             let embedder: std::sync::Arc<dyn context_index::embed::Embedder> =
                 std::sync::Arc::new(context_index::embed::configured_embedder());
@@ -757,6 +788,7 @@ pub async fn retrieve_context(
             for sq in &semantic_queries {
                 let q = sq.clone();
                 // Embed query without holding DB connection (Connection is !Send)
+                let t_embed = Instant::now();
                 let qvec = {
                     let cached = context_index::embed::QUERY_CACHE.get(&fp, &q).await;
                     if let Some(v) = cached {
@@ -777,14 +809,23 @@ pub async fn retrieve_context(
                         }
                     }
                 };
+                total_embed = total_embed.saturating_add(t_embed.elapsed().as_millis());
                 // Now open DB for brute search (moved off async executor thread)
                 let conn = structural_store::open_db_async(project.root.clone()).await?;
                 let cnt = context_index::vector::count_vectors(&conn, &fp).unwrap_or(0);
                 if cnt == 0 {
                     tracing::debug!("no vectors for model {}, skipping semantic", fp.model_id);
                     retrievers_used.push(format!("rust-semantic:0:{}", fp.model_id));
+                    vector_count_scanned = Some(0);
                     continue;
                 }
+                if vector_count_scanned.is_none() {
+                    vector_count_scanned = Some(cnt as usize);
+                } else {
+                    // keep max
+                    vector_count_scanned = Some(vector_count_scanned.unwrap().max(cnt as usize));
+                }
+                let t_search = Instant::now();
                 match context_index::vector::search_brute(
                     &conn,
                     &qvec,
@@ -827,11 +868,17 @@ pub async fn retrieve_context(
                         retrievers_used.push("rust-semantic:0".into());
                     }
                 }
+                total_search = total_search.saturating_add(t_search.elapsed().as_millis());
             }
             semantic_ms = t_sem.elapsed().as_millis();
+            semantic_embed_ms = Some(total_embed);
+            semantic_search_ms = Some(total_search);
         }
     } else {
         retrievers_used.push("rust-semantic:skipped".into());
+        semantic_embed_ms = None;
+        semantic_search_ms = None;
+        vector_count_scanned = None;
     }
 
     // Fuse BM25 + vector via RRF (rank-normalized)
@@ -970,6 +1017,17 @@ pub async fn retrieve_context(
         semantic_ms,
         rank_ms,
         pack_ms,
+        total_ms: Some(elapsed_ms),
+        discovery_ms: None,
+        reconcile_ms: None,
+        semantic_embed_ms,
+        semantic_search_ms,
+        fusion_ms: Some(fuse_ms),
+        authority_ms: Some(rank_ms),
+        generation: None,
+        dirty_file_count: None,
+        vector_count_scanned,
+        cache_hit: None,
     };
 
     Ok(ContextResult {
