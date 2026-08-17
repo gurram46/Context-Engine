@@ -231,6 +231,16 @@ impl ContextService {
         &self,
         override_embedder: Option<Arc<dyn Embedder>>,
     ) -> Result<ReconcileStats, ContextError> {
+        let (stats, _idx, _discovery_ms) = self
+            .reconcile_fast_with_index_inner(override_embedder)
+            .await?;
+        Ok(stats)
+    }
+
+    async fn reconcile_fast_with_index_inner(
+        &self,
+        override_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Result<(ReconcileStats, ProjectIndex, u128), ContextError> {
         let _guard = self.build_lock.lock().await;
         let t0 = std::time::Instant::now();
         let root = ProjectRoot::resolve(Some(&self.root))
@@ -246,8 +256,10 @@ impl ContextService {
         } else {
             false
         };
+        let t_discover = std::time::Instant::now();
         let idx =
             ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
+        let discovery_ms = t_discover.elapsed().as_millis();
         let root_path = root.path().to_path_buf();
         let idx_clone = idx.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -315,7 +327,7 @@ impl ContextService {
         }
 
         let elapsed = t0.elapsed().as_millis();
-        Ok(ReconcileStats {
+        let stats = ReconcileStats {
             discovered: idx.stats.discovered,
             changed_files: outcome.changed_files.len(),
             deleted_files: outcome.deleted_files.len(),
@@ -323,7 +335,8 @@ impl ContextService {
             vectors_created,
             vectors_reused,
             embedding_calls,
-        })
+        };
+        Ok((stats, idx, discovery_ms))
     }
 
     /// Cheap reconcile — discovery + incremental structural/BM25 + semantic if available (fast, incremental only).
@@ -357,15 +370,13 @@ impl ContextService {
         query: &str,
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
-        self.reconcile_fast_inner(None)
+        let t_search = std::time::Instant::now();
+        let (reconcile_stats, project, discovery_ms) = self
+            .reconcile_fast_with_index_inner(None)
             .await
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
-        let root = ProjectRoot::resolve(Some(&self.root))
-            .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
-        let project =
-            ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
         let providers = Providers {};
-        retrieve_context(
+        let mut res = retrieve_context(
             query,
             &project,
             &providers,
@@ -373,7 +384,23 @@ impl ContextService {
             opts.max_results,
         )
         .await
-        .map_err(|e| ContextError::Internal(e.to_string()))
+        .map_err(|e| ContextError::Internal(e.to_string()))?;
+        // Fill stage telemetry at service layer
+        let total_ms = t_search.elapsed().as_millis();
+        let generation = structural_store::open_db(&project.root)
+            .ok()
+            .and_then(|c| structural_store::get_generation(&c).ok());
+        res.stats.total_ms = Some(total_ms);
+        res.stats.discovery_ms = Some(discovery_ms);
+        res.stats.reconcile_ms = Some(reconcile_stats.elapsed_ms);
+        res.stats.generation = generation;
+        // dirty_file_count stays None until E2 (no dirty tracking yet)
+        res.stats.dirty_file_count = None;
+        res.stats.cache_hit = None;
+        if res.stats.authority_ms.is_none() {
+            res.stats.authority_ms = Some(res.stats.rank_ms);
+        }
+        Ok(res)
     }
 
     pub async fn symbol(
@@ -391,13 +418,12 @@ impl ContextService {
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
         // Graph-native dependency retrieval: directly query call graph, not via generic search
+        // E1: reconcile already does one discovery; remove duplicate unused ProjectIndex::discover
         self.reconcile_fast_inner(None)
             .await
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
         let root = ProjectRoot::resolve(Some(&self.root))
             .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
-        let _project =
-            ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
         let t0 = std::time::Instant::now();
         let mut candidates: Vec<context_rank::types::Evidence> = Vec::new();
         let mut retrievers_used = Vec::new();
@@ -650,6 +676,17 @@ impl ContextService {
             semantic_ms: 0,
             rank_ms,
             pack_ms,
+            total_ms: Some(elapsed_ms),
+            discovery_ms: None,
+            reconcile_ms: None,
+            semantic_embed_ms: None,
+            semantic_search_ms: None,
+            fusion_ms: Some(fuse_ms),
+            authority_ms: Some(rank_ms),
+            generation: None,
+            dirty_file_count: None,
+            vector_count_scanned: None,
+            cache_hit: None,
         };
         Ok(crate::pipeline::ContextResult {
             query: symbol.to_string(),

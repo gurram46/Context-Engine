@@ -120,12 +120,23 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         "packed_tokens": res.stats.packed_tokens,
                         "retrievers": res.stats.retrievers_used,
                         "elapsed_ms": res.stats.elapsed_ms,
+                        "total_ms": res.stats.total_ms,
+                        "discovery_ms": res.stats.discovery_ms,
+                        "reconcile_ms": res.stats.reconcile_ms,
                         "exact_ms": res.stats.exact_ms,
                         "structural_ms": res.stats.structural_ms,
                         "bm25_ms": res.stats.bm25_ms,
                         "semantic_ms": res.stats.semantic_ms,
+                        "semantic_embed_ms": res.stats.semantic_embed_ms,
+                        "semantic_search_ms": res.stats.semantic_search_ms,
                         "rank_ms": res.stats.rank_ms,
+                        "authority_ms": res.stats.authority_ms,
+                        "fusion_ms": res.stats.fusion_ms,
                         "pack_ms": res.stats.pack_ms,
+                        "generation": res.stats.generation,
+                        "dirty_file_count": res.stats.dirty_file_count,
+                        "vector_count_scanned": res.stats.vector_count_scanned,
+                        "cache_hit": res.stats.cache_hit,
                     }
                 });
                 // Debug observability only when --debug is set, not in normal JSON output

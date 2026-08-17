@@ -60,6 +60,7 @@ impl McpAdapter {
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let stats_json = serde_json::to_value(&res.stats).unwrap_or(serde_json::json!({}));
         let out = serde_json::json!({
             "query": res.query,
             "type": res.query_type.as_str(),
@@ -74,14 +75,7 @@ impl McpAdapter {
                 "authorityScore": e.authority_score,
                 "finalScore": e.final_score,
             })).collect::<Vec<_>>(),
-            "stats": {
-                "candidate_count": res.stats.candidate_count,
-                "evidence_count": res.stats.evidence_count,
-                "files_returned": res.stats.files_returned,
-                "packed_tokens": res.stats.packed_tokens,
-                "retrievers": res.stats.retrievers_used,
-                "elapsed_ms": res.stats.elapsed_ms,
-            }
+            "stats": stats_json
         });
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(
