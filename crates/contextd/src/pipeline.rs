@@ -352,13 +352,18 @@ pub async fn retrieve_context(
         retrievers_used.push(format!("rust-symbol:{}:{}", sym, added));
     }
 
-    // Native Rust structural graph
+    // Native Rust structural graph — dedup same callsite across short+qualified queries
+    let mut seen_graph: std::collections::HashSet<String> = std::collections::HashSet::new();
     for gq in &plan.graph_queries {
         let mut added = 0usize;
         let conn = structural_store::open_db_async(project.root.clone()).await?;
         if gq.direction == "callers" || gq.direction == "both" {
             if let Ok(callers) = structural_store::find_callers(&conn, &gq.symbol) {
                 for edge in callers.iter().take(50) {
+                    let graph_key = format!("caller:{}:{}", edge.file, edge.line);
+                    if !seen_graph.insert(graph_key.clone()) {
+                        continue;
+                    }
                     let caller_sym = if edge.caller_symbol_id.is_empty() {
                         None
                     } else {
@@ -401,6 +406,10 @@ pub async fn retrieve_context(
         if gq.direction == "callees" || gq.direction == "both" {
             if let Ok(callees) = structural_store::find_callees(&conn, &gq.symbol) {
                 for edge in callees.iter().take(20) {
+                    let graph_key = format!("callee:{}:{}", edge.file, edge.line);
+                    if !seen_graph.insert(graph_key.clone()) {
+                        continue;
+                    }
                     let callee_sym = edge
                         .resolved_symbol_id
                         .as_deref()

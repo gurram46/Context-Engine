@@ -302,23 +302,6 @@ pub fn score_authority(
             score += 30;
             reasons.push("+30 dependency graph caller".to_string());
         }
-        // Caller-specific boosts for known benchmark patterns (generic, not repo-hardcoded)
-        // For get_queryset, views/generic are the canonical callers (list, detail, dates, edit)
-        if query_type == QueryType::Dependency
-            && target_sym.as_deref() == Some("get_queryset")
-            && file.contains("views/generic")
-        {
-            score += 20;
-            reasons.push("+20 views generic for get_queryset".to_string());
-        }
-        // For NestFactory.create, sample and tools/benchmarks are the expected callers
-        if query_type == QueryType::Dependency
-            && target_sym.as_deref() == Some("nestfactory.create")
-            && (file.contains("sample/01-cats-app") || file.contains("tools/benchmarks"))
-        {
-            score += 20;
-            reasons.push("+20 sample for NestFactory.create".to_string());
-        }
     }
     if kind == FileKind::Source {
         let w = get_weight("sameLanguageImpl");

@@ -545,10 +545,9 @@ impl ContextService {
         // If graph returned nothing, still try to provide at least symbol definition as fallback (truthful)
         if candidates.is_empty() {
             // Fallback: try symbol definition for the queried symbol itself (not its caller)
-            if let Ok(defs) = structural_store::find_definitions(
-                &structural_store::open_db(root.path()).unwrap(),
-                symbol,
-            ) {
+            let conn_fallback = structural_store::open_db(root.path())
+                .map_err(|e| ContextError::Internal(format!("open_db for fallback failed: {e}")))?;
+            if let Ok(defs) = structural_store::find_definitions(&conn_fallback, symbol) {
                 for def in defs.iter().take(2) {
                     let txt = {
                         let p = root.path().join(&def.file);
@@ -1169,5 +1168,173 @@ mod tests {
         let stats2 = svc.reconcile_fast_inner(Some(fake.clone())).await.unwrap();
         assert_eq!(stats2.changed_files, 0);
         assert_eq!(stats2.vectors_created, 0);
+    }
+
+    #[tokio::test]
+    async fn dependency_db_failure_returns_error_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".context")).unwrap();
+        // Make .context/index a file to cause DB open failure
+        std::fs::write(root.join(".context/index"), b"not a directory").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let res = svc
+            .dependency("foo", Direction::Callers, SearchOptions::default())
+            .await;
+        assert!(
+            res.is_err(),
+            "dependency should return error on DB failure, not panic"
+        );
+        let err = res.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err.contains("open_db") || err.contains("reconcile") || err.contains("internal"),
+            "error should mention open_db/reconcile, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_dedup_short_qualified_same_callsite() {
+        // Verify that storing both short and qualified for same call site does not duplicate final result
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // Create a TS file with qualified call NestFactory.create()
+        std::fs::write(
+            root.join("a.ts"),
+            b"import { NestFactory } from '@nestjs/core';\nasync function bootstrap(){ await NestFactory.create(null); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.ts"),
+            b"export class NestFactory { static create(x:any){} }\n",
+        )
+        .unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        // Build index
+        svc.reconcile().await.unwrap();
+        // Query qualified
+        let res_q = svc
+            .dependency(
+                "NestFactory.create",
+                Direction::Callers,
+                SearchOptions::default(),
+            )
+            .await
+            .unwrap();
+        // Query short
+        let res_s = svc
+            .dependency("create", Direction::Callers, SearchOptions::default())
+            .await
+            .unwrap();
+        // Qualified should find at least a.ts
+        assert!(
+            res_q.evidence.iter().any(|e| e.file == "a.ts"),
+            "qualified should find a.ts"
+        );
+        // Short should also find a.ts (via short edge)
+        assert!(
+            res_s.evidence.iter().any(|e| e.file == "a.ts"),
+            "short should find a.ts"
+        );
+        // Check no duplicate same file/line in qualified result
+        let mut seen = std::collections::HashSet::new();
+        for e in &res_q.evidence {
+            let key = format!("{}:{}:{:?}", e.file, e.start_line.unwrap_or(0), e.symbol);
+            assert!(
+                seen.insert(key.clone()),
+                "duplicate evidence for same callsite in qualified result: {}",
+                key
+            );
+        }
+        // Also check short result has no duplicate same file/line
+        let mut seen2 = std::collections::HashSet::new();
+        for e in &res_s.evidence {
+            let key = format!("{}:{}:{:?}", e.file, e.start_line.unwrap_or(0), e.symbol);
+            assert!(
+                seen2.insert(key.clone()),
+                "duplicate evidence for same callsite in short result: {}",
+                key
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_api_truthfulness() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("a.py"), b"def foo():\n    bar()\n    baz()\n").unwrap();
+        std::fs::write(
+            root.join("b.py"),
+            b"def bar():\n    pass\ndef baz():\n    pass\n",
+        )
+        .unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        svc.reconcile().await.unwrap();
+        // Callees of foo should include bar and baz
+        let res_callees = svc
+            .dependency("foo", Direction::Callees, SearchOptions::default())
+            .await
+            .unwrap();
+        let _files_callees: Vec<_> = res_callees
+            .evidence
+            .iter()
+            .map(|e| e.file.clone())
+            .collect();
+        // Check that at least bar or baz callee is found (via callee_name)
+        // Callees relation should be Callee
+        assert!(
+            res_callees
+                .evidence
+                .iter()
+                .any(|e| e.relation == Some(context_rank::types::EvidenceRelation::Callee)),
+            "callees should have Callee relation"
+        );
+        // Callers of bar should include a.py (foo)
+        let res_callers = svc
+            .dependency("bar", Direction::Callers, SearchOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            res_callers.evidence.iter().any(|e| e.file == "a.py"
+                && e.relation == Some(context_rank::types::EvidenceRelation::Caller)),
+            "bar callers should include a.py"
+        );
+        // Both should have both relations marked correctly
+        let res_both = svc
+            .dependency("foo", Direction::Both, SearchOptions::default())
+            .await
+            .unwrap();
+        let _has_caller = res_both
+            .evidence
+            .iter()
+            .any(|e| e.relation == Some(context_rank::types::EvidenceRelation::Caller));
+        let has_callee = res_both
+            .evidence
+            .iter()
+            .any(|e| e.relation == Some(context_rank::types::EvidenceRelation::Callee));
+        // foo is a caller of bar/baz, and has no callers itself, so Both for foo should have at least Callees
+        assert!(has_callee, "Both should include Callees for foo");
+        // Fallback: query non-existent symbol should return Definition fallback, not fabricated caller
+        let res_fallback = svc
+            .dependency(
+                "nonexistent_xyz_123",
+                Direction::Callers,
+                SearchOptions::default(),
+            )
+            .await
+            .unwrap();
+        if !res_fallback.evidence.is_empty() {
+            for e in &res_fallback.evidence {
+                assert!(
+                    e.relation == Some(context_rank::types::EvidenceRelation::Definition)
+                        || e.relation == Some(context_rank::types::EvidenceRelation::Unknown),
+                    "fallback should be Definition, not Caller/Callee, got {:?}",
+                    e.relation
+                );
+            }
+        }
     }
 }

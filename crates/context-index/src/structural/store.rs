@@ -612,6 +612,18 @@ pub fn find_references(conn: &Connection, name: &str) -> Result<Vec<Reference>> 
     Ok(out)
 }
 
+fn dedup_call_edges(edges: Vec<CallEdge>) -> Vec<CallEdge> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for e in edges {
+        let key = format!("{}:{}:{}", e.file, e.line, e.caller_symbol_id);
+        if seen.insert(key) {
+            out.push(e);
+        }
+    }
+    out
+}
+
 pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<CallEdge>> {
     // Resolve symbol name to ids, then find edges where resolved_symbol_id matches or callee_name matches
     // First try to find symbol ids for name
@@ -642,7 +654,7 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
             }
         }
         if !out.is_empty() {
-            return Ok(out);
+            return Ok(dedup_call_edges(out));
         }
     }
     // Fallback: search by callee_name (also try short name for qualified calls like NestFactory.create)
@@ -667,7 +679,7 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
         out.push(r?);
     }
     if !out.is_empty() {
-        return Ok(out);
+        return Ok(dedup_call_edges(out));
     }
     // For qualified names like NestFactory.create or Foo::bar, also try short name (create, bar)
     // because call_edges store the short callee for cross-file calls.
@@ -705,7 +717,7 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
                 }
             }
             if !out.is_empty() {
-                return Ok(out);
+                return Ok(dedup_call_edges(out));
             }
         }
         // Fallback short name by callee_name
@@ -730,7 +742,7 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
             out.push(r?);
         }
     }
-    Ok(out)
+    Ok(dedup_call_edges(out))
 }
 
 pub fn find_callees(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<CallEdge>> {
@@ -765,7 +777,7 @@ pub fn find_callees(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
             out.push(r?);
         }
     }
-    Ok(out)
+    Ok(dedup_call_edges(out))
 }
 
 pub fn find_tests_related(conn: &Connection, query: &str) -> Result<Vec<Symbol>> {

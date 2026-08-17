@@ -925,4 +925,152 @@ mod tests {
         assert_eq!(stats3.files_deleted, 1);
         Ok(())
     }
+
+    #[test]
+    fn generic_graph_fixtures_direct_qualified_multiple_callees() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        // Direct: foo -> bar
+        std::fs::write(
+            tmp.path().join("direct.py"),
+            b"def bar():\n    pass\ndef foo():\n    bar()\n",
+        )?;
+        // Qualified: Foo.bar() style (Python class)
+        std::fs::write(
+            tmp.path().join("qualified.py"),
+            b"class MyClass:\n    def my_method(self):\n        pass\ndef caller_q():\n    obj = MyClass()\n    obj.my_method()\n",
+        )?;
+        // TS qualified NestFactory.create style
+        std::fs::write(
+            tmp.path().join("ts_qualified.ts"),
+            b"class NestFactory { static create(x:any){} }\nfunction caller_ts(){ NestFactory.create(null); }\n",
+        )?;
+        // Multiple callers: a,b -> target, c unrelated
+        std::fs::write(tmp.path().join("target.py"), b"def target():\n    pass\n")?;
+        std::fs::write(
+            tmp.path().join("caller_a.py"),
+            b"def caller_a():\n    target()\n",
+        )?;
+        std::fs::write(
+            tmp.path().join("caller_b.py"),
+            b"def caller_b():\n    target()\n",
+        )?;
+        std::fs::write(
+            tmp.path().join("unrelated.py"),
+            b"def unrelated():\n    pass\n",
+        )?;
+        // Callees: foo -> bar,baz
+        std::fs::write(
+            tmp.path().join("callee_src.py"),
+            b"def my_caller():\n    bar()\n    baz()\n",
+        )?;
+        std::fs::write(tmp.path().join("bar.py"), b"def bar():\n    pass\n")?;
+        std::fs::write(tmp.path().join("baz.py"), b"def baz():\n    pass\n")?;
+        // Go direct
+        std::fs::write(
+            tmp.path().join("go_direct.go"),
+            b"package main\nfunc bar_go(){}\nfunc foo_go(){ bar_go() }\n",
+        )?;
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let si = StructuralIndex::new(&root);
+        si.build(&idx).unwrap();
+
+        // Direct: foo callers should include direct.py's foo? Actually bar callers should include foo
+        let callers_bar = si.find_callers("bar")?;
+        assert!(
+            callers_bar.iter().any(|e| e.file == "direct.py"),
+            "direct: bar callers should include direct.py"
+        );
+        // Short query bar should find
+        let callers_bar_short = si.find_callers("bar")?;
+        assert!(!callers_bar_short.is_empty());
+
+        // Qualified: my_method via short and qualified
+        let callers_short = si.find_callers("my_method")?;
+        assert!(
+            callers_short.iter().any(|e| e.file == "qualified.py"),
+            "qualified short should find caller"
+        );
+        // TS qualified both forms
+        let q_qual = si.find_callers("NestFactory.create")?;
+        let q_short = si.find_callers("create")?;
+        assert!(
+            q_qual.iter().any(|e| e.file == "ts_qualified.ts"),
+            "qualified query should find"
+        );
+        assert!(
+            q_short.iter().any(|e| e.file == "ts_qualified.ts"),
+            "short query should find"
+        );
+        // Multiple callers: target should have 2 callers (a,b)
+        let callers_target = si.find_callers("target")?;
+        let files_target: Vec<_> = callers_target.iter().map(|e| e.file.clone()).collect();
+        assert!(
+            files_target.iter().any(|f| f == "caller_a.py"),
+            "multiple callers a"
+        );
+        assert!(
+            files_target.iter().any(|f| f == "caller_b.py"),
+            "multiple callers b"
+        );
+        assert!(
+            !files_target.iter().any(|f| f == "unrelated.py"),
+            "unrelated should not be caller"
+        );
+        // Callees: my_caller -> bar,baz
+        let callees = si.find_callees("my_caller")?;
+        let callee_names: Vec<_> = callees.iter().map(|e| e.callee_name.clone()).collect();
+        assert!(
+            callee_names.contains(&"bar".to_string()),
+            "callees should include bar"
+        );
+        assert!(
+            callee_names.contains(&"baz".to_string()),
+            "callees should include baz"
+        );
+        // Both: check relations via direct store
+        let both_callers = si.find_callers("target")?;
+        let both_callees = si.find_callees("my_caller")?;
+        assert!(!both_callers.is_empty());
+        assert!(!both_callees.is_empty());
+        // Dedup: same callsite short+qualified should not duplicate final caller list for that site beyond one per query
+        // For ts_qualified, qualified query should not have duplicate same file/line
+        let mut seen = std::collections::HashSet::new();
+        for e in &q_qual {
+            let key = format!("{}:{}", e.file, e.line);
+            assert!(seen.insert(key.clone()), "qualified dedup failed: {}", key);
+        }
+        let mut seen2 = std::collections::HashSet::new();
+        for e in &q_short {
+            // Short query for create will include many, but for ts_qualified site, ensure not duplicated
+            let key = format!("{}:{}:{}", e.file, e.line, e.callee_name);
+            assert!(seen2.insert(key.clone()), "short dedup failed: {}", key);
+        }
+        // Go
+        let callers_go = si.find_callers("bar_go")?;
+        assert!(
+            callers_go.iter().any(|e| e.file == "go_direct.go"),
+            "go caller"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn determinism_20x() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        std::fs::write(tmp.path().join("a.py"), b"def foo():\n    pass\n")?;
+        std::fs::write(tmp.path().join("b.py"), b"def bar():\n    foo()\n")?;
+        std::fs::write(tmp.path().join("c.py"), b"def baz():\n    foo()\n")?;
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let si = StructuralIndex::new(&root);
+        si.build(&idx).unwrap();
+        let first = si.find_callers("foo")?;
+        let first_str = format!("{:?}", first);
+        for _ in 0..20 {
+            let nxt = si.find_callers("foo")?;
+            assert_eq!(format!("{:?}", nxt), first_str, "20x determinism");
+        }
+        Ok(())
+    }
 }
