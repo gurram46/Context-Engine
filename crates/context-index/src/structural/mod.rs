@@ -112,6 +112,9 @@ impl StructuralIndex {
         let existing = store::list_files(&conn).unwrap_or_default();
         let mut existing_map: std::collections::HashMap<String, String> =
             existing.into_iter().collect();
+        let previously_indexed: std::collections::HashSet<String> =
+            existing_map.keys().cloned().collect();
+        let mut extraction_upgrade_complete = true;
 
         // Track incremental state
         let mut changed_files: Vec<String> = Vec::new();
@@ -150,12 +153,30 @@ impl StructuralIndex {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(file=%rel, error=%e, "skip unreadable file, preserve last-good");
+                    if needs_extraction_upgrade && previously_indexed.contains(rel) {
+                        extraction_upgrade_complete = false;
+                        tracing::warn!(
+                            file = %rel,
+                            "extraction upgrade incomplete: unreadable previously indexed file"
+                        );
+                    }
                     existing_map.remove(rel);
                     continue;
                 }
             };
             let actual_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
             let pf = parse_file(rel, &content, &actual_hash);
+            if needs_extraction_upgrade
+                && previously_indexed.contains(rel)
+                && pf.parse_error.is_some()
+            {
+                extraction_upgrade_complete = false;
+                tracing::warn!(
+                    file = %rel,
+                    error = ?pf.parse_error,
+                    "extraction upgrade incomplete: parse error preserves old extraction data"
+                );
+            }
             let size = content.len() as u64;
             // Determine affected from old vs new
             let old_names: std::collections::HashSet<String> = old_symbols_map
@@ -193,6 +214,13 @@ impl StructuralIndex {
                 }
                 Err(e) => {
                     tracing::warn!(file=%rel, error=%e, "upsert failed, preserve");
+                    if needs_extraction_upgrade && previously_indexed.contains(rel) {
+                        extraction_upgrade_complete = false;
+                        tracing::warn!(
+                            file = %rel,
+                            "extraction upgrade incomplete: upsert failed for previously indexed file"
+                        );
+                    }
                     existing_map.remove(rel);
                 }
             }
@@ -246,12 +274,19 @@ impl StructuralIndex {
             stats.structural_generation = store::get_generation(&conn).unwrap_or(0);
         }
 
-        // Store extraction version after successful build
+        // Store extraction version after successful build — only if every old file was upgraded
         if needs_extraction_upgrade {
-            let _ = store::set_meta(&conn, EXTRACTION_VERSION_KEY, &current_version_str);
+            if extraction_upgrade_complete {
+                store::set_meta(&conn, EXTRACTION_VERSION_KEY, &current_version_str)?;
+            } else {
+                tracing::warn!(
+                    stored = ?stored_version,
+                    "extraction upgrade incomplete, leaving version unchanged — next reconcile will retry"
+                );
+            }
         } else if stored_version.is_none() {
             // First build with no version stored
-            let _ = store::set_meta(&conn, EXTRACTION_VERSION_KEY, &current_version_str);
+            store::set_meta(&conn, EXTRACTION_VERSION_KEY, &current_version_str)?;
         }
 
         stats.elapsed_ms = t0.elapsed().as_millis();
@@ -1172,6 +1207,147 @@ mod tests {
         let out3 = si.build(&idx3).unwrap();
         assert_eq!(out3.files_skipped, 1);
         assert_eq!(out3.files_parsed, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn extraction_partial_upgrade_does_not_advance_version() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        // Two previously indexed files at v2
+        std::fs::write(
+            tmp.path().join("a.py"),
+            b"class Factory:\n    @staticmethod\n    def create():\n        pass\ndef caller_a():\n    Factory.create()\n",
+        )?;
+        std::fs::write(
+            tmp.path().join("b.py"),
+            b"class Other:\n    @staticmethod\n    def create():\n        pass\ndef caller_b():\n    Other.create()\n",
+        )?;
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let si = StructuralIndex::new(&root);
+        let out1 = si.build(&idx).unwrap();
+        assert!(out1.files_parsed >= 2);
+        // Verify both have qualified refs
+        let conn = store::open_db(tmp.path())?;
+        let refs_a: Vec<String> = conn
+            .prepare("SELECT name FROM refs WHERE file='a.py'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(refs_a.contains(&"Factory.create".to_string()));
+        let refs_b: Vec<String> = conn
+            .prepare("SELECT name FROM refs WHERE file='b.py'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(refs_b.contains(&"Other.create".to_string()));
+        // Simulate old v1: delete qualified for both and downgrade to 1
+        conn.execute("DELETE FROM refs WHERE name='Factory.create'", [])?;
+        conn.execute("DELETE FROM refs WHERE name='Other.create'", [])?;
+        conn.execute(
+            "DELETE FROM call_edges WHERE callee_name='Factory.create'",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM call_edges WHERE callee_name='Other.create'",
+            [],
+        )?;
+        store::set_meta(&conn, EXTRACTION_VERSION_KEY, "1")?;
+        // Make b.py unreadable via parse error: invalid syntax
+        std::fs::write(tmp.path().join("b.py"), b"def broken(\n")?;
+        // a.py remains valid and will upgrade successfully; b.py will preserve old (no qualified) and block version
+        let idx2 = ProjectIndex::discover(&root).unwrap();
+        let out2 = si.build(&idx2).unwrap();
+        // b.py had parse error, so should have been flagged incomplete
+        // Verify version still 1
+        let conn2 = store::open_db(tmp.path())?;
+        let ver2: Option<String> = store::get_meta(&conn2, EXTRACTION_VERSION_KEY)?;
+        assert_eq!(
+            ver2.as_deref(),
+            Some("1"),
+            "partial upgrade must not advance version"
+        );
+        // a.py should have been upgraded (qualified restored) even though overall version not advanced
+        let refs_a2: Vec<String> = conn2
+            .prepare("SELECT name FROM refs WHERE file='a.py'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            refs_a2.contains(&"Factory.create".to_string()),
+            "successful file a.py may retain upgraded data, got {:?}",
+            refs_a2
+        );
+        // b.py still without qualified (preserved old)
+        let refs_b2: Vec<String> = conn2
+            .prepare("SELECT name FROM refs WHERE file='b.py'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            !refs_b2.contains(&"Other.create".to_string()),
+            "b.py should still lack qualified after failed upgrade"
+        );
+        // Repair b.py to valid
+        std::fs::write(
+            tmp.path().join("b.py"),
+            b"class Other:\n    @staticmethod\n    def create():\n        pass\ndef caller_b():\n    Other.create()\n",
+        )?;
+        let idx3 = ProjectIndex::discover(&root).unwrap();
+        let out3 = si.build(&idx3).unwrap();
+        // Now upgrade should succeed and version become 2
+        let conn3 = store::open_db(tmp.path())?;
+        let ver3: Option<String> = store::get_meta(&conn3, EXTRACTION_VERSION_KEY)?;
+        let cur = STRUCTURAL_EXTRACTION_VERSION.to_string();
+        assert_eq!(ver3.as_deref(), Some(cur.as_str()));
+        let refs_b3: Vec<String> = conn3
+            .prepare("SELECT name FROM refs WHERE file='b.py'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(refs_b3.contains(&"Other.create".to_string()));
+        // Third reconcile should skip
+        let idx4 = ProjectIndex::discover(&root).unwrap();
+        let out4 = si.build(&idx4).unwrap();
+        assert_eq!(out4.files_skipped, 2);
+        assert_eq!(out4.files_parsed, 0);
+        // Ensure out2 and out3 had expected behavior (out2 not counted as skipped, out3 reparsed)
+        assert!(out2.files_parsed >= 1);
+        assert!(out3.files_parsed >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn extraction_parse_error_preserves_and_blocks_version() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        std::fs::write(
+            tmp.path().join("a.py"),
+            b"def foo():\n    pass\ndef caller():\n    foo()\n",
+        )?;
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let si = StructuralIndex::new(&root);
+        si.build(&idx).unwrap();
+        // Verify foo exists
+        let conn = store::open_db(tmp.path())?;
+        let refs: Vec<String> = conn
+            .prepare("SELECT name FROM refs WHERE file='a.py'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(refs.contains(&"foo".to_string()));
+        // Downgrade to 1 and introduce parse error
+        store::set_meta(&conn, EXTRACTION_VERSION_KEY, "1")?;
+        // Make file have parse error but was previously indexed
+        std::fs::write(tmp.path().join("a.py"), b"def broken(\n")?;
+        let idx2 = ProjectIndex::discover(&root).unwrap();
+        let out2 = si.build(&idx2).unwrap();
+        // Should preserve old and not advance version
+        let conn2 = store::open_db(tmp.path())?;
+        let ver2: Option<String> = store::get_meta(&conn2, EXTRACTION_VERSION_KEY)?;
+        assert_eq!(ver2.as_deref(), Some("1"));
+        // Old symbols should still exist (preserved)
+        let syms = store::load_symbols_for_file(&conn2, "a.py")?;
+        assert!(
+            syms.iter().any(|s| s.name == "foo"),
+            "last-known-good should be preserved"
+        );
+        // Even though build completed, version not advanced
+        assert!(out2.files_parsed == 0 || out2.files_skipped == 0); // parse error counts as not parsed? but version still 1
         Ok(())
     }
 

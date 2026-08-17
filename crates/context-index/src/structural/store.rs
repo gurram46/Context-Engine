@@ -661,7 +661,7 @@ pub fn find_callers(conn: &Connection, symbol_id_or_name: &str) -> Result<Vec<Ca
             return Ok(dedup_call_edges(out));
         }
     }
-    // Fallback: search by callee_name (also try short name for qualified calls like NestFactory.create)
+    // Fallback: search by exact qualified callee_name
     let mut stmt = conn.prepare(
         "SELECT caller_symbol_id, callee_name, resolved_symbol_id, confidence, file, line FROM call_edges WHERE callee_name=?1 ORDER BY file, line LIMIT 100",
     )?;
