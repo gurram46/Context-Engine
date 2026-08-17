@@ -397,12 +397,8 @@ impl ContextService {
         // dirty_file_count stays None until E2 (no dirty tracking yet)
         res.stats.dirty_file_count = None;
         res.stats.cache_hit = None;
-        // ensure authority/fusion mirrored if not set
         if res.stats.authority_ms.is_none() {
             res.stats.authority_ms = Some(res.stats.rank_ms);
-        }
-        if res.stats.fusion_ms.is_none() {
-            res.stats.fusion_ms = Some(res.stats.pack_ms);
         }
         Ok(res)
     }
