@@ -1,6 +1,6 @@
 use anyhow::Result;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -370,6 +370,226 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Mark-only dirty state. `Unknown` means the watcher cannot tell which paths changed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DirtyState {
+    #[default]
+    Clean,
+    Paths(BTreeSet<String>),
+    Unknown,
+}
+
+/// A snapshot of dirty state plus its epoch. The epoch protects acknowledgement from
+/// clearing changes that arrived after the snapshot was taken.
+#[derive(Debug, Clone)]
+pub struct DirtySnapshot {
+    pub state: DirtyState,
+    pub epoch: u64,
+}
+
+#[derive(Debug)]
+struct DirtyTrackerInner {
+    state: DirtyState,
+    epoch: u64,
+    capacity: usize,
+}
+
+/// Bounded, epoch-protected dirty tracker.
+///
+/// - `snapshot` returns the current state and epoch without changing either.
+/// - `acknowledge(epoch)` clears the state only if the epoch has not moved on.
+/// - A poisoned lock always reports `Unknown` so the tracker never falsely claims cleanliness.
+#[derive(Debug, Clone)]
+pub struct DirtyTracker {
+    inner: Arc<std::sync::Mutex<DirtyTrackerInner>>,
+}
+
+impl DirtyTracker {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(DirtyTrackerInner {
+                state: DirtyState::Clean,
+                epoch: 0,
+                capacity,
+            })),
+        }
+    }
+
+    pub fn mark_paths(&self, paths: impl IntoIterator<Item = String>) -> DirtySnapshot {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return DirtySnapshot {
+                    state: DirtyState::Unknown,
+                    epoch: 0,
+                }
+            }
+        };
+
+        // Once unknown, more precise path information is intentionally lost.
+        if guard.state == DirtyState::Unknown {
+            guard.epoch = guard.epoch.wrapping_add(1);
+            return DirtySnapshot {
+                state: DirtyState::Unknown,
+                epoch: guard.epoch,
+            };
+        }
+
+        let mut set = match std::mem::take(&mut guard.state) {
+            DirtyState::Clean => BTreeSet::new(),
+            DirtyState::Paths(s) => s,
+            DirtyState::Unknown => BTreeSet::new(),
+        };
+
+        for p in paths {
+            set.insert(p);
+        }
+
+        guard.state = if set.len() > guard.capacity {
+            DirtyState::Unknown
+        } else {
+            DirtyState::Paths(set)
+        };
+        guard.epoch = guard.epoch.wrapping_add(1);
+        DirtySnapshot {
+            state: guard.state.clone(),
+            epoch: guard.epoch,
+        }
+    }
+
+    pub fn mark_unknown(&self) -> DirtySnapshot {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return DirtySnapshot {
+                    state: DirtyState::Unknown,
+                    epoch: 0,
+                }
+            }
+        };
+        guard.state = DirtyState::Unknown;
+        guard.epoch = guard.epoch.wrapping_add(1);
+        DirtySnapshot {
+            state: guard.state.clone(),
+            epoch: guard.epoch,
+        }
+    }
+
+    pub fn snapshot(&self) -> DirtySnapshot {
+        match self.inner.lock() {
+            Ok(guard) => DirtySnapshot {
+                state: guard.state.clone(),
+                epoch: guard.epoch,
+            },
+            Err(_) => DirtySnapshot {
+                state: DirtyState::Unknown,
+                epoch: 0,
+            },
+        }
+    }
+
+    pub fn acknowledge(&self, epoch: u64) -> DirtySnapshot {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return DirtySnapshot {
+                    state: DirtyState::Unknown,
+                    epoch: 0,
+                }
+            }
+        };
+
+        if guard.state == DirtyState::Unknown {
+            return DirtySnapshot {
+                state: DirtyState::Unknown,
+                epoch: guard.epoch,
+            };
+        }
+
+        if epoch == guard.epoch {
+            guard.state = DirtyState::Clean;
+        }
+        DirtySnapshot {
+            state: guard.state.clone(),
+            epoch: guard.epoch,
+        }
+    }
+}
+
+fn is_ignore_control_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n == ".gitignore" || n == ".ignore")
+        .unwrap_or(false)
+}
+
+/// Lightweight, mark-only repository watcher.
+///
+/// The notify callback records normalized relative paths in a `DirtyTracker`. It performs
+/// no SQLite work, no parsing/hashing/embedding, and no async spawning.
+pub struct RepositoryWatcher {
+    root: PathBuf,
+    tracker: DirtyTracker,
+    _watcher: RecommendedWatcher,
+}
+
+impl RepositoryWatcher {
+    pub fn new(root: PathBuf) -> Result<Self> {
+        let tracker = DirtyTracker::new(BOUNDED_CAP);
+        let tracker_cb = tracker.clone();
+        let root_cb = root.clone();
+
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
+                Ok(event) => {
+                    let mut rels = Vec::new();
+                    let mut unknown = false;
+                    for p in &event.paths {
+                        if p.is_dir() {
+                            unknown = true;
+                            break;
+                        }
+                        if is_ignore_control_file(p) {
+                            unknown = true;
+                            break;
+                        }
+                        match normalize_rel(&root_cb, p) {
+                            Some(rel) => rels.push(rel),
+                            None => {
+                                unknown = true;
+                                break;
+                            }
+                        }
+                    }
+                    if unknown {
+                        tracker_cb.mark_unknown();
+                    } else if !rels.is_empty() {
+                        tracker_cb.mark_paths(rels);
+                    }
+                }
+                Err(_) => {
+                    tracker_cb.mark_unknown();
+                }
+            })?;
+
+        watcher.watch(&root, RecursiveMode::Recursive)?;
+
+        Ok(Self {
+            root,
+            tracker,
+            _watcher: watcher,
+        })
+    }
+
+    pub fn tracker(&self) -> &DirtyTracker {
+        &self.tracker
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +693,121 @@ mod tests {
         // No missing files
         assert_eq!(stats.files_parsed + stats.files_skipped, 10);
         w.shutdown().await;
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_ack_does_not_lose_same_path_event_after_snapshot() {
+        let tracker = DirtyTracker::new(10);
+        tracker.mark_paths(["src/main.rs".to_string()]);
+        let snap = tracker.snapshot();
+        assert_eq!(
+            snap.state,
+            DirtyState::Paths(BTreeSet::from(["src/main.rs".to_string()]))
+        );
+        let epoch = snap.epoch;
+
+        // Same-path event arrives after snapshot.
+        tracker.mark_paths(["src/main.rs".to_string()]);
+        let ack = tracker.acknowledge(epoch);
+
+        // Acknowledging the old epoch must not drop the later same-path event.
+        assert_ne!(
+            ack.state,
+            DirtyState::Clean,
+            "ack of old epoch after a new event must not clear state"
+        );
+        assert!(
+            matches!(ack.state, DirtyState::Paths(_)),
+            "same-path event after snapshot must be preserved"
+        );
+    }
+
+    #[test]
+    fn dirty_capacity_overflow_becomes_unknown() {
+        let tracker = DirtyTracker::new(2);
+        tracker.mark_paths(["a.rs".to_string(), "b.rs".to_string()]);
+        assert!(
+            !matches!(tracker.snapshot().state, DirtyState::Unknown),
+            "state under capacity should remain Paths"
+        );
+
+        tracker.mark_paths(["c.rs".to_string()]);
+        assert_eq!(
+            tracker.snapshot().state,
+            DirtyState::Unknown,
+            "exceeding capacity must collapse to Unknown"
+        );
+    }
+
+    #[test]
+    fn dirty_unchanged_epoch_acknowledges_to_clean() {
+        let tracker = DirtyTracker::new(10);
+        tracker.mark_paths(["src/main.rs".to_string()]);
+        let snap = tracker.snapshot();
+        let epoch = snap.epoch;
+        assert!(
+            matches!(snap.state, DirtyState::Paths(_)),
+            "state should be dirty before ack"
+        );
+
+        let ack = tracker.acknowledge(epoch);
+        assert_eq!(
+            ack.state,
+            DirtyState::Clean,
+            "acknowledging the current unchanged epoch must clear to Clean"
+        );
+    }
+
+    fn wait_for_state(
+        tracker: &DirtyTracker,
+        timeout: Duration,
+        predicate: impl Fn(&DirtyState) -> bool,
+    ) -> Option<DirtySnapshot> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            let snap = tracker.snapshot();
+            if predicate(&snap.state) {
+                return Some(snap);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn dirty_watcher_classifies_source_and_gitignore() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(root.join("src"))?;
+
+        let watcher = RepositoryWatcher::new(root.clone())?;
+        assert_eq!(watcher.root(), root.as_path());
+
+        // Regular source modification records its relative path.
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
+        let snap = wait_for_state(watcher.tracker(), Duration::from_millis(1000), |s| {
+            matches!(s, DirtyState::Paths(_))
+        });
+        assert!(snap.is_some(), "source change should be recorded");
+        assert_eq!(
+            snap.unwrap().state,
+            DirtyState::Paths(BTreeSet::from(["src/main.rs".to_string()]))
+        );
+
+        // Acknowledge so the next event is isolated.
+        let epoch = watcher.tracker().snapshot().epoch;
+        watcher.tracker().acknowledge(epoch);
+        assert_eq!(watcher.tracker().snapshot().state, DirtyState::Clean);
+
+        // Changing .gitignore collapses state to Unknown.
+        std::fs::write(root.join(".gitignore"), "target/\n")?;
+        let snap = wait_for_state(watcher.tracker(), Duration::from_millis(1000), |s| {
+            *s == DirtyState::Unknown
+        });
+        assert!(snap.is_some(), ".gitignore change should record Unknown");
+
         Ok(())
     }
 }
