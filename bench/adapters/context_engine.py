@@ -303,6 +303,10 @@ class ContextEngineAdapter(BenchmarkAdapter):
         dirty = g("dirty_file_count", "dirtyFileCount", None)
         vector_scanned = g("vector_count_scanned", "vectorCountScanned", None)
         cache_hit = g("cache_hit", "cacheHit", None)
+        reconcile_skipped = g("reconcile_skipped", "reconcileSkipped", None)
+        discovery_calls = g("discovery_calls", "discoveryCalls", None)
+        reconcile_calls = g("reconcile_calls", "reconcileCalls", None)
+        runtime_state = g("runtime_state", "runtimeState", None)
 
         # candidate_tokens: not exposed by production; leave None honestly
         candidate_tokens = None
@@ -355,6 +359,10 @@ class ContextEngineAdapter(BenchmarkAdapter):
             dirty_file_count=int(dirty) if dirty is not None else None,
             vector_count_scanned=int(vector_scanned) if vector_scanned is not None else None,
             cache_hit=bool(cache_hit_inferred) if cache_hit_inferred is not None else None,
+            reconcile_skipped=bool(reconcile_skipped) if reconcile_skipped is not None else None,
+            discovery_calls=int(discovery_calls) if discovery_calls is not None else None,
+            reconcile_calls=int(reconcile_calls) if reconcile_calls is not None else None,
+            runtime_state=str(runtime_state) if runtime_state is not None else None,
             process_pid=None,
             startup_ms=None,
             raw={**data, "wall_ms": wall_ms, "internal_ms": internal_ms, "cache_hit_inferred": cache_hit_inferred},
