@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -35,6 +36,8 @@ pub(crate) struct RepositoryRuntime {
     pub(crate) reconcile_lock: tokio::sync::Mutex<()>,
     #[cfg(test)]
     test_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pre_reconcile_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,9 +45,16 @@ pub(crate) struct RuntimeSnapshot {
     pub project: Arc<ProjectIndex>,
     pub generation: u64,
     #[allow(dead_code)]
-    pub semantic_fingerprint: ModelFingerprint,
-    #[allow(dead_code)]
     pub last_full_verified: Option<Instant>,
+}
+
+/// Single atomic view of dirty state, captured paths, and epoch. Derived from one
+/// `DirtyTracker::snapshot()` so `state`, `paths`, and `epoch` can never disagree.
+#[derive(Debug, Clone)]
+pub(crate) struct DirtyAccess {
+    pub state: RuntimeState,
+    pub paths: Option<BTreeSet<String>>,
+    pub epoch: u64,
 }
 
 impl RepositoryRuntime {
@@ -68,6 +78,8 @@ impl RepositoryRuntime {
             reconcile_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             test_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            pre_reconcile_hook: std::sync::Mutex::new(None),
         })
     }
 
@@ -76,6 +88,7 @@ impl RepositoryRuntime {
         &self.root
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self) -> RuntimeState {
         match self.tracker.snapshot().state {
             context_index::watcher::DirtyState::Clean => RuntimeState::Clean,
@@ -84,11 +97,28 @@ impl RepositoryRuntime {
         }
     }
 
-    pub(crate) fn dirty_paths(&self) -> Option<std::collections::BTreeSet<String>> {
-        match self.tracker.snapshot().state {
-            context_index::watcher::DirtyState::Paths(paths) => Some(paths),
-            _ => None,
+    /// Capture dirty state, paths, and epoch in a single tracker snapshot so a
+    /// concurrent watcher event cannot split them (the source of the F1/F2 race).
+    pub(crate) fn dirty_access(&self) -> DirtyAccess {
+        let snap = self.tracker.snapshot();
+        let (state, paths) = match snap.state {
+            context_index::watcher::DirtyState::Clean => (RuntimeState::Clean, None),
+            context_index::watcher::DirtyState::Paths(paths) => (RuntimeState::Dirty, Some(paths)),
+            context_index::watcher::DirtyState::Unknown => (RuntimeState::Unknown, None),
+        };
+        DirtyAccess {
+            state,
+            paths,
+            epoch: snap.epoch,
         }
+    }
+
+    pub(crate) fn semantic_fingerprint(&self) -> ModelFingerprint {
+        let guard = match self.data.lock() {
+            Ok(g) => g,
+            Err(_) => return context_index::embed::configured_fingerprint(),
+        };
+        guard.semantic_fingerprint.clone()
     }
 
     pub(crate) fn current_snapshot(&self) -> Option<RuntimeSnapshot> {
@@ -97,7 +127,6 @@ impl RepositoryRuntime {
         Some(RuntimeSnapshot {
             project,
             generation: guard.generation,
-            semantic_fingerprint: guard.semantic_fingerprint.clone(),
             last_full_verified: guard.last_full_verified,
         })
     }
@@ -119,18 +148,27 @@ impl RepositoryRuntime {
     /// Publish a validated project snapshot. Must be called while holding
     /// `reconcile_lock` (or during single-threaded initialization) so that
     /// the counters stay consistent with the work that produced the snapshot.
+    ///
+    /// `full_verification` is true only when the snapshot verified the whole
+    /// repository (initial/full discovery). Incremental dirty-path publishes
+    /// must preserve the existing `last_full_verified` deadline, otherwise a
+    /// stream of single-file edits would postpone periodic full verification
+    /// indefinitely.
     pub(crate) fn publish(
         &self,
         project: Arc<ProjectIndex>,
         generation: u64,
         fingerprint: ModelFingerprint,
         now: Instant,
+        full_verification: bool,
     ) {
         let mut guard = self.data.lock().expect("runtime data mutex poisoned");
         guard.project = Some(project);
         guard.generation = generation;
         guard.semantic_fingerprint = fingerprint;
-        guard.last_full_verified = Some(now);
+        if full_verification {
+            guard.last_full_verified = Some(now);
+        }
         guard.reconcile_total = guard.reconcile_total.saturating_add(1);
     }
 
@@ -161,6 +199,27 @@ impl RepositoryRuntime {
     #[cfg(test)]
     pub(crate) fn run_test_hook(&self) {
         let hook = match self.test_hook.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Test hook fired between the dirty-path snapshot capture and the start of
+    /// the path-local reconcile. Lets a test inject a watcher event in the exact
+    /// F1 window (after `dirty_access()` captures paths+epoch, before reconcile).
+    #[cfg(test)]
+    pub(crate) fn set_pre_reconcile_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        if let Ok(mut guard) = self.pre_reconcile_hook.lock() {
+            *guard = Some(hook);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_pre_reconcile_hook(&self) {
+        let hook = match self.pre_reconcile_hook.lock() {
             Ok(mut guard) => guard.take(),
             Err(_) => None,
         };
@@ -202,6 +261,7 @@ mod tests {
                 dimension: 1,
             },
             Instant::now(),
+            true,
         );
         rt.tracker.acknowledge(epoch);
         assert_eq!(rt.state(), RuntimeState::Clean);
@@ -225,6 +285,7 @@ mod tests {
                 dimension: 1,
             },
             Instant::now(),
+            true,
         );
         rt.tracker.acknowledge(initial_epoch);
         rt.tracker.mark_paths(["a.py".to_string()]);

@@ -78,9 +78,19 @@ pub(crate) struct RuntimeAccess {
     pub discovery_calls: u32,
     pub reconcile_calls: u32,
     pub runtime_state: &'static str,
-    pub dirty_file_count: usize,
+    pub dirty_file_count: Option<usize>,
     pub discovery_ms: u128,
     pub reconcile_ms: u128,
+}
+
+/// Result of one full discovery + structural build, before any publish/ack.
+struct FullReconcile {
+    stats: ReconcileStats,
+    project: Arc<ProjectIndex>,
+    discovery_ms: u128,
+    fingerprint: context_index::embed::ModelFingerprint,
+    generation: u64,
+    epoch: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -160,10 +170,10 @@ impl ContextService {
     }
 
     /// Caller holds `runtime.reconcile_lock`; runtime data is locked only while publishing.
-    async fn reconcile_and_publish_locked(
+    async fn reconcile_full_discovery_locked(
         &self,
         override_embedder: Option<Arc<dyn Embedder>>,
-    ) -> Result<(ReconcileStats, Arc<ProjectIndex>, u128), ContextError> {
+    ) -> Result<FullReconcile, ContextError> {
         let epoch = self.runtime.tracker.snapshot().epoch;
         let t0 = Instant::now();
         let root = ProjectRoot::resolve(Some(&self.root))
@@ -235,9 +245,6 @@ impl ContextService {
                             }
                         }
                     }
-                    if !outcome.deleted_files.is_empty() {
-                        let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
-                    }
                 }
                 Err(e) => {
                     tracing::warn!(error=%e, "open_db for semantic sync failed");
@@ -245,6 +252,14 @@ impl ContextService {
             }
         } else {
             tracing::debug!("semantic backend unavailable, skipping vector sync");
+        }
+
+        // Orphan GC after deletion is a local SQLite DELETE, independent of the
+        // embedding backend (F5).
+        if !outcome.deleted_files.is_empty() {
+            if let Ok(conn) = structural_store::open_db(root.path()) {
+                let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
+            }
         }
 
         let generation = structural_store::open_db(root.path())
@@ -261,13 +276,34 @@ impl ContextService {
             vectors_reused,
             embedding_calls,
         };
-        let project_arc = Arc::new(idx);
-        self.runtime
-            .publish(project_arc.clone(), generation, fingerprint, Instant::now());
+        Ok(FullReconcile {
+            stats,
+            project: Arc::new(idx),
+            discovery_ms,
+            fingerprint,
+            generation,
+            epoch,
+        })
+    }
+
+    async fn reconcile_and_publish_locked(
+        &self,
+        override_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Result<(ReconcileStats, Arc<ProjectIndex>, u128), ContextError> {
+        let full = self
+            .reconcile_full_discovery_locked(override_embedder)
+            .await?;
+        self.runtime.publish(
+            full.project.clone(),
+            full.generation,
+            full.fingerprint.clone(),
+            Instant::now(),
+            true,
+        );
         #[cfg(test)]
         self.runtime.run_test_hook();
-        self.runtime.tracker.acknowledge(epoch);
-        Ok((stats, project_arc, discovery_ms))
+        self.runtime.tracker.acknowledge(full.epoch);
+        Ok((full.stats, full.project, full.discovery_ms))
     }
 
     async fn reconcile_inner(
@@ -282,8 +318,8 @@ impl ContextService {
         override_embedder: Option<Arc<dyn Embedder>>,
     ) -> Result<ReconcileStats, ContextError> {
         let _guard = self.runtime.reconcile_lock.lock().await;
-        let (mut stats, project, _) = self
-            .reconcile_and_publish_locked(override_embedder.clone())
+        let mut full = self
+            .reconcile_full_discovery_locked(override_embedder.clone())
             .await?;
         let backend_available = if override_embedder.is_some() {
             true
@@ -294,19 +330,19 @@ impl ContextService {
             let embedder: Arc<dyn Embedder> = override_embedder
                 .unwrap_or_else(|| Arc::new(context_index::embed::configured_embedder()));
             let fingerprint = embedder.fingerprint();
-            match structural_store::open_db(&project.root) {
+            match structural_store::open_db(&full.project.root) {
                 Ok(mut conn) => {
                     match context_index::vector::sync_missing_vectors_for_root(
                         &mut conn,
-                        &project.root,
+                        &full.project.root,
                         embedder.as_ref(),
                     )
                     .await
                     {
                         Ok((reused, created, calls, _)) => {
-                            stats.vectors_reused += reused;
-                            stats.vectors_created += created;
-                            stats.embedding_calls += calls;
+                            full.stats.vectors_reused += reused;
+                            full.stats.vectors_created += created;
+                            full.stats.embedding_calls += calls;
                         }
                         Err(e) => {
                             tracing::warn!(error=%e, "full semantic sync failed, structural still ok");
@@ -317,7 +353,19 @@ impl ContextService {
                 Err(e) => tracing::warn!(error=%e, "open_db for semantic sync failed"),
             }
         }
-        Ok(stats)
+        // Publish the clean replacement snapshot only after the full semantic
+        // backfill has completed (F6).
+        self.runtime.publish(
+            full.project.clone(),
+            full.generation,
+            full.fingerprint.clone(),
+            Instant::now(),
+            true,
+        );
+        #[cfg(test)]
+        self.runtime.run_test_hook();
+        self.runtime.tracker.acknowledge(full.epoch);
+        Ok(full.stats)
     }
 
     async fn reconcile_fast_inner(
@@ -336,11 +384,12 @@ impl ContextService {
     ) -> Result<RuntimeAccess, ContextError> {
         let _guard = self.runtime.reconcile_lock.lock().await;
         let now = Instant::now();
-        let state = self.runtime.state();
-        let dirty = self.runtime.dirty_paths();
+        // One snapshot for state + paths + epoch so a concurrent watcher event
+        // cannot split them (F1/F2).
+        let access = self.runtime.dirty_access();
         let has_snapshot = self.runtime.current_snapshot().is_some();
 
-        if state == RuntimeState::Clean && !self.runtime.is_verification_expired(now) {
+        if access.state == RuntimeState::Clean && !self.runtime.is_verification_expired(now) {
             let snapshot = self.runtime.current_snapshot().ok_or_else(|| {
                 ContextError::Internal("clean runtime has no project snapshot".into())
             })?;
@@ -351,17 +400,19 @@ impl ContextService {
                 discovery_calls: 0,
                 reconcile_calls: 0,
                 runtime_state: "clean",
-                dirty_file_count: 0,
+                dirty_file_count: Some(0),
                 discovery_ms: 0,
                 reconcile_ms: 0,
             });
         }
 
-        if let Some(paths) = dirty {
+        if let Some(paths) = access.paths {
             if has_snapshot {
                 let dirty_count = paths.len();
+                #[cfg(test)]
+                self.runtime.run_pre_reconcile_hook();
                 let (stats, project) = self
-                    .reconcile_dirty_paths_locked(override_embedder, &paths)
+                    .reconcile_dirty_paths_locked(override_embedder, &paths, access.epoch)
                     .await?;
                 let generation = self
                     .runtime
@@ -375,7 +426,7 @@ impl ContextService {
                     discovery_calls: 0,
                     reconcile_calls: 1,
                     runtime_state: "dirty",
-                    dirty_file_count: dirty_count,
+                    dirty_file_count: Some(dirty_count),
                     discovery_ms: 0,
                     reconcile_ms: stats.elapsed_ms,
                 });
@@ -397,7 +448,7 @@ impl ContextService {
             discovery_calls: 1,
             reconcile_calls: 1,
             runtime_state: "unknown",
-            dirty_file_count: 0,
+            dirty_file_count: None,
             discovery_ms,
             reconcile_ms: stats.elapsed_ms,
         })
@@ -410,16 +461,20 @@ impl ContextService {
         &self,
         override_embedder: Option<Arc<dyn Embedder>>,
         paths: &BTreeSet<String>,
+        epoch: u64,
     ) -> Result<(ReconcileStats, Arc<ProjectIndex>), ContextError> {
-        let epoch = self.runtime.tracker.snapshot().epoch;
         let t0 = Instant::now();
         let root = ProjectRoot::resolve(Some(&self.root))
             .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
 
+        // Fingerprint of the model actually in use: the override when supplied,
+        // else the runtime's published semantic fingerprint (set by the last
+        // full/initial reconcile). This keeps orphan GC targeted at the vectors
+        // that were really created, not always the configured model (F5).
         let fingerprint = override_embedder
             .as_ref()
             .map(|e| e.fingerprint())
-            .unwrap_or_else(context_index::embed::configured_fingerprint);
+            .unwrap_or_else(|| self.runtime.semantic_fingerprint());
         // Structural mutation may change semantic refs; sample readiness first.
         let was_semantic_ready = structural_store::open_db(root.path())
             .ok()
@@ -506,11 +561,17 @@ impl ContextService {
                             Err(e) => tracing::warn!(error=%e, "incremental semantic sync failed"),
                         }
                     }
-                    if !removed.is_empty() {
-                        let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
-                    }
                 }
                 Err(e) => tracing::warn!(error=%e, "open_db for semantic sync failed"),
+            }
+        }
+
+        // Orphan GC is a local SQLite DELETE independent of the embedding backend;
+        // it must run after any deletion with the fingerprint of the model actually
+        // in use (F5).
+        if !removed.is_empty() {
+            if let Ok(conn) = structural_store::open_db(root.path()) {
+                let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
             }
         }
 
@@ -558,8 +619,13 @@ impl ContextService {
             embedding_calls,
         };
         let project_arc = Arc::new(delta.project);
-        self.runtime
-            .publish(project_arc.clone(), generation, fingerprint, Instant::now());
+        self.runtime.publish(
+            project_arc.clone(),
+            generation,
+            fingerprint,
+            Instant::now(),
+            false,
+        );
         #[cfg(test)]
         self.runtime.run_test_hook();
         self.runtime.tracker.acknowledge(epoch);
@@ -627,7 +693,7 @@ impl ContextService {
         res.stats.discovery_ms = Some(access.discovery_ms);
         res.stats.reconcile_ms = Some(access.reconcile_ms);
         res.stats.generation = Some(access.generation);
-        res.stats.dirty_file_count = Some(access.dirty_file_count);
+        res.stats.dirty_file_count = access.dirty_file_count;
         res.stats.reconcile_skipped = Some(access.reconcile_skipped);
         res.stats.discovery_calls = Some(access.discovery_calls);
         res.stats.reconcile_calls = Some(access.reconcile_calls);
@@ -930,7 +996,7 @@ impl ContextService {
             fusion_ms: Some(fuse_ms),
             authority_ms: Some(rank_ms),
             generation: Some(access.generation),
-            dirty_file_count: Some(access.dirty_file_count),
+            dirty_file_count: access.dirty_file_count,
             vector_count_scanned: None,
             cache_hit: None,
             reconcile_skipped: Some(access.reconcile_skipped),
@@ -1877,12 +1943,19 @@ mod tests {
             "unrelated vectors must remain"
         );
 
-        // Delete a.py: semantic refs disappear, remaining files stay ready.
+        // Delete a.py: semantic refs disappear, orphan vectors GC'd (F5), remaining files stay ready.
         fs::remove_file(root.join("a.py")).unwrap();
         svc.runtime.tracker.mark_paths(["a.py".to_string()]);
         let _ = svc.search("foo", SearchOptions::default()).await.unwrap();
         let conn3 = structural_store::open_db(&root).unwrap();
         assert!(context_index::vector::is_semantic_ready(&conn3, &fp, true).unwrap());
+        let vectors_after_delete = context_index::vector::count_vectors(&conn3, &fp).unwrap();
+        assert!(
+            vectors_after_delete < vectors_after,
+            "orphan vectors for the deleted file must be GC'd: {} -> {}",
+            vectors_after,
+            vectors_after_delete
+        );
     }
 
     #[tokio::test]
@@ -1899,6 +1972,10 @@ mod tests {
         assert_eq!(res.stats.discovery_calls, Some(1));
         assert_eq!(res.stats.reconcile_calls, Some(1));
         assert_eq!(res.stats.runtime_state.as_deref(), Some("unknown"));
+        assert_eq!(
+            res.stats.dirty_file_count, None,
+            "Unknown must report null dirty_file_count, not a fake zero"
+        );
         let (d1, r1) = svc.runtime.counters();
         assert_eq!(d1, d0 + 1);
         assert_eq!(r1, r0 + 1);
@@ -1977,5 +2054,65 @@ mod tests {
 
         let _ = svc.search("foo", SearchOptions::default()).await.unwrap();
         assert_eq!(svc.runtime.state(), RuntimeState::Clean);
+    }
+
+    #[tokio::test]
+    async fn event_between_snapshot_and_reconcile_remains_dirty() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        fs::write(root.join("b.py"), b"def bar():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+
+        fs::write(root.join("a.py"), b"def foo():\n    return 1\n").unwrap();
+        svc.runtime.tracker.mark_paths(["a.py".to_string()]);
+
+        // Inject a second event in the F1 window: after `dirty_access()` captured
+        // {a.py}+epoch, but before the path-local reconcile acknowledges.
+        let tracker = svc.runtime.tracker.clone();
+        svc.runtime.set_pre_reconcile_hook(Box::new(move || {
+            tracker.mark_paths(["b.py".to_string()]);
+        }));
+
+        let _ = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(
+            svc.runtime.state(),
+            RuntimeState::Dirty,
+            "event between snapshot capture and reconcile must not be acknowledged away"
+        );
+
+        // The second path is reconciled on the next request.
+        let _ = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(svc.runtime.state(), RuntimeState::Clean);
+    }
+
+    #[tokio::test]
+    async fn path_local_reconcile_preserves_verification_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+
+        // Force the full-verification deadline into the past.
+        let now = Instant::now();
+        svc.runtime.set_last_full_verified(
+            now - crate::runtime::FULL_VERIFY_INTERVAL - std::time::Duration::from_secs(1),
+        );
+        assert!(svc.runtime.is_verification_expired(now));
+
+        fs::write(root.join("a.py"), b"def foo():\n    return 2\n").unwrap();
+        svc.runtime.tracker.mark_paths(["a.py".to_string()]);
+
+        let res = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(res.stats.reconcile_calls, Some(1));
+        assert_eq!(res.stats.runtime_state.as_deref(), Some("dirty"));
+
+        // Path-local publish must not refresh the full-verification deadline (F4).
+        assert!(
+            svc.runtime.is_verification_expired(now),
+            "path-local publish must not reset the full-verification deadline"
+        );
     }
 }
