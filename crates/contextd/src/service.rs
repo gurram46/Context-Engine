@@ -206,8 +206,11 @@ impl ContextService {
         .map_err(|e| ContextError::Internal(format!("structural build panicked: {e}")))?
         .map_err(|e| ContextError::Internal(format!("structural build failed: {e}")))?;
 
+        let needs_incremental_semantic = was_semantic_ready && !outcome.changed_files.is_empty();
         let backend_available = if override_embedder.is_some() {
             true
+        } else if !needs_incremental_semantic {
+            false
         } else {
             context_index::embed::is_configured_model_available().await
         };
@@ -1337,11 +1340,12 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn daemon_reachable_model_unavailable_reports_unavailable() {
         let _env_guard = ENV_GLOBAL_LOCK.lock().unwrap();
-        // mock Ollama tags server - handle 2 requests
+        // Mock Ollama tags server until the test aborts it. Extra probes should not
+        // make the second model check fail by exhausting the fixture.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            loop {
                 if let Ok((mut socket, _)) = listener.accept().await {
                     let mut buf = [0u8; 2048];
                     let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
