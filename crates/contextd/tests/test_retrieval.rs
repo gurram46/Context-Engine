@@ -35,9 +35,16 @@ async fn test_retrieval_python() {
     si.build(&idx).expect("build");
 
     let project = ProjectIndex::discover(&pr).expect("idx2");
-    let res = retrieve_context("What tests cover Foo?", &project, &Providers {}, 10000, 5)
-        .await
-        .expect("retrieve");
+    let res = retrieve_context(
+        "What tests cover Foo?",
+        &project,
+        &Providers {},
+        10000,
+        5,
+        None,
+    )
+    .await
+    .expect("retrieve");
 
     let files: Vec<&str> = res.evidence.iter().map(|e| e.file.as_str()).collect();
     assert!(
@@ -67,9 +74,16 @@ async fn test_retrieval_typescript() {
     si.build(&idx).expect("build");
 
     let project = ProjectIndex::discover(&pr).expect("idx2");
-    let res = retrieve_context("What tests cover Foo?", &project, &Providers {}, 10000, 5)
-        .await
-        .expect("retrieve");
+    let res = retrieve_context(
+        "What tests cover Foo?",
+        &project,
+        &Providers {},
+        10000,
+        5,
+        None,
+    )
+    .await
+    .expect("retrieve");
 
     let files: Vec<&str> = res.evidence.iter().map(|e| e.file.as_str()).collect();
     assert!(
@@ -99,9 +113,16 @@ async fn test_retrieval_go() {
     si.build(&idx).expect("build");
 
     let project = ProjectIndex::discover(&pr).expect("idx2");
-    let res = retrieve_context("What tests cover Foo?", &project, &Providers {}, 10000, 5)
-        .await
-        .expect("retrieve");
+    let res = retrieve_context(
+        "What tests cover Foo?",
+        &project,
+        &Providers {},
+        10000,
+        5,
+        None,
+    )
+    .await
+    .expect("retrieve");
 
     let files: Vec<&str> = res.evidence.iter().map(|e| e.file.as_str()).collect();
     assert!(
@@ -141,6 +162,7 @@ async fn test_retrieval_rust_inline() {
         &Providers {},
         10000,
         5,
+        None,
     )
     .await
     .expect("retrieve");
@@ -181,6 +203,7 @@ async fn test_retrieval_q_objects() {
         &Providers {},
         10000,
         5,
+        None,
     )
     .await
     .expect("retrieve");
@@ -216,6 +239,7 @@ async fn test_single_letter_negative_q_not_match_query() {
         &Providers {},
         10000,
         5,
+        None,
     )
     .await
     .expect("retrieve");
@@ -273,6 +297,7 @@ async fn test_single_letter_negative_t_not_match_template() {
         &Providers {},
         10000,
         5,
+        None,
     )
     .await
     .expect("retrieve");
@@ -324,6 +349,7 @@ async fn test_single_letter_negative_a_not_match_api() {
         &Providers {},
         10000,
         5,
+        None,
     )
     .await
     .expect("retrieve");
@@ -378,7 +404,7 @@ async fn test_foo_bar_camel_to_snake() {
         let si = StructuralIndex::new(&pr);
         si.build(&idx).expect("build");
         let project = ProjectIndex::discover(&pr).expect("idx2");
-        let res = retrieve_context(query, &project, &Providers {}, 10000, 5)
+        let res = retrieve_context(query, &project, &Providers {}, 10000, 5, None)
             .await
             .expect("retrieve");
         let files: Vec<&str> = res.evidence.iter().map(|e| e.file.as_str()).collect();
@@ -417,6 +443,7 @@ async fn test_foo_bar_negative_unrelated_not_matched() {
         &Providers {},
         10000,
         5,
+        None,
     )
     .await
     .expect("retrieve");
@@ -464,7 +491,7 @@ async fn test_inline_no_false_positive_contest_latest_testament() {
         "What tests cover latest?",
         "What tests cover testament?",
     ] {
-        let res = retrieve_context(query, &project, &Providers {}, 10000, 5)
+        let res = retrieve_context(query, &project, &Providers {}, 10000, 5, None)
             .await
             .expect("retrieve");
         let has_inline = res.evidence.iter().any(|e| {
@@ -502,9 +529,16 @@ async fn test_determinism_20x_identical() {
 
     let mut first: Option<Vec<String>> = None;
     for i in 0..20 {
-        let res = retrieve_context("What tests cover Foo?", &project, &Providers {}, 10000, 5)
-            .await
-            .expect("retrieve");
+        let res = retrieve_context(
+            "What tests cover Foo?",
+            &project,
+            &Providers {},
+            10000,
+            5,
+            None,
+        )
+        .await
+        .expect("retrieve");
         let ordered: Vec<String> = res
             .evidence
             .iter()

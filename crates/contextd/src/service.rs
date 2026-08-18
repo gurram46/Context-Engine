@@ -699,10 +699,22 @@ impl ContextService {
         override_embedder: Option<Arc<dyn Embedder>>,
     ) -> Result<ContextResult, ContextError> {
         let t_search = std::time::Instant::now();
+        let is_override = override_embedder.is_some();
+        let t_access = std::time::Instant::now();
         let access = self
             .access_runtime(override_embedder)
             .await
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
+        let runtime_access_ms = t_access.elapsed().as_millis();
+        // Hot retrieval state — generation+fingerprint bound, lazy loaded, read-only
+        let hot = if !is_override {
+            let fp = self.runtime.semantic_fingerprint();
+            // get_or_load_hot is async and may block on first load per generation (1-2s for large repos)
+            // but subsequent clean queries reuse in-memory hot without DB or filesystem.
+            self.runtime.get_or_load_hot(access.generation, fp).await
+        } else {
+            None
+        };
         let providers = Providers {};
         let mut res = retrieve_context(
             query,
@@ -710,12 +722,16 @@ impl ContextService {
             &providers,
             opts.budget_tokens,
             opts.max_results,
+            hot,
         )
         .await
         .map_err(|e| ContextError::Internal(e.to_string()))?;
         // Fill stage telemetry at service layer
         let total_ms = t_search.elapsed().as_millis();
         res.stats.total_ms = Some(total_ms);
+        res.stats.total_internal_ms = Some(res.stats.elapsed_ms);
+        res.stats.wall_ms = Some(total_ms);
+        res.stats.runtime_access_ms = Some(runtime_access_ms);
         res.stats.discovery_ms = Some(access.discovery_ms);
         res.stats.reconcile_ms = Some(access.reconcile_ms);
         res.stats.generation = Some(access.generation);
@@ -724,7 +740,8 @@ impl ContextService {
         res.stats.discovery_calls = Some(access.discovery_calls);
         res.stats.reconcile_calls = Some(access.reconcile_calls);
         res.stats.runtime_state = Some(access.runtime_state.to_string());
-        res.stats.cache_hit = None;
+        // preserve query embedding cache hit from pipeline; result cache not yet implemented
+        res.stats.result_cache_hit = None;
         if res.stats.authority_ms.is_none() {
             res.stats.authority_ms = Some(res.stats.rank_ms);
         }
@@ -1029,6 +1046,20 @@ impl ContextService {
             discovery_calls: Some(access.discovery_calls),
             reconcile_calls: Some(access.reconcile_calls),
             runtime_state: Some(access.runtime_state.to_string()),
+            runtime_access_ms: None,
+            graph_ms: Some(graph_ms_total),
+            test_ms: Some(0),
+            sqlite_open_ms: None,
+            sqlite_open_calls: None,
+            sqlite_query_ms: None,
+            vector_load_ms: None,
+            vector_scan_ms: None,
+            filesystem_ms: None,
+            files_read: None,
+            query_embedding_cache_hit: None,
+            result_cache_hit: None,
+            total_internal_ms: Some(elapsed_ms),
+            wall_ms: Some(elapsed_ms),
         };
         Ok(crate::pipeline::ContextResult {
             query: symbol.to_string(),

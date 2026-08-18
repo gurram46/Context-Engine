@@ -34,6 +34,7 @@ pub(crate) struct RepositoryRuntime {
     _watcher: RepositoryWatcher,
     data: std::sync::Mutex<RuntimeData>,
     pub(crate) reconcile_lock: tokio::sync::Mutex<()>,
+    hot: std::sync::RwLock<Option<Arc<crate::hot::HotState>>>,
     #[cfg(test)]
     test_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -76,6 +77,7 @@ impl RepositoryRuntime {
                 reconcile_total: 0,
             }),
             reconcile_lock: tokio::sync::Mutex::new(()),
+            hot: std::sync::RwLock::new(None),
             #[cfg(test)]
             test_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -165,16 +167,84 @@ impl RepositoryRuntime {
         let mut guard = self.data.lock().expect("runtime data mutex poisoned");
         guard.project = Some(project);
         guard.generation = generation;
-        guard.semantic_fingerprint = fingerprint;
+        guard.semantic_fingerprint = fingerprint.clone();
         if full_verification {
             guard.last_full_verified = Some(now);
         }
         guard.reconcile_total = guard.reconcile_total.saturating_add(1);
+        drop(guard);
+        // Invalidate hot retrieval state on generation/fingerprint change (E3-D)
+        // Hot is generation+fingerprint bound; stale hot must not be reused.
+        // Invalidate hot retrieval state on any publish to avoid stale BM25/vectors
+        // after incremental or full reconciliation. Next clean query will lazily rebuild.
+        // This ensures generation-bound isolation and no stale results after mutation.
+        let _ = self.hot.write().map(|mut w| *w = None);
     }
 
     pub(crate) fn increment_discovery(&self) {
         let mut guard = self.data.lock().expect("runtime data mutex poisoned");
         guard.discovery_total = guard.discovery_total.saturating_add(1);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn invalidate_hot(&self) {
+        if let Ok(mut guard) = self.hot.write() {
+            *guard = None;
+        }
+    }
+
+    pub(crate) async fn get_or_load_hot(
+        &self,
+        generation: u64,
+        fingerprint: ModelFingerprint,
+    ) -> Option<Arc<crate::hot::HotState>> {
+        // Fast read path
+        if let Ok(guard) = self.hot.read() {
+            if let Some(hot) = guard.clone() {
+                if hot.generation == generation && hot.fingerprint == fingerprint {
+                    return Some(hot);
+                }
+            }
+        }
+        // Need to load — do blocking load outside lock
+        let root = self.root.clone();
+        let fp_clone = fingerprint.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            crate::hot::HotState::load_blocking(&root, generation, fp_clone)
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(Arc::new);
+        if let Some(hot) = loaded.clone() {
+            // Write back, but check again for race
+            if let Ok(mut w) = self.hot.write() {
+                if let Some(existing) = w.clone() {
+                    if existing.generation == generation && existing.fingerprint == fingerprint {
+                        return Some(existing);
+                    }
+                }
+                *w = Some(hot.clone());
+            }
+            return Some(hot);
+        }
+        None
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn peek_hot(
+        &self,
+        generation: u64,
+        fingerprint: &ModelFingerprint,
+    ) -> Option<Arc<crate::hot::HotState>> {
+        if let Ok(guard) = self.hot.read() {
+            if let Some(hot) = guard.clone() {
+                if hot.generation == generation && hot.fingerprint == *fingerprint {
+                    return Some(hot);
+                }
+            }
+        }
+        None
     }
 
     #[cfg(test)]
