@@ -4,7 +4,7 @@ use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -100,10 +100,17 @@ fn normalize_rel(root: &Path, abs: &Path) -> Option<String> {
     let rel = abs.strip_prefix(root).ok()?;
     let s = rel.to_string_lossy().replace('\\', "/");
     if s.is_empty() {
-        None
-    } else {
-        Some(s)
+        return None;
     }
+    if Path::new(&s).components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(s)
 }
 
 impl StructuralWatcher {
@@ -992,6 +999,27 @@ mod tests {
         let after = tracker.snapshot();
         assert_eq!(after.state, before.state);
         assert_eq!(after.epoch, before.epoch, "Noop must not bump epoch");
+    }
+
+    #[test]
+    fn classify_parent_dir_component_is_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let evil = root.join("a/../b.rs");
+        let event =
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(evil);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::MarkUnknown,
+            "path containing ParentDir '..' must classify as Unknown"
+        );
+        let evil2 = root.join("src/../../secret.txt");
+        let event2 = Event::new(EventKind::Create(CreateKind::File)).add_path(evil2);
+        assert_eq!(
+            classify_event(root, &event2),
+            EventAction::MarkUnknown,
+            "escape via '..' must classify as Unknown"
+        );
     }
 
     #[test]

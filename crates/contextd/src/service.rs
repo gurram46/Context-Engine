@@ -2145,6 +2145,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_explicit_roots_have_isolated_runtime_state() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let root1 = tmp1.path().to_path_buf();
+        let root2 = tmp2.path().to_path_buf();
+        fs::create_dir_all(root1.join(".git")).unwrap();
+        fs::create_dir_all(root2.join(".git")).unwrap();
+        fs::write(root1.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        fs::write(root2.join("b.py"), b"def bar():\n    pass\n").unwrap();
+
+        let svc1 = ContextService::new(Some(root1.clone())).await.unwrap();
+        let svc2 = ContextService::new(Some(root2.clone())).await.unwrap();
+
+        let snap1 = svc1.runtime.current_snapshot().unwrap();
+        let snap2 = svc2.runtime.current_snapshot().unwrap();
+        assert_ne!(snap1.project.root, snap2.project.root);
+        assert!(snap1
+            .project
+            .files
+            .iter()
+            .any(|f| f.relative_path == "a.py"));
+        assert!(snap2
+            .project
+            .files
+            .iter()
+            .any(|f| f.relative_path == "b.py"));
+        assert!(!snap1
+            .project
+            .files
+            .iter()
+            .any(|f| f.relative_path == "b.py"));
+        assert!(!snap2
+            .project
+            .files
+            .iter()
+            .any(|f| f.relative_path == "a.py"));
+        assert_ne!(
+            Arc::as_ptr(&svc1.runtime) as *const (),
+            Arc::as_ptr(&svc2.runtime) as *const ()
+        );
+
+        svc1.runtime.tracker.mark_paths(["a.py".to_string()]);
+        assert_eq!(svc1.runtime.state(), RuntimeState::Dirty);
+        assert_eq!(svc2.runtime.state(), RuntimeState::Clean);
+        assert_eq!(
+            svc1.runtime.current_snapshot().unwrap().generation,
+            snap1.generation
+        );
+        assert_eq!(
+            svc2.runtime.current_snapshot().unwrap().generation,
+            snap2.generation
+        );
+    }
+
+    #[tokio::test]
     async fn dirty_expired_triggers_full_reconcile() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();

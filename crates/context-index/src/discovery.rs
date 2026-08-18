@@ -192,10 +192,10 @@ impl ProjectIndex {
 
         for rel in paths {
             let norm = normalize_rel_path(rel)?;
-            let old = match files.iter().position(|f| f.relative_path == norm) {
-                Some(pos) => Some(files.remove(pos)),
-                None => None,
-            };
+            let old = files
+                .iter()
+                .position(|f| f.relative_path == norm)
+                .map(|pos| files.remove(pos));
             let mut scratch = ScanStats::default();
             if let Some(new) = make_record(&self.root, &norm, true, &mut scratch) {
                 let is_changed = match &old {
@@ -334,8 +334,10 @@ fn make_record(
 
 /// Recompute aggregate scan stats from the final file vector.
 fn recompute_stats(files: &[FileRecord]) -> ScanStats {
-    let mut stats = ScanStats::default();
-    stats.discovered = files.len();
+    let mut stats = ScanStats {
+        discovered: files.len(),
+        ..Default::default()
+    };
     for f in files {
         stats.total_bytes += f.size_bytes;
         match f.kind {
