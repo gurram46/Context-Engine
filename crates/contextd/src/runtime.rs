@@ -33,6 +33,8 @@ pub(crate) struct RepositoryRuntime {
     _watcher: RepositoryWatcher,
     data: std::sync::Mutex<RuntimeData>,
     pub(crate) reconcile_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    test_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +66,8 @@ impl RepositoryRuntime {
                 reconcile_total: 0,
             }),
             reconcile_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            test_hook: std::sync::Mutex::new(None),
         })
     }
 
@@ -77,6 +81,13 @@ impl RepositoryRuntime {
             context_index::watcher::DirtyState::Clean => RuntimeState::Clean,
             context_index::watcher::DirtyState::Paths(_) => RuntimeState::Dirty,
             context_index::watcher::DirtyState::Unknown => RuntimeState::Unknown,
+        }
+    }
+
+    pub(crate) fn dirty_paths(&self) -> Option<std::collections::BTreeSet<String>> {
+        match self.tracker.snapshot().state {
+            context_index::watcher::DirtyState::Paths(paths) => Some(paths),
+            _ => None,
         }
     }
 
@@ -138,6 +149,24 @@ impl RepositoryRuntime {
     pub fn set_last_full_verified(&self, instant: Instant) {
         let mut guard = self.data.lock().expect("runtime data mutex poisoned");
         guard.last_full_verified = Some(instant);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        if let Ok(mut guard) = self.test_hook.lock() {
+            *guard = Some(hook);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_test_hook(&self) {
+        let hook = match self.test_hook.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 

@@ -79,6 +79,15 @@ pub struct PipelineStats {
     pub vector_count_scanned: Option<usize>,
     #[serde(default)]
     pub cache_hit: Option<bool>,
+    // E2 persistent-runtime telemetry — nullable, filled only in service paths.
+    #[serde(default)]
+    pub reconcile_skipped: Option<bool>,
+    #[serde(default)]
+    pub discovery_calls: Option<u32>,
+    #[serde(default)]
+    pub reconcile_calls: Option<u32>,
+    #[serde(default)]
+    pub runtime_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1029,6 +1038,10 @@ pub async fn retrieve_context(
         dirty_file_count: None,
         vector_count_scanned,
         cache_hit: None,
+        reconcile_skipped: None,
+        discovery_calls: None,
+        reconcile_calls: None,
+        runtime_state: None,
     };
 
     Ok(ContextResult {

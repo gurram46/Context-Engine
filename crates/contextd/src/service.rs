@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -6,6 +7,7 @@ use std::time::Instant;
 use context_core::ContextError;
 use context_index::embed::Embedder;
 use context_index::structural::store as structural_store;
+use context_index::structural::{detect_language, Language};
 use context_index::{ProjectIndex, ProjectRoot};
 
 use crate::pipeline::{retrieve_context, ContextResult, Providers};
@@ -66,6 +68,19 @@ pub struct ReconcileStats {
     pub vectors_created: usize,
     pub vectors_reused: usize,
     pub embedding_calls: usize,
+}
+
+/// Snapshot access result for search/dependency, carrying truthful E2 telemetry.
+pub(crate) struct RuntimeAccess {
+    pub project: Arc<ProjectIndex>,
+    pub generation: u64,
+    pub reconcile_skipped: bool,
+    pub discovery_calls: u32,
+    pub reconcile_calls: u32,
+    pub runtime_state: &'static str,
+    pub dirty_file_count: usize,
+    pub discovery_ms: u128,
+    pub reconcile_ms: u128,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -249,6 +264,8 @@ impl ContextService {
         let project_arc = Arc::new(idx);
         self.runtime
             .publish(project_arc.clone(), generation, fingerprint, Instant::now());
+        #[cfg(test)]
+        self.runtime.run_test_hook();
         self.runtime.tracker.acknowledge(epoch);
         Ok((stats, project_arc, discovery_ms))
     }
@@ -311,36 +328,242 @@ impl ContextService {
         Ok(stats)
     }
 
-    async fn access_project(
+    /// Shared runtime access for search and dependency. Caller acquires the
+    /// reconcile lock and releases it before retrieval runs.
+    async fn access_runtime(
         &self,
         override_embedder: Option<Arc<dyn Embedder>>,
-    ) -> Result<(Arc<ProjectIndex>, u128, ReconcileStats), ContextError> {
+    ) -> Result<RuntimeAccess, ContextError> {
         let _guard = self.runtime.reconcile_lock.lock().await;
-        let snapshot = self.runtime.current_snapshot();
-        if self.runtime.state() == RuntimeState::Clean
-            && !self.runtime.is_verification_expired(Instant::now())
-        {
-            let snapshot = snapshot.ok_or_else(|| {
+        let now = Instant::now();
+        let state = self.runtime.state();
+        let dirty = self.runtime.dirty_paths();
+        let has_snapshot = self.runtime.current_snapshot().is_some();
+
+        if state == RuntimeState::Clean && !self.runtime.is_verification_expired(now) {
+            let snapshot = self.runtime.current_snapshot().ok_or_else(|| {
                 ContextError::Internal("clean runtime has no project snapshot".into())
             })?;
-            return Ok((
-                snapshot.project,
-                0,
-                ReconcileStats {
-                    discovered: 0,
-                    changed_files: 0,
-                    deleted_files: 0,
-                    elapsed_ms: 0,
-                    vectors_created: 0,
-                    vectors_reused: 0,
-                    embedding_calls: 0,
-                },
-            ));
+            return Ok(RuntimeAccess {
+                project: snapshot.project,
+                generation: snapshot.generation,
+                reconcile_skipped: true,
+                discovery_calls: 0,
+                reconcile_calls: 0,
+                runtime_state: "clean",
+                dirty_file_count: 0,
+                discovery_ms: 0,
+                reconcile_ms: 0,
+            });
         }
 
+        if let Some(paths) = dirty {
+            if has_snapshot {
+                let dirty_count = paths.len();
+                let (stats, project) = self
+                    .reconcile_dirty_paths_locked(override_embedder, &paths)
+                    .await?;
+                let generation = self
+                    .runtime
+                    .current_snapshot()
+                    .map(|s| s.generation)
+                    .unwrap_or(0);
+                return Ok(RuntimeAccess {
+                    project,
+                    generation,
+                    reconcile_skipped: false,
+                    discovery_calls: 0,
+                    reconcile_calls: 1,
+                    runtime_state: "dirty",
+                    dirty_file_count: dirty_count,
+                    discovery_ms: 0,
+                    reconcile_ms: stats.elapsed_ms,
+                });
+            }
+        }
+
+        // Unknown, expired, or dirty-without-snapshot: one full discovery/reconcile.
         let (stats, project, discovery_ms) =
             self.reconcile_and_publish_locked(override_embedder).await?;
-        Ok((project, discovery_ms, stats))
+        let generation = self
+            .runtime
+            .current_snapshot()
+            .map(|s| s.generation)
+            .unwrap_or(0);
+        Ok(RuntimeAccess {
+            project,
+            generation,
+            reconcile_skipped: false,
+            discovery_calls: 1,
+            reconcile_calls: 1,
+            runtime_state: "unknown",
+            dirty_file_count: 0,
+            discovery_ms,
+            reconcile_ms: stats.elapsed_ms,
+        })
+    }
+
+    /// Path-local dirty reconciliation. Caller holds `reconcile_lock`.
+    /// Only `refresh_paths` re-scans captured paths; structural updates run
+    /// through `update_single_file` inside `spawn_blocking`.
+    async fn reconcile_dirty_paths_locked(
+        &self,
+        override_embedder: Option<Arc<dyn Embedder>>,
+        paths: &BTreeSet<String>,
+    ) -> Result<(ReconcileStats, Arc<ProjectIndex>), ContextError> {
+        let epoch = self.runtime.tracker.snapshot().epoch;
+        let t0 = Instant::now();
+        let root = ProjectRoot::resolve(Some(&self.root))
+            .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
+
+        let fingerprint = override_embedder
+            .as_ref()
+            .map(|e| e.fingerprint())
+            .unwrap_or_else(context_index::embed::configured_fingerprint);
+        // Structural mutation may change semantic refs; sample readiness first.
+        let was_semantic_ready = structural_store::open_db(root.path())
+            .ok()
+            .and_then(|conn| {
+                context_index::vector::is_semantic_ready(&conn, &fingerprint, true).ok()
+            })
+            .unwrap_or(false);
+
+        let current = self
+            .runtime
+            .current_snapshot()
+            .ok_or_else(|| ContextError::Internal("no project snapshot to refresh".into()))?
+            .project;
+
+        // Path-local snapshot refresh — never a full walk.
+        let delta = current
+            .refresh_paths(paths)
+            .map_err(|e| ContextError::Internal(e.to_string()))?;
+
+        let root_path = root.path().to_path_buf();
+        let changed = delta.changed_files.clone();
+        let deleted = delta.deleted_files.clone();
+        let (parsed, removed) = tokio::task::spawn_blocking(move || {
+            let si = context_index::structural::StructuralIndex::for_path(root_path);
+            let mut parsed = Vec::new();
+            let mut removed = Vec::new();
+            for f in &changed {
+                if detect_language(std::path::Path::new(f)) == Language::Unknown {
+                    continue;
+                }
+                let stats = si
+                    .update_single_file(f)
+                    .map_err(|e| ContextError::Internal(e.to_string()))?;
+                if stats.files_parsed == 1 {
+                    parsed.push(f.clone());
+                }
+            }
+            for f in &deleted {
+                if detect_language(std::path::Path::new(f)) == Language::Unknown {
+                    continue;
+                }
+                let stats = si
+                    .update_single_file(f)
+                    .map_err(|e| ContextError::Internal(e.to_string()))?;
+                if stats.files_deleted == 1 {
+                    removed.push(f.clone());
+                }
+            }
+            Ok::<_, ContextError>((parsed, removed))
+        })
+        .await
+        .map_err(|e| ContextError::Internal(format!("structural update panicked: {e}")))??;
+
+        let backend_available = if override_embedder.is_some() {
+            true
+        } else {
+            context_index::embed::is_configured_model_available().await
+        };
+
+        let mut vectors_created = 0usize;
+        let mut vectors_reused = 0usize;
+        let mut embedding_calls = 0usize;
+
+        if backend_available {
+            let embedder: Arc<dyn Embedder> = override_embedder
+                .clone()
+                .unwrap_or_else(|| Arc::new(context_index::embed::configured_embedder()));
+            match structural_store::open_db(root.path()) {
+                Ok(mut conn) => {
+                    if was_semantic_ready && !parsed.is_empty() {
+                        match context_index::vector::sync_changed_files_vectors(
+                            &mut conn,
+                            root.path(),
+                            &parsed,
+                            embedder.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok((reused, embedded, calls)) => {
+                                vectors_reused = reused;
+                                vectors_created = embedded;
+                                embedding_calls = calls;
+                            }
+                            Err(e) => tracing::warn!(error=%e, "incremental semantic sync failed"),
+                        }
+                    }
+                    if !removed.is_empty() {
+                        let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
+                    }
+                }
+                Err(e) => tracing::warn!(error=%e, "open_db for semantic sync failed"),
+            }
+        }
+
+        // Truthful repository generation: bump once when the project snapshot
+        // content changed but no structural file was actually parsed/deleted.
+        let structural_changed = !parsed.is_empty() || !removed.is_empty();
+        let content_changed = {
+            let mut any = !delta.deleted_files.is_empty();
+            if !any {
+                for f in &delta.changed_files {
+                    let old_hash = current.find_by_path(f).map(|r| r.content_hash.clone());
+                    let new_hash = delta
+                        .project
+                        .find_by_path(f)
+                        .map(|r| r.content_hash.clone());
+                    if old_hash != new_hash {
+                        any = true;
+                        break;
+                    }
+                }
+            }
+            any
+        };
+        let mut generation = structural_store::open_db(root.path())
+            .ok()
+            .and_then(|c| structural_store::get_generation(&c).ok())
+            .unwrap_or(0);
+        if content_changed && !structural_changed {
+            if let Ok(conn) = structural_store::open_db(root.path()) {
+                let next = generation.saturating_add(1);
+                if structural_store::set_generation(&conn, next).is_ok() {
+                    generation = next;
+                }
+            }
+        }
+
+        let elapsed = t0.elapsed().as_millis();
+        let stats = ReconcileStats {
+            discovered: delta.project.stats.discovered,
+            changed_files: parsed.len(),
+            deleted_files: removed.len(),
+            elapsed_ms: elapsed,
+            vectors_created,
+            vectors_reused,
+            embedding_calls,
+        };
+        let project_arc = Arc::new(delta.project);
+        self.runtime
+            .publish(project_arc.clone(), generation, fingerprint, Instant::now());
+        #[cfg(test)]
+        self.runtime.run_test_hook();
+        self.runtime.tracker.acknowledge(epoch);
+        Ok((stats, project_arc))
     }
 
     /// Cheap reconcile — discovery + incremental structural/BM25 + semantic if available (fast, incremental only).
@@ -374,15 +597,24 @@ impl ContextService {
         query: &str,
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
+        self.search_with_override(query, opts, None).await
+    }
+
+    async fn search_with_override(
+        &self,
+        query: &str,
+        opts: SearchOptions,
+        override_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Result<ContextResult, ContextError> {
         let t_search = std::time::Instant::now();
-        let (project, discovery_ms, reconcile_stats) = self
-            .access_project(None)
+        let access = self
+            .access_runtime(override_embedder)
             .await
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
         let providers = Providers {};
         let mut res = retrieve_context(
             query,
-            &project,
+            &access.project,
             &providers,
             opts.budget_tokens,
             opts.max_results,
@@ -391,21 +623,30 @@ impl ContextService {
         .map_err(|e| ContextError::Internal(e.to_string()))?;
         // Fill stage telemetry at service layer
         let total_ms = t_search.elapsed().as_millis();
-        let generation = self
-            .runtime
-            .current_snapshot()
-            .map(|snapshot| snapshot.generation);
         res.stats.total_ms = Some(total_ms);
-        res.stats.discovery_ms = Some(discovery_ms);
-        res.stats.reconcile_ms = Some(reconcile_stats.elapsed_ms);
-        res.stats.generation = generation;
-        // dirty_file_count stays None until E2 (no dirty tracking yet)
-        res.stats.dirty_file_count = None;
+        res.stats.discovery_ms = Some(access.discovery_ms);
+        res.stats.reconcile_ms = Some(access.reconcile_ms);
+        res.stats.generation = Some(access.generation);
+        res.stats.dirty_file_count = Some(access.dirty_file_count);
+        res.stats.reconcile_skipped = Some(access.reconcile_skipped);
+        res.stats.discovery_calls = Some(access.discovery_calls);
+        res.stats.reconcile_calls = Some(access.reconcile_calls);
+        res.stats.runtime_state = Some(access.runtime_state.to_string());
         res.stats.cache_hit = None;
         if res.stats.authority_ms.is_none() {
             res.stats.authority_ms = Some(res.stats.rank_ms);
         }
         Ok(res)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn search_with_embedder(
+        &self,
+        query: &str,
+        opts: SearchOptions,
+        embedder: Arc<dyn Embedder>,
+    ) -> Result<ContextResult, ContextError> {
+        self.search_with_override(query, opts, Some(embedder)).await
     }
 
     pub async fn symbol(
@@ -423,8 +664,8 @@ impl ContextService {
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
         // Graph-native dependency retrieval: directly query call graph, not via generic search
-        // E1: reconcile already does one discovery; remove duplicate unused ProjectIndex::discover
-        self.reconcile_fast_inner(None)
+        let access = self
+            .access_runtime(None)
             .await
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
         let root = ProjectRoot::resolve(Some(&self.root))
@@ -682,16 +923,20 @@ impl ContextService {
             rank_ms,
             pack_ms,
             total_ms: Some(elapsed_ms),
-            discovery_ms: None,
-            reconcile_ms: None,
+            discovery_ms: Some(access.discovery_ms),
+            reconcile_ms: Some(access.reconcile_ms),
             semantic_embed_ms: None,
             semantic_search_ms: None,
             fusion_ms: Some(fuse_ms),
             authority_ms: Some(rank_ms),
-            generation: None,
-            dirty_file_count: None,
+            generation: Some(access.generation),
+            dirty_file_count: Some(access.dirty_file_count),
             vector_count_scanned: None,
             cache_hit: None,
+            reconcile_skipped: Some(access.reconcile_skipped),
+            discovery_calls: Some(access.discovery_calls),
+            reconcile_calls: Some(access.reconcile_calls),
+            runtime_state: Some(access.runtime_state.to_string()),
         };
         Ok(crate::pipeline::ContextResult {
             query: symbol.to_string(),
@@ -1398,5 +1643,339 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn clean_searches_keep_counters_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let (d0, r0) = svc.runtime.counters();
+        let mut first_gen = None;
+        for _ in 0..5 {
+            let res = svc.search("foo", SearchOptions::default()).await.unwrap();
+            assert_eq!(res.stats.discovery_calls, Some(0));
+            assert_eq!(res.stats.reconcile_calls, Some(0));
+            assert_eq!(res.stats.reconcile_skipped, Some(true));
+            assert_eq!(res.stats.runtime_state.as_deref(), Some("clean"));
+            assert_eq!(res.stats.dirty_file_count, Some(0));
+            first_gen = Some(res.stats.generation.unwrap());
+        }
+        let (d1, r1) = svc.runtime.counters();
+        assert_eq!(
+            (d1, r1),
+            (d0, r0),
+            "repeated clean searches must not increment totals"
+        );
+
+        let opts = SearchOptions::default();
+        let (ra, rb) = tokio::join!(svc.search("foo", opts.clone()), svc.search("foo", opts));
+        let a = ra.unwrap();
+        let b = rb.unwrap();
+        assert_eq!(a.stats.generation, b.stats.generation);
+        assert_eq!(a.stats.generation, Some(first_gen.unwrap()));
+        let (d2, r2) = svc.runtime.counters();
+        assert_eq!(
+            (d2, r2),
+            (d0, r0),
+            "concurrent clean searches must not increment totals"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_modify_reconciles_path_local_once() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        fs::write(root.join("b.py"), b"def bar():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let gen0 = svc.runtime.current_snapshot().unwrap().generation;
+        let (d0, r0) = svc.runtime.counters();
+
+        fs::write(root.join("a.py"), b"def foo():\n    return 42\n").unwrap();
+        svc.runtime.tracker.mark_paths(["a.py".to_string()]);
+
+        let res = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(res.stats.discovery_calls, Some(0));
+        assert_eq!(res.stats.reconcile_calls, Some(1));
+        assert_eq!(res.stats.reconcile_skipped, Some(false));
+        assert_eq!(res.stats.runtime_state.as_deref(), Some("dirty"));
+        assert_eq!(res.stats.dirty_file_count, Some(1));
+        let gen1 = res.stats.generation.unwrap();
+        assert_eq!(gen1, gen0 + 1, "one-file mutation advances generation once");
+        let (d1, r1) = svc.runtime.counters();
+        assert_eq!(d1, d0, "dirty path must not run discovery");
+        assert_eq!(r1, r0 + 1);
+
+        // A second search (possibly processing a duplicate watcher event for the
+        // same path) must not advance generation further.
+        let res2 = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(res2.stats.generation, Some(gen1));
+    }
+
+    #[tokio::test]
+    async fn dirty_no_content_change_does_not_advance_generation() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let gen0 = svc.runtime.current_snapshot().unwrap().generation;
+
+        // Rewrite identical content (touch) and mark dirty.
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        svc.runtime.tracker.mark_paths(["a.py".to_string()]);
+
+        let res = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(res.stats.reconcile_calls, Some(1));
+        assert_eq!(res.stats.runtime_state.as_deref(), Some("dirty"));
+        assert_eq!(
+            res.stats.generation,
+            Some(gen0),
+            "no-content-change event must not advance generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_create_is_visible() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let gen0 = svc.runtime.current_snapshot().unwrap().generation;
+
+        fs::write(root.join("c.py"), b"def baz():\n    pass\n").unwrap();
+        svc.runtime.tracker.mark_paths(["c.py".to_string()]);
+
+        let res = svc.search("baz", SearchOptions::default()).await.unwrap();
+        assert!(
+            res.evidence.iter().any(|e| e.file == "c.py"),
+            "created file should be visible"
+        );
+        assert_eq!(res.stats.discovery_calls, Some(0));
+        assert_eq!(res.stats.reconcile_calls, Some(1));
+        assert_eq!(res.stats.generation, Some(gen0 + 1));
+    }
+
+    #[tokio::test]
+    async fn dirty_delete_cleans_symbols_bm25_graph() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    bar()\n").unwrap();
+        fs::write(root.join("b.py"), b"def bar():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+
+        let conn = structural_store::open_db(&root).unwrap();
+        assert!(structural_store::find_callers(&conn, "bar")
+            .unwrap()
+            .iter()
+            .any(|e| e.file == "a.py"));
+        let bm25_before = context_index::bm25::count_bm25_docs(&conn).unwrap();
+
+        fs::remove_file(root.join("a.py")).unwrap();
+        svc.runtime.tracker.mark_paths(["a.py".to_string()]);
+        let res = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(res.stats.reconcile_calls, Some(1));
+
+        let conn2 = structural_store::open_db(&root).unwrap();
+        assert!(structural_store::find_definitions(&conn2, "foo")
+            .unwrap()
+            .is_empty());
+        assert!(!structural_store::find_callers(&conn2, "bar")
+            .unwrap()
+            .iter()
+            .any(|e| e.file == "a.py"));
+        assert!(!structural_store::list_files(&conn2)
+            .unwrap()
+            .iter()
+            .any(|(f, _)| f == "a.py"));
+        let bm25_after = context_index::bm25::count_bm25_docs(&conn2).unwrap();
+        assert!(
+            bm25_after < bm25_before,
+            "BM25 rows for deleted file should disappear"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_semantic_ready_modify_embeds_only_changed() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    return 1\n").unwrap();
+        fs::write(root.join("b.py"), b"def bar():\n    return 2\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+
+        let fake_full = Arc::new(context_index::embed::FakeEmbedder::new("sem-ready", 8));
+        svc.full_semantic_index_with_embedder(fake_full.clone())
+            .await
+            .unwrap();
+        let fp = fake_full.fingerprint();
+        let conn = structural_store::open_db(&root).unwrap();
+        assert!(context_index::vector::is_semantic_ready(&conn, &fp, true).unwrap());
+        let vectors_before = context_index::vector::count_vectors(&conn, &fp).unwrap();
+
+        struct CountingEmbedder {
+            inner: context_index::embed::FakeEmbedder,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl context_index::embed::Embedder for CountingEmbedder {
+            fn model_id(&self) -> &str {
+                self.inner.model_id()
+            }
+            fn dimension(&self) -> usize {
+                self.inner.dimension()
+            }
+            fn version(&self) -> &str {
+                self.inner.version()
+            }
+            async fn embed_query(&self, q: &str) -> anyhow::Result<Vec<f32>> {
+                self.inner.embed_query(q).await
+            }
+            async fn embed_documents(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.embed_documents(texts).await
+            }
+        }
+
+        fs::write(root.join("a.py"), b"def foo():\n    return 999\n").unwrap();
+        svc.runtime.tracker.mark_paths(["a.py".to_string()]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::new(CountingEmbedder {
+            inner: context_index::embed::FakeEmbedder::new("sem-ready", 8),
+            calls: calls.clone(),
+        });
+        let res = svc
+            .search_with_embedder("foo", SearchOptions::default(), counting)
+            .await
+            .unwrap();
+        assert_eq!(res.stats.reconcile_calls, Some(1));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the changed file's representations should embed"
+        );
+
+        let conn2 = structural_store::open_db(&root).unwrap();
+        assert!(context_index::vector::is_semantic_ready(&conn2, &fp, true).unwrap());
+        assert_eq!(
+            context_index::vector::missing_vector_count(&conn2, &fp).unwrap(),
+            0
+        );
+        let vectors_after = context_index::vector::count_vectors(&conn2, &fp).unwrap();
+        assert!(
+            vectors_after >= vectors_before,
+            "unrelated vectors must remain"
+        );
+
+        // Delete a.py: semantic refs disappear, remaining files stay ready.
+        fs::remove_file(root.join("a.py")).unwrap();
+        svc.runtime.tracker.mark_paths(["a.py".to_string()]);
+        let _ = svc.search("foo", SearchOptions::default()).await.unwrap();
+        let conn3 = structural_store::open_db(&root).unwrap();
+        assert!(context_index::vector::is_semantic_ready(&conn3, &fp, true).unwrap());
+    }
+
+    #[tokio::test]
+    async fn unknown_fallback_full_reconcile() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let (d0, r0) = svc.runtime.counters();
+
+        svc.runtime.tracker.mark_unknown();
+        let res = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(res.stats.discovery_calls, Some(1));
+        assert_eq!(res.stats.reconcile_calls, Some(1));
+        assert_eq!(res.stats.runtime_state.as_deref(), Some("unknown"));
+        let (d1, r1) = svc.runtime.counters();
+        assert_eq!(d1, d0 + 1);
+        assert_eq!(r1, r0 + 1);
+    }
+
+    #[tokio::test]
+    async fn public_reconcile_forces_full_verification() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let (d0, r0) = svc.runtime.counters();
+
+        let stats = svc.reconcile().await.unwrap();
+        assert!(stats.discovered > 0);
+        let (d1, r1) = svc.runtime.counters();
+        assert_eq!(d1, d0 + 1);
+        assert_eq!(r1, r0 + 1);
+    }
+
+    #[tokio::test]
+    async fn verification_expiry_triggers_unknown_path_once() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let now = Instant::now();
+        svc.runtime.set_last_full_verified(
+            now - crate::runtime::FULL_VERIFY_INTERVAL - std::time::Duration::from_secs(1),
+        );
+        assert!(svc.runtime.is_verification_expired(now));
+
+        let (d0, r0) = svc.runtime.counters();
+        let res = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(res.stats.discovery_calls, Some(1));
+        assert_eq!(res.stats.runtime_state.as_deref(), Some("unknown"));
+        let (d1, r1) = svc.runtime.counters();
+        assert_eq!(d1, d0 + 1);
+        assert_eq!(r1, r0 + 1);
+
+        let res2 = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(res2.stats.reconcile_skipped, Some(true));
+        let (d2, r2) = svc.runtime.counters();
+        assert_eq!(
+            (d2, r2),
+            (d1, r1),
+            "post-expiry clean search must not re-discover"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_during_reconcile_remains_dirty() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        fs::write(root.join("b.py"), b"def bar():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+
+        fs::write(root.join("a.py"), b"def foo():\n    return 1\n").unwrap();
+        svc.runtime.tracker.mark_paths(["a.py".to_string()]);
+
+        let tracker = svc.runtime.tracker.clone();
+        svc.runtime.set_test_hook(Box::new(move || {
+            tracker.mark_paths(["b.py".to_string()]);
+        }));
+
+        let _ = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(
+            svc.runtime.state(),
+            RuntimeState::Dirty,
+            "event arriving during reconcile must leave runtime dirty"
+        );
+
+        let _ = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(svc.runtime.state(), RuntimeState::Clean);
     }
 }
