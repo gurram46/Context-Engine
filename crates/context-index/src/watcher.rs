@@ -1,5 +1,8 @@
 use anyhow::Result;
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
+use notify::{
+    event::{CreateKind, RemoveKind},
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -416,6 +419,12 @@ impl DirtyTracker {
     }
 
     pub fn mark_paths(&self, paths: impl IntoIterator<Item = String>) -> DirtySnapshot {
+        let paths: Vec<String> = paths.into_iter().collect();
+        if paths.is_empty() {
+            // ponytail: true no-op; do not bump epoch or move Clean -> Paths(empty).
+            return self.snapshot();
+        }
+
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -499,13 +508,6 @@ impl DirtyTracker {
             }
         };
 
-        if guard.state == DirtyState::Unknown {
-            return DirtySnapshot {
-                state: DirtyState::Unknown,
-                epoch: guard.epoch,
-            };
-        }
-
         if epoch == guard.epoch {
             guard.state = DirtyState::Clean;
         }
@@ -516,10 +518,17 @@ impl DirtyTracker {
     }
 }
 
+fn event_kind_implies_unknown(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
+    )
+}
+
 fn is_ignore_control_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .map(|n| n == ".gitignore" || n == ".ignore")
+        .map(|n| n == ".gitignore" || n == ".ignore" || n == ".opencodeignore")
         .unwrap_or(false)
 }
 
@@ -542,6 +551,10 @@ impl RepositoryWatcher {
         let mut watcher =
             notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
                 Ok(event) => {
+                    if event_kind_implies_unknown(&event.kind) {
+                        tracker_cb.mark_unknown();
+                        return;
+                    }
                     let mut rels = Vec::new();
                     let mut unknown = false;
                     for p in &event.paths {
@@ -773,6 +786,77 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         None
+    }
+
+    #[test]
+    fn dirty_ack_current_epoch_clears_unknown_stale_cannot() {
+        let tracker = DirtyTracker::new(10);
+        tracker.mark_unknown();
+        let snap = tracker.snapshot();
+        assert_eq!(snap.state, DirtyState::Unknown);
+        let epoch = snap.epoch;
+
+        // Current unchanged epoch clears Unknown.
+        let ack = tracker.acknowledge(epoch);
+        assert_eq!(ack.state, DirtyState::Clean);
+
+        // A new Unknown event bumps the epoch.
+        tracker.mark_unknown();
+        // Stale epoch cannot clear Unknown.
+        let stale_ack = tracker.acknowledge(epoch);
+        assert_eq!(stale_ack.state, DirtyState::Unknown);
+    }
+
+    #[test]
+    fn dirty_opencodeignore_is_unknown() {
+        assert!(
+            is_ignore_control_file(Path::new("/repo/.opencodeignore")),
+            ".opencodeignore should be an ignore-control file"
+        );
+        assert!(
+            is_ignore_control_file(Path::new(".opencodeignore")),
+            ".opencodeignore base name should match"
+        );
+        assert!(
+            !is_ignore_control_file(Path::new("/repo/main.rs")),
+            "regular files should not match"
+        );
+    }
+
+    #[test]
+    fn dirty_mark_paths_empty_is_noop() {
+        let tracker = DirtyTracker::new(10);
+        let before = tracker.snapshot();
+        assert_eq!(before.state, DirtyState::Clean);
+        assert_eq!(before.epoch, 0);
+
+        let returned = tracker.mark_paths(std::iter::empty::<String>());
+        assert_eq!(returned.state, DirtyState::Clean);
+        assert_eq!(returned.epoch, 0);
+
+        let after = tracker.snapshot();
+        assert_eq!(after.state, DirtyState::Clean);
+        assert_eq!(after.epoch, 0, "empty mark_paths must not bump epoch");
+    }
+
+    #[test]
+    fn dirty_folder_create_remove_kind_is_unknown() {
+        assert!(
+            event_kind_implies_unknown(&EventKind::Create(CreateKind::Folder)),
+            "Create(Folder) should imply Unknown"
+        );
+        assert!(
+            event_kind_implies_unknown(&EventKind::Remove(RemoveKind::Folder)),
+            "Remove(Folder) should imply Unknown even if the path no longer exists"
+        );
+        assert!(
+            !event_kind_implies_unknown(&EventKind::Create(CreateKind::File)),
+            "Create(File) should not imply Unknown"
+        );
+        assert!(
+            !event_kind_implies_unknown(&EventKind::Remove(RemoveKind::File)),
+            "Remove(File) should not imply Unknown"
+        );
     }
 
     #[test]
