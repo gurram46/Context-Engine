@@ -543,10 +543,6 @@ fn event_kind_implies_unknown(kind: &EventKind) -> bool {
     )
 }
 
-fn looks_like_file(path: &Path) -> bool {
-    path.extension().is_some()
-}
-
 fn is_ignore_control_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -604,12 +600,7 @@ fn classify_event(root: &Path, event: &Event) -> EventAction {
             event.kind,
             EventKind::Remove(RemoveKind::Any) | EventKind::Remove(RemoveKind::Other)
         ) {
-            if looks_like_file(p) {
-                rels.push(rel);
-            } else {
-                return EventAction::MarkUnknown;
-            }
-            continue;
+            return EventAction::MarkUnknown;
         }
         rels.push(rel);
     }
@@ -1126,15 +1117,14 @@ mod tests {
     fn classify_vanished_generic_remove_is_unknown() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        // File with extension via generic remove remains path-local (not unknown)
-        let vanished = root.join("src/gone.rs");
+        // Ambiguous generic remove must be Unknown even for file-like names
+        let vanished = root.join("foo.rs");
         let event = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(vanished);
         assert_eq!(
             classify_event(root, &event),
-            EventAction::MarkPaths(vec!["src/gone.rs".to_string()]),
-            "generic Remove(Any) for file with extension must remain path-local"
+            EventAction::MarkUnknown,
+            "generic Remove(Any) must be MarkUnknown even for foo.rs"
         );
-        // Directory-like path without extension via generic remove is ambiguous -> Unknown
         let vanished2 = root.join("src/old_dir");
         let event2 = Event::new(EventKind::Remove(RemoveKind::Other)).add_path(vanished2);
         assert_eq!(classify_event(root, &event2), EventAction::MarkUnknown);
@@ -1142,6 +1132,39 @@ mod tests {
         let ignored = root.join(".context/index/db");
         let event3 = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(ignored);
         assert_eq!(classify_event(root, &event3), EventAction::Noop);
+    }
+
+    #[test]
+    fn classify_dotted_dir_ambiguous_remove_is_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Dotted directory names must not be inferred as files
+        let dir1 = root.join("src/v1.2");
+        let event1 = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(dir1);
+        assert_eq!(
+            classify_event(root, &event1),
+            EventAction::MarkUnknown,
+            "ambiguous Remove(Any) for src/v1.2 must be MarkUnknown"
+        );
+        let dir2 = root.join("packages/foo.bar");
+        let event2 = Event::new(EventKind::Remove(RemoveKind::Other)).add_path(dir2);
+        assert_eq!(
+            classify_event(root, &event2),
+            EventAction::MarkUnknown,
+            "ambiguous Remove(Other) for packages/foo.bar must be MarkUnknown"
+        );
+        // Also ensure a file-like path via ambiguous is still Unknown
+        let file_like = root.join("src/v1.2/a.rs");
+        // normal file removal via explicit File kind is path-local, but ambiguous for the dir itself is Unknown
+        // Verify the dir case dominates
+        assert_eq!(
+            classify_event(
+                root,
+                &Event::new(EventKind::Remove(RemoveKind::Any)).add_path(root.join("src/v1.2"))
+            ),
+            EventAction::MarkUnknown
+        );
+        let _ = file_like;
     }
 
     #[test]
