@@ -287,17 +287,13 @@ fn is_symlink_tainted(root: &Path, rel: &str) -> bool {
     // Prevents incremental reads outside root and aligns full/incremental.
     let mut prefix = PathBuf::new();
     for comp in Path::new(rel).components() {
-        match comp {
-            Component::Normal(os) => {
-                prefix.push(os);
-                let abs = root.join(&prefix);
-                if let Ok(md) = std::fs::symlink_metadata(&abs) {
-                    if md.file_type().is_symlink() {
-                        return true;
-                    }
-                }
+        if let Component::Normal(os) = comp {
+            prefix.push(os);
+            if std::fs::symlink_metadata(root.join(&prefix))
+                .is_ok_and(|md| md.file_type().is_symlink())
+            {
+                return true;
             }
-            _ => {}
         }
     }
     false
