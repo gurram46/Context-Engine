@@ -532,6 +532,61 @@ fn is_ignore_control_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Action derived from a filesystem event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventAction {
+    Noop,
+    MarkUnknown,
+    MarkPaths(Vec<String>),
+}
+
+impl EventAction {
+    fn apply(&self, tracker: &DirtyTracker) {
+        match self {
+            EventAction::Noop => {}
+            EventAction::MarkUnknown => {
+                tracker.mark_unknown();
+            }
+            EventAction::MarkPaths(paths) => {
+                tracker.mark_paths(paths.clone());
+            }
+        }
+    }
+}
+
+/// Classify a notify event relative to a repository root.
+///
+/// Per-path order: normalize; skip ignored; if ignore-control then MarkUnknown;
+/// if nonignored folder kind or path is a directory then MarkUnknown;
+/// otherwise collect the regular relative paths. Empty/all-ignored -> Noop.
+fn classify_event(root: &Path, event: &Event) -> EventAction {
+    if event.need_rescan() {
+        return EventAction::MarkUnknown;
+    }
+    let mut rels = Vec::new();
+    for p in &event.paths {
+        let rel = match normalize_rel(root, p) {
+            Some(r) => r,
+            None => return EventAction::MarkUnknown,
+        };
+        if is_ignored(&rel) {
+            continue;
+        }
+        if is_ignore_control_file(p) {
+            return EventAction::MarkUnknown;
+        }
+        if event_kind_implies_unknown(&event.kind) || p.is_dir() {
+            return EventAction::MarkUnknown;
+        }
+        rels.push(rel);
+    }
+    if rels.is_empty() {
+        EventAction::Noop
+    } else {
+        EventAction::MarkPaths(rels)
+    }
+}
+
 /// Lightweight, mark-only repository watcher.
 ///
 /// The notify callback records normalized relative paths in a `DirtyTracker`. It performs
@@ -551,34 +606,7 @@ impl RepositoryWatcher {
         let mut watcher =
             notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
                 Ok(event) => {
-                    if event_kind_implies_unknown(&event.kind) {
-                        tracker_cb.mark_unknown();
-                        return;
-                    }
-                    let mut rels = Vec::new();
-                    let mut unknown = false;
-                    for p in &event.paths {
-                        if p.is_dir() {
-                            unknown = true;
-                            break;
-                        }
-                        if is_ignore_control_file(p) {
-                            unknown = true;
-                            break;
-                        }
-                        match normalize_rel(&root_cb, p) {
-                            Some(rel) => rels.push(rel),
-                            None => {
-                                unknown = true;
-                                break;
-                            }
-                        }
-                    }
-                    if unknown {
-                        tracker_cb.mark_unknown();
-                    } else if !rels.is_empty() {
-                        tracker_cb.mark_paths(rels);
-                    }
+                    classify_event(&root_cb, &event).apply(&tracker_cb);
                 }
                 Err(_) => {
                     tracker_cb.mark_unknown();
@@ -606,6 +634,7 @@ impl RepositoryWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::{DataChange, ModifyKind};
     use tempfile::TempDir;
 
     #[test]
@@ -857,6 +886,112 @@ mod tests {
             !event_kind_implies_unknown(&EventKind::Remove(RemoveKind::File)),
             "Remove(File) should not imply Unknown"
         );
+    }
+
+    #[test]
+    fn classify_ignored_context_folder_create_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let context_dir = root.join(".context");
+        std::fs::create_dir_all(&context_dir).unwrap();
+        let event = Event::new(EventKind::Create(CreateKind::Folder)).add_path(context_dir);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::Noop,
+            "creating the runtime .context directory must not dirty state"
+        );
+    }
+
+    #[test]
+    fn classify_ignored_context_folder_remove_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let context_dir = root.join(".context");
+        // Path no longer exists, as it would be for a Remove(Folder) event.
+        let event = Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(context_dir);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::Noop,
+            "removing the runtime .context directory must not dirty state"
+        );
+    }
+
+    #[test]
+    fn classify_ignored_context_db_modify_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let db = root.join(".context/index/structural.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"").unwrap();
+        let event =
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(db);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::Noop,
+            "modifying the runtime structural DB must not dirty state"
+        );
+    }
+
+    #[test]
+    fn classify_nonignored_folder_remove_is_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let src_dir = root.join("src");
+        // Directory has been removed, so it does not exist.
+        let event = Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(src_dir);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::MarkUnknown,
+            "removing a nonignored directory must mark Unknown"
+        );
+    }
+
+    #[test]
+    fn classify_regular_file_modify_is_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let file = root.join("src/main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"fn main() {}").unwrap();
+        let event =
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(file);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::MarkPaths(vec!["src/main.rs".to_string()]),
+            "modifying a regular nonignored file must record its relative path"
+        );
+    }
+
+    #[test]
+    fn classify_all_ignored_paths_leaves_tracker_unchanged() {
+        let tracker = DirtyTracker::new(10);
+        let before = tracker.snapshot();
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let event = Event::new(EventKind::Create(CreateKind::Folder))
+            .add_path(root.join(".context"))
+            .add_path(root.join(".git/objects"));
+        let action = classify_event(root, &event);
+        assert_eq!(
+            action,
+            EventAction::Noop,
+            "all-ignored event must produce Noop"
+        );
+
+        // Applying Noop must not mutate tracker state/epoch.
+        match action {
+            EventAction::MarkPaths(rels) => {
+                tracker.mark_paths(rels);
+            }
+            EventAction::MarkUnknown => {
+                tracker.mark_unknown();
+            }
+            EventAction::Noop => {}
+        }
+        let after = tracker.snapshot();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.epoch, before.epoch, "Noop must not bump epoch");
     }
 
     #[test]
