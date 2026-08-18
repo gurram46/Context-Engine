@@ -540,9 +540,11 @@ fn event_kind_implies_unknown(kind: &EventKind) -> bool {
         EventKind::Create(CreateKind::Folder)
             | EventKind::Remove(RemoveKind::Folder)
             | EventKind::Modify(ModifyKind::Name(_))
-            | EventKind::Remove(RemoveKind::Any)
-            | EventKind::Remove(RemoveKind::Other)
     )
+}
+
+fn looks_like_file(path: &Path) -> bool {
+    path.extension().is_some()
 }
 
 fn is_ignore_control_file(path: &Path) -> bool {
@@ -597,6 +599,17 @@ fn classify_event(root: &Path, event: &Event) -> EventAction {
         }
         if event_kind_implies_unknown(&event.kind) || p.is_dir() {
             return EventAction::MarkUnknown;
+        }
+        if matches!(
+            event.kind,
+            EventKind::Remove(RemoveKind::Any) | EventKind::Remove(RemoveKind::Other)
+        ) {
+            if looks_like_file(p) {
+                rels.push(rel);
+            } else {
+                return EventAction::MarkUnknown;
+            }
+            continue;
         }
         rels.push(rel);
     }
@@ -1113,14 +1126,16 @@ mod tests {
     fn classify_vanished_generic_remove_is_unknown() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
+        // File with extension via generic remove remains path-local (not unknown)
         let vanished = root.join("src/gone.rs");
         let event = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(vanished);
         assert_eq!(
             classify_event(root, &event),
-            EventAction::MarkUnknown,
-            "generic Remove(Any) for vanished path must be MarkUnknown"
+            EventAction::MarkPaths(vec!["src/gone.rs".to_string()]),
+            "generic Remove(Any) for file with extension must remain path-local"
         );
-        let vanished2 = root.join("src/gone2.rs");
+        // Directory-like path without extension via generic remove is ambiguous -> Unknown
+        let vanished2 = root.join("src/old_dir");
         let event2 = Event::new(EventKind::Remove(RemoveKind::Other)).add_path(vanished2);
         assert_eq!(classify_event(root, &event2), EventAction::MarkUnknown);
         // ignored generic remove stays Noop
