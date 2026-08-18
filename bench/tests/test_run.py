@@ -162,5 +162,148 @@ class TestSmokeIntegration(unittest.TestCase):
                     del os.environ["CONTEXT_BENCH_TIMING"]
 
 
+class TestRuntimeTelemetry(unittest.TestCase):
+    def test_search_result_exposes_runtime_fields(self):
+        sr = SearchResult(
+            query="q",
+            reconcile_skipped=True,
+            discovery_calls=0,
+            reconcile_calls=0,
+            runtime_state="clean",
+        )
+        self.assertTrue(sr.reconcile_skipped is True)
+        self.assertEqual(sr.discovery_calls, 0)
+        self.assertEqual(sr.reconcile_calls, 0)
+        self.assertEqual(sr.runtime_state, "clean")
+
+    def test_missing_runtime_fields_remain_none_when_durations_present(self):
+        sr = SearchResult(query="q", discovery_ms=12, reconcile_ms=7)
+        self.assertIsNone(sr.reconcile_skipped)
+        self.assertIsNone(sr.discovery_calls)
+        self.assertIsNone(sr.reconcile_calls)
+        self.assertIsNone(sr.runtime_state)
+
+    def test_cold_adapter_maps_camel_and_snake_without_inferring_zeros(self):
+        from unittest.mock import patch
+        import bench.adapters.context_engine as ce_mod
+        from bench.adapters.context_engine import ContextEngineAdapter
+
+        # helper to make adapter without building
+        adapter = ContextEngineAdapter.__new__(ContextEngineAdapter)
+        adapter._bin = Path("/tmp/fake_contextd")
+
+        camel_data = {
+            "evidence": [],
+            "stats": {
+                "reconcileSkipped": True,
+                "discoveryCalls": 0,
+                "reconcileCalls": 0,
+                "runtimeState": "clean",
+                "discoveryMs": 1,
+                "reconcileMs": 2,
+            },
+            "context": "",
+        }
+        snake_data = {
+            "evidence": [],
+            "stats": {
+                "reconcile_skipped": False,
+                "discovery_calls": 3,
+                "reconcile_calls": 1,
+                "runtime_state": "dirty",
+            },
+            "context": "",
+        }
+        only_durations = {
+            "evidence": [],
+            "stats": {"discoveryMs": 9, "reconcileMs": 4},
+            "context": "",
+        }
+
+        with patch.object(ce_mod, "_run_json", return_value=camel_data):
+            res = adapter.search("q", Path("/tmp"), top_n=5)
+            self.assertTrue(res.reconcile_skipped is True)
+            self.assertEqual(res.discovery_calls, 0)
+            self.assertEqual(res.reconcile_calls, 0)
+            self.assertEqual(res.runtime_state, "clean")
+
+        with patch.object(ce_mod, "_run_json", return_value=snake_data):
+            res = adapter.search("q", Path("/tmp"), top_n=5)
+            self.assertTrue(res.reconcile_skipped is False)
+            self.assertEqual(res.discovery_calls, 3)
+            self.assertEqual(res.reconcile_calls, 1)
+            self.assertEqual(res.runtime_state, "dirty")
+
+        with patch.object(ce_mod, "_run_json", return_value=only_durations):
+            res = adapter.search("q", Path("/tmp"), top_n=5)
+            self.assertIsNone(res.reconcile_skipped)
+            self.assertIsNone(res.discovery_calls)
+            self.assertIsNone(res.reconcile_calls)
+            self.assertIsNone(res.runtime_state)
+
+    def test_hot_adapter_maps_camel_and_snake_without_inferring_zeros(self):
+        from bench.adapters.context_engine_hot import ContextEngineHotAdapter
+
+        adapter = ContextEngineHotAdapter.__new__(ContextEngineHotAdapter)
+        adapter._bin = Path("/tmp/fake_contextd")
+        adapter._clients = {}
+
+        class FakeClient:
+            def __init__(self, payload):
+                self.payload = payload
+                self.contextd_pid = 1234
+                self.startup_ms = 10
+
+            def search(self, query, max_results=5, budget_tokens=10000, timeout=180):
+                return self.payload
+
+        camel = {
+            "evidence": [],
+            "stats": {
+                "reconcileSkipped": True,
+                "discoveryCalls": 0,
+                "reconcileCalls": 0,
+                "runtimeState": "clean",
+            },
+        }
+        snake = {
+            "evidence": [],
+            "stats": {
+                "reconcile_skipped": True,
+                "discovery_calls": 0,
+                "reconcile_calls": 0,
+                "runtime_state": "clean",
+            },
+        }
+        only_durations = {
+            "evidence": [],
+            "stats": {"discovery_ms": 15, "reconcile_ms": 6},
+        }
+
+        fake_camel = FakeClient(camel)
+        adapter._client_for = lambda _p: fake_camel  # type: ignore
+        res = adapter.search("q", Path("/tmp"), top_n=5)
+        self.assertTrue(res.reconcile_skipped is True)
+        self.assertEqual(res.discovery_calls, 0)
+        self.assertEqual(res.reconcile_calls, 0)
+        self.assertEqual(res.runtime_state, "clean")
+
+        fake_snake = FakeClient(snake)
+        adapter._client_for = lambda _p: fake_snake  # type: ignore
+        res = adapter.search("q", Path("/tmp"), top_n=5)
+        self.assertTrue(res.reconcile_skipped is True)
+        self.assertEqual(res.discovery_calls, 0)
+        self.assertEqual(res.reconcile_calls, 0)
+        self.assertEqual(res.runtime_state, "clean")
+
+        fake_durations = FakeClient(only_durations)
+        adapter._client_for = lambda _p: fake_durations  # type: ignore
+        res = adapter.search("q", Path("/tmp"), top_n=5)
+        self.assertIsNone(res.reconcile_skipped)
+        self.assertIsNone(res.discovery_calls)
+        self.assertIsNone(res.reconcile_calls)
+        self.assertIsNone(res.runtime_state)
+
+
 if __name__ == "__main__":
     unittest.main()

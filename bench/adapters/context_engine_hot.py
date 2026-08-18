@@ -398,6 +398,10 @@ class ContextEngineHotAdapter(BenchmarkAdapter):
         generation = g("generation", "generation", None)
         dirty = g("dirty_file_count", "dirtyFileCount", None)
         vector_scanned = g("vector_count_scanned", "vectorCountScanned", None)
+        reconcile_skipped = g("reconcile_skipped", "reconcileSkipped", None)
+        discovery_calls = g("discovery_calls", "discoveryCalls", None)
+        reconcile_calls = g("reconcile_calls", "reconcileCalls", None)
+        runtime_state = g("runtime_state", "runtimeState", None)
 
         # hot must report both wall and internal
         # wall is adapter-measured per query (excludes startup), internal is engine pipeline
@@ -461,6 +465,10 @@ class ContextEngineHotAdapter(BenchmarkAdapter):
             dirty_file_count=int(dirty) if dirty is not None else None,
             vector_count_scanned=int(vector_scanned) if vector_scanned is not None else None,
             cache_hit=cache_hit_val,
+            reconcile_skipped=bool(reconcile_skipped) if reconcile_skipped is not None else None,
+            discovery_calls=int(discovery_calls) if discovery_calls is not None else None,
+            reconcile_calls=int(reconcile_calls) if reconcile_calls is not None else None,
+            runtime_state=str(runtime_state) if runtime_state is not None else None,
             process_pid=pid_for_query,
             startup_ms=startup_for_query,
             raw={

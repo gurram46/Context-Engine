@@ -63,6 +63,11 @@ class SearchResult:
     cache_hit: Optional[bool] = None
     process_pid: Optional[int] = None
     startup_ms: Optional[int] = None
+    # E2 runtime telemetry (Option/null when not exposed)
+    reconcile_skipped: Optional[bool] = None
+    discovery_calls: Optional[int] = None
+    reconcile_calls: Optional[int] = None
+    runtime_state: Optional[str] = None
     # Raw for debugging
     raw: Optional[Dict] = None
 
