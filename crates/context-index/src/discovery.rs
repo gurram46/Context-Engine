@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use context_core::ContextError;
@@ -191,11 +191,11 @@ impl ProjectIndex {
         let mut deleted = Vec::new();
 
         for rel in paths {
-            let norm = rel.replace('\\', "/").trim_start_matches("./").to_string();
-            let old = files.iter().find(|f| f.relative_path == norm).cloned();
-            if let Some(pos) = files.iter().position(|f| f.relative_path == norm) {
-                files.remove(pos);
-            }
+            let norm = normalize_rel_path(rel)?;
+            let old = match files.iter().position(|f| f.relative_path == norm) {
+                Some(pos) => Some(files.remove(pos)),
+                None => None,
+            };
             let mut scratch = ScanStats::default();
             if let Some(new) = make_record(&self.root, &norm, true, &mut scratch) {
                 let is_changed = match &old {
@@ -220,7 +220,9 @@ impl ProjectIndex {
         changed.sort();
         deleted.sort();
 
-        let stats = recompute_stats(&files);
+        let mut stats = recompute_stats(&files);
+        stats.skipped_generated = self.stats.skipped_generated;
+        stats.hash_errors = self.stats.hash_errors;
 
         Ok(ProjectIndexDelta {
             project: ProjectIndex {
@@ -232,6 +234,33 @@ impl ProjectIndex {
             deleted_files: deleted,
         })
     }
+}
+
+/// Normalize a caller-supplied path to posix style and reject any path that
+/// would escape the project root: empty, absolute, root/prefix, or `..`.
+fn normalize_rel_path(rel: &str) -> Result<String, ContextError> {
+    let norm = rel.replace('\\', "/").trim_start_matches("./").to_string();
+    if norm.is_empty() {
+        return Err(ContextError::InvalidParams("empty path".into()));
+    }
+    for comp in Path::new(&norm).components() {
+        match comp {
+            Component::ParentDir => {
+                return Err(ContextError::InvalidParams(format!(
+                    "path escapes project root: {}",
+                    rel
+                )));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(ContextError::InvalidParams(format!(
+                    "absolute path not allowed: {}",
+                    rel
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(norm)
 }
 
 /// Build a single `FileRecord` from a relative posix path.
@@ -262,6 +291,9 @@ fn make_record(
         Ok(m) => m,
         Err(_) => return None,
     };
+    if meta.is_dir() {
+        return None;
+    }
     let size = meta.len();
     stats.total_bytes += size;
     match kind {
@@ -314,12 +346,6 @@ fn recompute_stats(files: &[FileRecord]) -> ScanStats {
             FileKind::Build => stats.build += 1,
             FileKind::Generated => stats.generated += 1,
             FileKind::Unknown => stats.unknown += 1,
-        }
-        if f.content_hash.is_none()
-            && is_text_searchable(&f.relative_path, f.kind)
-            && f.size_bytes <= 10 * 1024 * 1024
-        {
-            stats.hash_errors += 1;
         }
     }
     stats
@@ -379,6 +405,7 @@ fn is_text_searchable(rel: &str, kind: FileKind) -> bool {
 mod tests {
     use super::*;
     use crate::project_root::ProjectRoot;
+    use context_core::ContextError;
     use std::collections::BTreeSet;
     use std::fs;
     use tempfile::TempDir;
@@ -600,5 +627,90 @@ mod tests {
         assert_eq!(delta.project.stats.source, 2);
         assert_eq!(delta.project.stats.doc, 0);
         assert_eq!(delta.project.stats.total_bytes, 5 + 12);
+    }
+
+    #[test]
+    fn refresh_paths_rejects_parent_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        fs::write(tmp.path().join("a.py"), b"hello").unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let paths: BTreeSet<String> = ["../secret.txt".to_string()].into_iter().collect();
+        let err = idx.refresh_paths(&paths).unwrap_err();
+        assert!(matches!(err, ContextError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn refresh_paths_rejects_absolute() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        fs::write(tmp.path().join("a.py"), b"hello").unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let abs = tmp.path().join("a.py").to_string_lossy().replace('\\', "/");
+        let paths: BTreeSet<String> = [abs].into_iter().collect();
+        let err = idx.refresh_paths(&paths).unwrap_err();
+        assert!(matches!(err, ContextError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn refresh_paths_rejects_empty() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        fs::write(tmp.path().join("a.py"), b"hello").unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let paths: BTreeSet<String> = ["".to_string()].into_iter().collect();
+        let err = idx.refresh_paths(&paths).unwrap_err();
+        assert!(matches!(err, ContextError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn refresh_paths_directory_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        fs::write(tmp.path().join("a.py"), b"hello").unwrap();
+        fs::create_dir_all(tmp.path().join("subdir")).unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        let paths: BTreeSet<String> = ["subdir".to_string()].into_iter().collect();
+        let delta = idx.refresh_paths(&paths).unwrap();
+        assert!(!delta
+            .project
+            .files
+            .iter()
+            .any(|f| f.relative_path == "subdir"));
+        assert!(delta.changed_files.is_empty());
+        assert!(delta.deleted_files.is_empty());
+    }
+
+    #[test]
+    fn refresh_paths_preserves_skipped_generated() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        fs::write(tmp.path().join("a.py"), b"hello").unwrap();
+        fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
+        fs::write(tmp.path().join("target/debug/foo"), b"bin").unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        assert!(idx.stats.skipped_generated > 0);
+        fs::write(tmp.path().join("b.py"), b"world").unwrap();
+        let paths: BTreeSet<String> = ["b.py".to_string()].into_iter().collect();
+        let delta = idx.refresh_paths(&paths).unwrap();
+        assert_eq!(
+            delta.project.stats.skipped_generated,
+            idx.stats.skipped_generated
+        );
+    }
+
+    #[test]
+    fn refresh_paths_preserves_hash_errors() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        fs::write(tmp.path().join("a.py"), b"hello").unwrap();
+        fs::write(tmp.path().join("b.md"), b"# doc").unwrap();
+        let idx = ProjectIndex::discover_with_options(&root, false).unwrap();
+        assert_eq!(idx.stats.hash_errors, 0);
+        fs::write(tmp.path().join("a.py"), b"hello world").unwrap();
+        let paths: BTreeSet<String> = ["a.py".to_string()].into_iter().collect();
+        let delta = idx.refresh_paths(&paths).unwrap();
+        assert_eq!(delta.project.stats.hash_errors, idx.stats.hash_errors);
+        assert_eq!(delta.project.stats.hash_errors, 0);
     }
 }
