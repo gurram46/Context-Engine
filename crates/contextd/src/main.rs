@@ -7,6 +7,7 @@ mod config;
 mod mcp;
 mod pipeline;
 mod project;
+mod runtime;
 mod service;
 
 use clap::Parser;

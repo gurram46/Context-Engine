@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use context_core::ContextError;
 use context_index::embed::Embedder;
@@ -8,7 +9,7 @@ use context_index::structural::store as structural_store;
 use context_index::{ProjectIndex, ProjectRoot};
 
 use crate::pipeline::{retrieve_context, ContextResult, Providers};
-use crate::project::ProjectCache;
+use crate::runtime::{RepositoryRuntime, RuntimeState};
 
 /// Options for search-like calls.
 #[derive(Debug, Clone)]
@@ -101,15 +102,15 @@ pub struct StatusReport {
 
 /// Native service — single core for CLI and MCP.
 pub struct ContextService {
-    cache: Arc<ProjectCache>,
     root: PathBuf,
-    #[allow(dead_code)]
     explicit_root: Option<PathBuf>,
-    build_lock: Arc<tokio::sync::Mutex<()>>,
+    runtime: Arc<RepositoryRuntime>,
 }
 
 impl ContextService {
     /// Create service for given root (or auto-resolve via ProjectRoot::resolve).
+    /// Starts the mark-only watcher and completes one full discovery/reconcile
+    /// before returning so that the runtime snapshot is immediately usable.
     pub async fn new(root: Option<PathBuf>) -> Result<Self, ContextError> {
         let root_path = if let Some(p) = root.clone() {
             p.canonicalize().unwrap_or(p)
@@ -118,43 +119,58 @@ impl ContextService {
                 .map(|r| r.path().to_path_buf())
                 .map_err(|e| ContextError::InvalidRoot(e.to_string()))?
         };
-        Ok(Self {
-            cache: Arc::new(ProjectCache::new()),
+        let runtime = Arc::new(RepositoryRuntime::new(root_path.clone()).map_err(|e| {
+            ContextError::Internal(format!("failed to start repository runtime: {e}"))
+        })?);
+        let service = Self {
             root: root_path,
             explicit_root: root,
-            build_lock: Arc::new(tokio::sync::Mutex::new(())),
-        })
+            runtime,
+        };
+        service.initialize().await?;
+        Ok(service)
     }
 
-    /// For tests: create with explicit cache.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn with_cache(cache: Arc<ProjectCache>, root: PathBuf) -> Self {
-        Self {
-            cache,
-            root: root.clone(),
-            explicit_root: Some(root),
-            build_lock: Arc::new(tokio::sync::Mutex::new(())),
-        }
+    async fn initialize(&self) -> Result<(), ContextError> {
+        self.reconcile_and_publish(None).await?;
+        Ok(())
     }
 
-    async fn reconcile_inner(
+    async fn reconcile_and_publish(
         &self,
         override_embedder: Option<Arc<dyn Embedder>>,
-    ) -> Result<ReconcileStats, ContextError> {
-        self.reconcile_full_inner(override_embedder).await
+    ) -> Result<(ReconcileStats, Arc<ProjectIndex>, u128), ContextError> {
+        let _guard = self.runtime.reconcile_lock.lock().await;
+        self.reconcile_and_publish_locked(override_embedder).await
     }
 
-    async fn reconcile_full_inner(
+    /// Caller holds `runtime.reconcile_lock`; runtime data is locked only while publishing.
+    async fn reconcile_and_publish_locked(
         &self,
         override_embedder: Option<Arc<dyn Embedder>>,
-    ) -> Result<ReconcileStats, ContextError> {
-        let _guard = self.build_lock.lock().await;
-        let t0 = std::time::Instant::now();
+    ) -> Result<(ReconcileStats, Arc<ProjectIndex>, u128), ContextError> {
+        let epoch = self.runtime.tracker.snapshot().epoch;
+        let t0 = Instant::now();
         let root = ProjectRoot::resolve(Some(&self.root))
             .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
+
+        let fingerprint = override_embedder
+            .as_ref()
+            .map(|embedder| embedder.fingerprint())
+            .unwrap_or_else(context_index::embed::configured_fingerprint);
+        // Structural reconciliation mutates semantic references, so readiness must be sampled first.
+        let was_semantic_ready = structural_store::open_db(root.path())
+            .ok()
+            .and_then(|conn| {
+                context_index::vector::is_semantic_ready(&conn, &fingerprint, true).ok()
+            })
+            .unwrap_or(false);
+
+        let t_discovery = Instant::now();
+        self.runtime.increment_discovery();
         let idx =
             ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
+        let discovery_ms = t_discovery.elapsed().as_millis();
         let root_path = root.path().to_path_buf();
         let idx_clone = idx.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -165,130 +181,24 @@ impl ContextService {
         .map_err(|e| ContextError::Internal(format!("structural build panicked: {e}")))?
         .map_err(|e| ContextError::Internal(format!("structural build failed: {e}")))?;
 
-        let _elapsed_struct = t0.elapsed().as_millis();
-        let mut vectors_created = 0usize;
-        let mut vectors_reused = 0usize;
-        let mut embedding_calls = 0usize;
-
-        let fingerprint = if let Some(ref emb) = override_embedder {
-            emb.fingerprint()
-        } else {
-            context_index::embed::configured_fingerprint()
-        };
         let backend_available = if override_embedder.is_some() {
             true
         } else {
             context_index::embed::is_configured_model_available().await
         };
 
-        if backend_available {
-            let embedder: Arc<dyn Embedder> = if let Some(e) = override_embedder {
-                e
-            } else {
-                Arc::new(context_index::embed::configured_embedder())
-            };
-            match structural_store::open_db(root.path()) {
-                Ok(mut conn) => {
-                    match context_index::vector::sync_missing_vectors_for_root(
-                        &mut conn,
-                        root.path(),
-                        embedder.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok((reused, created, calls, _docs)) => {
-                            vectors_reused = reused;
-                            vectors_created = created;
-                            embedding_calls = calls;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error=%e, "semantic sync failed, structural still ok");
-                        }
-                    }
-                    let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
-                }
-                Err(e) => {
-                    tracing::warn!(error=%e, "open_db for semantic sync failed");
-                }
-            }
-        } else {
-            tracing::debug!("semantic backend unavailable, skipping vector sync");
-        }
-
-        let elapsed = t0.elapsed().as_millis();
-        Ok(ReconcileStats {
-            discovered: idx.stats.discovered,
-            changed_files: outcome.changed_files.len(),
-            deleted_files: outcome.deleted_files.len(),
-            elapsed_ms: elapsed,
-            vectors_created,
-            vectors_reused,
-            embedding_calls,
-        })
-    }
-
-    async fn reconcile_fast_inner(
-        &self,
-        override_embedder: Option<Arc<dyn Embedder>>,
-    ) -> Result<ReconcileStats, ContextError> {
-        let (stats, _idx, _discovery_ms) = self
-            .reconcile_fast_with_index_inner(override_embedder)
-            .await?;
-        Ok(stats)
-    }
-
-    async fn reconcile_fast_with_index_inner(
-        &self,
-        override_embedder: Option<Arc<dyn Embedder>>,
-    ) -> Result<(ReconcileStats, ProjectIndex, u128), ContextError> {
-        let _guard = self.build_lock.lock().await;
-        let t0 = std::time::Instant::now();
-        let root = ProjectRoot::resolve(Some(&self.root))
-            .map_err(|e| ContextError::InvalidRoot(e.to_string()))?;
-        // Capture semantic readiness BEFORE structural mutation (correct for incremental)
-        let fingerprint = if let Some(ref emb) = override_embedder {
-            emb.fingerprint()
-        } else {
-            context_index::embed::configured_fingerprint()
-        };
-        let was_semantic_ready = if let Ok(conn) = structural_store::open_db(root.path()) {
-            context_index::vector::is_semantic_ready(&conn, &fingerprint, true).unwrap_or(false)
-        } else {
-            false
-        };
-        let t_discover = std::time::Instant::now();
-        let idx =
-            ProjectIndex::discover(&root).map_err(|e| ContextError::Internal(e.to_string()))?;
-        let discovery_ms = t_discover.elapsed().as_millis();
-        let root_path = root.path().to_path_buf();
-        let idx_clone = idx.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            let si = context_index::structural::StructuralIndex::for_path(root_path);
-            si.build_with_delta(&idx_clone)
-        })
-        .await
-        .map_err(|e| ContextError::Internal(format!("structural build panicked: {e}")))?
-        .map_err(|e| ContextError::Internal(format!("structural build failed: {e}")))?;
-
         let mut vectors_created = 0usize;
         let mut vectors_reused = 0usize;
         let mut embedding_calls = 0usize;
 
-        let backend_available = if override_embedder.is_some() {
-            true
-        } else {
-            context_index::embed::is_configured_model_available().await
-        };
-
         if backend_available {
-            let embedder: Arc<dyn Embedder> = if let Some(e) = override_embedder {
+            let embedder: Arc<dyn Embedder> = if let Some(e) = override_embedder.clone() {
                 e
             } else {
                 Arc::new(context_index::embed::configured_embedder())
             };
             match structural_store::open_db(root.path()) {
                 Ok(mut conn) => {
-                    // Fast path: only incremental when previously ready and small delta (using pre-mutation readiness)
                     let small_delta =
                         outcome.changed_files.len() <= 10 && outcome.deleted_files.len() <= 10;
                     if was_semantic_ready && small_delta && !outcome.changed_files.is_empty() {
@@ -309,23 +219,23 @@ impl ContextService {
                                 tracing::warn!(error=%e, "incremental semantic sync failed");
                             }
                         }
-                    } else {
-                        // Cold or no-change or large delta: do not full backfill, just GC if deleted
-                        if !outcome.deleted_files.is_empty() {
-                            let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
-                        }
                     }
-                    // Ensure GC for deleted files even when skipping embedding
                     if !outcome.deleted_files.is_empty() {
                         let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error=%e, "open_db for fast semantic sync failed");
+                    tracing::warn!(error=%e, "open_db for semantic sync failed");
                 }
             }
+        } else {
+            tracing::debug!("semantic backend unavailable, skipping vector sync");
         }
 
+        let generation = structural_store::open_db(root.path())
+            .ok()
+            .and_then(|c| structural_store::get_generation(&c).ok())
+            .unwrap_or(0);
         let elapsed = t0.elapsed().as_millis();
         let stats = ReconcileStats {
             discovered: idx.stats.discovered,
@@ -336,7 +246,101 @@ impl ContextService {
             vectors_reused,
             embedding_calls,
         };
-        Ok((stats, idx, discovery_ms))
+        let project_arc = Arc::new(idx);
+        self.runtime
+            .publish(project_arc.clone(), generation, fingerprint, Instant::now());
+        self.runtime.tracker.acknowledge(epoch);
+        Ok((stats, project_arc, discovery_ms))
+    }
+
+    async fn reconcile_inner(
+        &self,
+        override_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Result<ReconcileStats, ContextError> {
+        self.reconcile_full_inner(override_embedder).await
+    }
+
+    async fn reconcile_full_inner(
+        &self,
+        override_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Result<ReconcileStats, ContextError> {
+        let _guard = self.runtime.reconcile_lock.lock().await;
+        let (mut stats, project, _) = self
+            .reconcile_and_publish_locked(override_embedder.clone())
+            .await?;
+        let backend_available = if override_embedder.is_some() {
+            true
+        } else {
+            context_index::embed::is_configured_model_available().await
+        };
+        if backend_available {
+            let embedder: Arc<dyn Embedder> = override_embedder
+                .unwrap_or_else(|| Arc::new(context_index::embed::configured_embedder()));
+            let fingerprint = embedder.fingerprint();
+            match structural_store::open_db(&project.root) {
+                Ok(mut conn) => {
+                    match context_index::vector::sync_missing_vectors_for_root(
+                        &mut conn,
+                        &project.root,
+                        embedder.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok((reused, created, calls, _)) => {
+                            stats.vectors_reused += reused;
+                            stats.vectors_created += created;
+                            stats.embedding_calls += calls;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error=%e, "full semantic sync failed, structural still ok");
+                        }
+                    }
+                    let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
+                }
+                Err(e) => tracing::warn!(error=%e, "open_db for semantic sync failed"),
+            }
+        }
+        Ok(stats)
+    }
+
+    async fn reconcile_fast_inner(
+        &self,
+        override_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Result<ReconcileStats, ContextError> {
+        let (stats, _, _) = self.reconcile_and_publish(override_embedder).await?;
+        Ok(stats)
+    }
+
+    async fn access_project(
+        &self,
+        override_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Result<(Arc<ProjectIndex>, u128, ReconcileStats), ContextError> {
+        let _guard = self.runtime.reconcile_lock.lock().await;
+        let snapshot = self.runtime.current_snapshot();
+        if self.runtime.state() == RuntimeState::Clean
+            && !self.runtime.is_verification_expired(Instant::now())
+        {
+            let snapshot = snapshot.ok_or_else(|| {
+                ContextError::Internal("clean runtime has no project snapshot".into())
+            })?;
+            return Ok((
+                snapshot.project,
+                0,
+                ReconcileStats {
+                    discovered: 0,
+                    changed_files: 0,
+                    deleted_files: 0,
+                    elapsed_ms: 0,
+                    vectors_created: 0,
+                    vectors_reused: 0,
+                    embedding_calls: 0,
+                },
+            ));
+        }
+
+        let (stats, project, discovery_ms) =
+            self.reconcile_and_publish_locked(override_embedder).await?;
+        Ok((project, discovery_ms, stats))
     }
 
     /// Cheap reconcile — discovery + incremental structural/BM25 + semantic if available (fast, incremental only).
@@ -371,8 +375,8 @@ impl ContextService {
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
         let t_search = std::time::Instant::now();
-        let (reconcile_stats, project, discovery_ms) = self
-            .reconcile_fast_with_index_inner(None)
+        let (project, discovery_ms, reconcile_stats) = self
+            .access_project(None)
             .await
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
         let providers = Providers {};
@@ -387,9 +391,10 @@ impl ContextService {
         .map_err(|e| ContextError::Internal(e.to_string()))?;
         // Fill stage telemetry at service layer
         let total_ms = t_search.elapsed().as_millis();
-        let generation = structural_store::open_db(&project.root)
-            .ok()
-            .and_then(|c| structural_store::get_generation(&c).ok());
+        let generation = self
+            .runtime
+            .current_snapshot()
+            .map(|snapshot| snapshot.generation);
         res.stats.total_ms = Some(total_ms);
         res.stats.discovery_ms = Some(discovery_ms);
         res.stats.reconcile_ms = Some(reconcile_stats.elapsed_ms);
@@ -863,17 +868,19 @@ mod tests {
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::create_dir_all(root.join(".context")).unwrap();
         fs::write(root.join(".context/index"), b"not a directory").unwrap();
-        let svc = ContextService::new(Some(root.clone())).await.unwrap();
-        let res = svc.search("foo", SearchOptions::default()).await;
+        let res = ContextService::new(Some(root.clone())).await;
         assert!(
             res.is_err(),
-            "search should propagate reconcile failure, got {:?}",
-            res
+            "initialization should propagate reconcile failure"
         );
-        let err = res.unwrap_err().to_string().to_lowercase();
+        let err = res
+            .err()
+            .expect("initialization error")
+            .to_string()
+            .to_lowercase();
         assert!(
-            err.contains("reconcile"),
-            "error should mention reconcile, got: {}",
+            err.contains("structural build"),
+            "error should mention the failed build, got: {}",
             err
         );
     }
@@ -1215,18 +1222,19 @@ mod tests {
         std::fs::create_dir_all(root.join(".context")).unwrap();
         // Make .context/index a file to cause DB open failure
         std::fs::write(root.join(".context/index"), b"not a directory").unwrap();
-        let svc = ContextService::new(Some(root.clone())).await.unwrap();
-        let res = svc
-            .dependency("foo", Direction::Callers, SearchOptions::default())
-            .await;
+        let res = ContextService::new(Some(root.clone())).await;
         assert!(
             res.is_err(),
-            "dependency should return error on DB failure, not panic"
+            "service initialization should return DB failure, not panic"
         );
-        let err = res.unwrap_err().to_string().to_lowercase();
+        let err = res
+            .err()
+            .expect("initialization error")
+            .to_string()
+            .to_lowercase();
         assert!(
-            err.contains("open_db") || err.contains("reconcile") || err.contains("internal"),
-            "error should mention open_db/reconcile, got: {}",
+            err.contains("structural build"),
+            "error should mention the failed build, got: {}",
             err
         );
     }
@@ -1295,6 +1303,23 @@ mod tests {
                 key
             );
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_initial() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+        let (d, r) = svc.runtime.counters();
+        assert_eq!(d, 1, "initialization should perform one discovery");
+        assert_eq!(r, 1, "initialization should perform one reconcile");
+        let res = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert!(!res.evidence.is_empty(), "search should find foo");
+        let (d2, r2) = svc.runtime.counters();
+        assert_eq!(d2, 1, "clean search should not discover again");
+        assert_eq!(r2, 1, "clean search should not reconcile again");
     }
 
     #[tokio::test]
