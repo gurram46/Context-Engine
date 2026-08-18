@@ -133,10 +133,7 @@ pub struct ContextService {
 }
 
 impl ContextService {
-    /// Create service for given root (or auto-resolve via ProjectRoot::resolve).
-    /// Starts the mark-only watcher and completes one full discovery/reconcile
-    /// before returning so that the runtime snapshot is immediately usable.
-    pub async fn new(root: Option<PathBuf>) -> Result<Self, ContextError> {
+    fn build(root: Option<PathBuf>) -> Result<Self, ContextError> {
         let root_path = if let Some(p) = root.clone() {
             p.canonicalize().unwrap_or(p)
         } else {
@@ -147,13 +144,24 @@ impl ContextService {
         let runtime = Arc::new(RepositoryRuntime::new(root_path.clone()).map_err(|e| {
             ContextError::Internal(format!("failed to start repository runtime: {e}"))
         })?);
-        let service = Self {
+        Ok(Self {
             root: root_path,
             explicit_root: root,
             runtime,
-        };
+        })
+    }
+
+    /// Create service for given root (or auto-resolve via ProjectRoot::resolve).
+    /// Starts the mark-only watcher and completes one full discovery/reconcile
+    /// before returning so that the runtime snapshot is immediately usable.
+    pub async fn new(root: Option<PathBuf>) -> Result<Self, ContextError> {
+        let service = Self::build(root)?;
         service.initialize().await?;
         Ok(service)
+    }
+
+    pub(crate) fn new_for_index(root: Option<PathBuf>) -> Result<Self, ContextError> {
+        Self::build(root)
     }
 
     async fn initialize(&self) -> Result<(), ContextError> {
@@ -262,6 +270,10 @@ impl ContextService {
         if !outcome.deleted_files.is_empty() {
             if let Ok(conn) = structural_store::open_db(root.path()) {
                 let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
+                let prev = self.runtime.semantic_fingerprint();
+                if prev != fingerprint {
+                    let _ = context_index::vector::gc_orphaned_vectors(&conn, &prev);
+                }
             }
         }
 
@@ -2232,6 +2244,59 @@ mod tests {
         assert!(
             !svc.runtime.is_verification_expired(Instant::now()),
             "full discovery must clear the expired deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_constructor_starts_uninitialized() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new_for_index(Some(root.clone())).unwrap();
+        assert_eq!(
+            svc.runtime.counters(),
+            (0, 0),
+            "index constructor must not perform discovery/reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_nonsemantic_reconcile_single_pass() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new_for_index(Some(root.clone())).unwrap();
+        assert_eq!(svc.runtime.counters(), (0, 0));
+        let stats = svc.reconcile().await.unwrap();
+        assert!(stats.discovered > 0);
+        assert_eq!(
+            svc.runtime.counters(),
+            (1, 1),
+            "nonsemantic index must perform exactly one discovery and one reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_semantic_single_pass_with_fake_embedder() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        fs::write(root.join("b.py"), b"def bar():\n    pass\n").unwrap();
+        let svc = ContextService::new_for_index(Some(root.clone())).unwrap();
+        assert_eq!(svc.runtime.counters(), (0, 0));
+        let fake = std::sync::Arc::new(context_index::embed::FakeEmbedder::new("idx-sem-test", 8));
+        let stats = svc
+            .full_semantic_index_with_embedder(fake.clone())
+            .await
+            .unwrap();
+        assert!(stats.vectors_created > 0);
+        assert_eq!(
+            svc.runtime.counters(),
+            (1, 1),
+            "semantic index with FakeEmbedder must perform exactly one discovery and one reconcile"
         );
     }
 }

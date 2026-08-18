@@ -303,7 +303,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
         Some(Command::Index { semantic }) => {
-            let svc = ContextService::new(root).await?;
+            let svc = ContextService::new_for_index(root)?;
             let stats = if semantic {
                 svc.full_semantic_index().await?
             } else {
