@@ -1,6 +1,6 @@
 use anyhow::Result;
 use notify::{
-    event::{CreateKind, RemoveKind},
+    event::{CreateKind, ModifyKind, RemoveKind},
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -71,7 +71,6 @@ const BOUNDED_CAP: usize = 512;
 const IGNORED_DIRS: &[&str] = &[
     ".git/",
     ".context/",
-    ".opencode/",
     "target/",
     "node_modules/",
     "dist/",
@@ -83,8 +82,18 @@ const IGNORED_DIRS: &[&str] = &[
     "coverage/",
 ];
 
+fn is_opencode_index_ignored(lower: &str) -> bool {
+    lower == ".opencode/index"
+        || lower.starts_with(".opencode/index/")
+        || lower.contains("/.opencode/index/")
+        || lower.ends_with("/.opencode/index")
+}
+
 fn is_ignored(rel: &str) -> bool {
     let lower = rel.to_lowercase().replace('\\', "/");
+    if is_opencode_index_ignored(&lower) {
+        return true;
+    }
     for pat in IGNORED_DIRS {
         if lower.starts_with(pat)
             || lower.contains(&format!("/{}", pat))
@@ -528,7 +537,11 @@ impl DirtyTracker {
 fn event_kind_implies_unknown(kind: &EventKind) -> bool {
     matches!(
         kind,
-        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
+        EventKind::Create(CreateKind::Folder)
+            | EventKind::Remove(RemoveKind::Folder)
+            | EventKind::Modify(ModifyKind::Name(_))
+            | EventKind::Remove(RemoveKind::Any)
+            | EventKind::Remove(RemoveKind::Other)
     )
 }
 
@@ -1020,6 +1033,118 @@ mod tests {
             EventAction::MarkUnknown,
             "escape via '..' must classify as Unknown"
         );
+    }
+
+    #[test]
+    fn classify_opencode_settings_is_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let file = root.join(".opencode/settings.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"{}").unwrap();
+        let event =
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(file);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::MarkPaths(vec![".opencode/settings.json".to_string()]),
+            ".opencode/settings.json must not be ignored"
+        );
+        assert!(!is_ignored(".opencode/settings.json"));
+    }
+
+    #[test]
+    fn classify_opencode_index_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let file = root.join(".opencode/index/structural.db");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"").unwrap();
+        let event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(file.clone());
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::Noop,
+            ".opencode/index and descendants must be ignored"
+        );
+        assert!(is_ignored(".opencode/index/structural.db"));
+        assert!(is_ignored(".opencode/index"));
+        // sibling file under .opencode/index subdir
+        let file2 = root.join(".opencode/index/a/b.rs");
+        let event2 = Event::new(EventKind::Create(CreateKind::File)).add_path(file2);
+        assert_eq!(classify_event(root, &event2), EventAction::Noop);
+    }
+
+    #[test]
+    fn classify_vanished_generic_rename_is_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let vanished = root.join("src/renamed.rs");
+        // do not create file — vanished
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Any,
+        )))
+        .add_path(vanished);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::MarkUnknown,
+            "generic ModifyKind::Name for vanished path must be MarkUnknown"
+        );
+        // also Both variant
+        let vanished2 = root.join("src/other.rs");
+        let event2 = Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(vanished2);
+        assert_eq!(classify_event(root, &event2), EventAction::MarkUnknown);
+        // ignored path with rename must stay Noop
+        let ignored = root.join(".opencode/index/foo.db");
+        let event3 = Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Any,
+        )))
+        .add_path(ignored);
+        assert_eq!(
+            classify_event(root, &event3),
+            EventAction::Noop,
+            "ignored paths must remain Noop even for rename"
+        );
+    }
+
+    #[test]
+    fn classify_vanished_generic_remove_is_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let vanished = root.join("src/gone.rs");
+        let event = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(vanished);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::MarkUnknown,
+            "generic Remove(Any) for vanished path must be MarkUnknown"
+        );
+        let vanished2 = root.join("src/gone2.rs");
+        let event2 = Event::new(EventKind::Remove(RemoveKind::Other)).add_path(vanished2);
+        assert_eq!(classify_event(root, &event2), EventAction::MarkUnknown);
+        // ignored generic remove stays Noop
+        let ignored = root.join(".context/index/db");
+        let event3 = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(ignored);
+        assert_eq!(classify_event(root, &event3), EventAction::Noop);
+    }
+
+    #[test]
+    fn classify_exact_file_remove_is_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let vanished = root.join("src/deleted.rs");
+        // exact file remove for vanished path remains path-local
+        let event = Event::new(EventKind::Remove(RemoveKind::File)).add_path(vanished);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::MarkPaths(vec!["src/deleted.rs".to_string()]),
+            "exact Remove(File) must remain path-local even when vanished"
+        );
+        // exact folder remove remains unknown (coverage)
+        let vanished_dir = root.join("src/subdir");
+        let event2 = Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(vanished_dir);
+        assert_eq!(classify_event(root, &event2), EventAction::MarkUnknown);
     }
 
     #[test]
