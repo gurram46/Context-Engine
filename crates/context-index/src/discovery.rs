@@ -100,24 +100,7 @@ impl ProjectIndex {
         let mut files = Vec::new();
         let mut stats = ScanStats::default();
 
-        // Use `ignore` WalkBuilder which respects .gitignore, .ignore, and hidden.
-        // Add overrides for ENGINE_INTERNAL_EXCLUDES and .opencodeignore.
-        let mut builder = WalkBuilder::new(root_path);
-        builder
-            .hidden(false) // don't hide . files by default; let gitignore handle
-            .git_ignore(true)
-            .git_global(false)
-            .git_exclude(false)
-            .parents(true)
-            .ignore(true) // .ignore
-            .require_git(true) // only if git repo
-            .follow_links(false);
-
-        // Add custom ignore for .opencodeignore if present
-        let opencode_ignore = root_path.join(".opencodeignore");
-        if opencode_ignore.exists() {
-            builder.add_ignore(opencode_ignore);
-        }
+        let builder = build_walk(root_path);
 
         // Walk
         for entry in builder.build() {
@@ -189,6 +172,9 @@ impl ProjectIndex {
         let mut files = self.files.clone();
         let mut changed = Vec::new();
         let mut deleted = Vec::new();
+        // Reuse WalkBuilder config via IncrementalIgnore without a recursive walk.
+        let builder = build_walk(&self.root);
+        let mut matcher = builder.build_matchers().into_iter().next().unwrap();
 
         for rel in paths {
             let norm = normalize_rel_path(rel)?;
@@ -196,6 +182,21 @@ impl ProjectIndex {
                 .iter()
                 .position(|f| f.relative_path == norm)
                 .map(|pos| files.remove(pos));
+            // Symlink check before any metadata/ignore stat to prevent reads outside root.
+            if is_symlink_tainted(&self.root, &norm) {
+                if old.is_some() {
+                    deleted.push(norm.clone());
+                }
+                continue;
+            }
+            // Mirror WalkBuilder filtering: hidden, gitignore, ignore, opencodeignore etc.
+            // `matched` checks hierarchical ignore files; treat Ignore as absent.
+            if matcher.matched(&norm, false).is_ignore() {
+                if old.is_some() {
+                    deleted.push(norm.clone());
+                }
+                continue;
+            }
             let mut scratch = ScanStats::default();
             if let Some(new) = make_record(&self.root, &norm, true, &mut scratch) {
                 let is_changed = match &old {
@@ -263,6 +264,45 @@ fn normalize_rel_path(rel: &str) -> Result<String, ContextError> {
     Ok(norm)
 }
 
+fn build_walk(root_path: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root_path);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(true)
+        .ignore(true)
+        .require_git(true)
+        .follow_links(false);
+    let opencode_ignore = root_path.join(".opencodeignore");
+    if opencode_ignore.exists() {
+        builder.add_ignore(opencode_ignore);
+    }
+    builder
+}
+
+fn is_symlink_tainted(root: &Path, rel: &str) -> bool {
+    // Reject if the candidate itself or any component below root is a symlink.
+    // Prevents incremental reads outside root and aligns full/incremental.
+    let mut prefix = PathBuf::new();
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(os) => {
+                prefix.push(os);
+                let abs = root.join(&prefix);
+                if let Ok(md) = std::fs::symlink_metadata(&abs) {
+                    if md.file_type().is_symlink() {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Build a single `FileRecord` from a relative posix path.
 /// Updates `stats` to reflect the record, mirroring the logic in full discovery.
 fn make_record(
@@ -271,6 +311,10 @@ fn make_record(
     do_hash: bool,
     stats: &mut ScanStats,
 ) -> Option<FileRecord> {
+    // Before metadata/hashing, reject symlink or symlink component
+    if is_symlink_tainted(root_path, rel) {
+        return None;
+    }
     let path = root_path.join(rel);
 
     // Engine-internal check
@@ -714,5 +758,211 @@ mod tests {
         let delta = idx.refresh_paths(&paths).unwrap();
         assert_eq!(delta.project.stats.hash_errors, idx.stats.hash_errors);
         assert_eq!(delta.project.stats.hash_errors, 0);
+    }
+
+    #[test]
+    fn refresh_paths_ignores_gitignore_new_file() {
+        let tmp = TempDir::new().unwrap();
+        // require_git(true) needs a .git dir for .gitignore to be respected
+        fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join(".gitignore"), b"ignored_git.py\n").unwrap();
+        fs::write(tmp.path().join("a.py"), b"hello").unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        assert!(idx.files.iter().any(|f| f.relative_path == "a.py"));
+        assert!(!idx
+            .files
+            .iter()
+            .any(|f| f.relative_path == "ignored_git.py"));
+        // Create a file that matches .gitignore and try incremental refresh
+        fs::write(tmp.path().join("ignored_git.py"), b"should be ignored").unwrap();
+        let paths: BTreeSet<String> = ["ignored_git.py".to_string()].into_iter().collect();
+        let delta = idx.refresh_paths(&paths).unwrap();
+        assert!(
+            !delta
+                .project
+                .files
+                .iter()
+                .any(|f| f.relative_path == "ignored_git.py"),
+            "refresh must not index .gitignore'd file"
+        );
+        assert!(delta.changed_files.is_empty());
+        assert!(delta.deleted_files.is_empty());
+        // Parity with full discover
+        let full = ProjectIndex::discover(&root).unwrap();
+        assert!(!full
+            .files
+            .iter()
+            .any(|f| f.relative_path == "ignored_git.py"));
+    }
+
+    #[test]
+    fn refresh_paths_ignores_ignore_new_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".ignore"), b"ignored_tool.py\n").unwrap();
+        fs::write(tmp.path().join("a.py"), b"hello").unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        assert!(!idx
+            .files
+            .iter()
+            .any(|f| f.relative_path == "ignored_tool.py"));
+        fs::write(tmp.path().join("ignored_tool.py"), b"should be ignored").unwrap();
+        let paths: BTreeSet<String> = ["ignored_tool.py".to_string()].into_iter().collect();
+        let delta = idx.refresh_paths(&paths).unwrap();
+        assert!(!delta
+            .project
+            .files
+            .iter()
+            .any(|f| f.relative_path == "ignored_tool.py"));
+        assert!(delta.changed_files.is_empty());
+        let full = ProjectIndex::discover(&root).unwrap();
+        assert!(!full
+            .files
+            .iter()
+            .any(|f| f.relative_path == "ignored_tool.py"));
+    }
+
+    #[test]
+    fn refresh_paths_ignores_opencodeignore_new_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".opencodeignore"), b"ignored_open.py\n").unwrap();
+        fs::write(tmp.path().join("a.py"), b"hello").unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        assert!(!idx
+            .files
+            .iter()
+            .any(|f| f.relative_path == "ignored_open.py"));
+        fs::write(tmp.path().join("ignored_open.py"), b"should be ignored").unwrap();
+        let paths: BTreeSet<String> = ["ignored_open.py".to_string()].into_iter().collect();
+        let delta = idx.refresh_paths(&paths).unwrap();
+        assert!(!delta
+            .project
+            .files
+            .iter()
+            .any(|f| f.relative_path == "ignored_open.py"));
+        assert!(delta.changed_files.is_empty());
+        let full = ProjectIndex::discover(&root).unwrap();
+        assert!(!full
+            .files
+            .iter()
+            .any(|f| f.relative_path == "ignored_open.py"));
+    }
+
+    #[test]
+    fn refresh_paths_removes_now_ignored_file() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join("keep.py"), b"hello").unwrap();
+        fs::write(tmp.path().join("to_ignore.py"), b"hello").unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+        assert!(idx.files.iter().any(|f| f.relative_path == "to_ignore.py"));
+        // Now add ignore rule that matches the previously-indexed file
+        fs::write(tmp.path().join(".gitignore"), b"to_ignore.py\n").unwrap();
+        // File still exists on disk; refresh should evict it
+        let paths: BTreeSet<String> = ["to_ignore.py".to_string()].into_iter().collect();
+        let delta = idx.refresh_paths(&paths).unwrap();
+        assert!(!delta
+            .project
+            .files
+            .iter()
+            .any(|f| f.relative_path == "to_ignore.py"));
+        assert_eq!(delta.deleted_files, vec!["to_ignore.py"]);
+        assert!(delta.changed_files.is_empty());
+        let full = ProjectIndex::discover(&root).unwrap();
+        assert!(!full.files.iter().any(|f| f.relative_path == "to_ignore.py"));
+    }
+
+    #[test]
+    fn refresh_paths_rejects_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let root = ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        fs::write(tmp.path().join("a.py"), b"hello").unwrap();
+        let idx = ProjectIndex::discover(&root).unwrap();
+
+        // Create a target outside the project root
+        let outside_dir = TempDir::new().unwrap();
+        let outside_file = outside_dir.path().join("secret.txt");
+        fs::write(&outside_file, b"secret").unwrap();
+
+        let link_path = tmp.path().join("link.py");
+        let res = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&outside_file, &link_path)
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_file(&outside_file, &link_path)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "unsupported",
+                ))
+            }
+        };
+        if res.is_err() {
+            // Windows without privilege: early return per spec
+            return;
+        }
+
+        let paths: BTreeSet<String> = ["link.py".to_string()].into_iter().collect();
+        let delta = idx.refresh_paths(&paths).unwrap();
+        assert!(
+            !delta
+                .project
+                .files
+                .iter()
+                .any(|f| f.relative_path == "link.py"),
+            "symlink must not be indexed via refresh"
+        );
+        assert!(delta.changed_files.is_empty());
+        // Full discovery must also not index the symlink
+        let full = ProjectIndex::discover(&root).unwrap();
+        assert!(!full.files.iter().any(|f| f.relative_path == "link.py"));
+        // Also test symlink component: dir symlink
+        #[cfg(unix)]
+        {
+            let outside_sub = outside_dir.path().join("sub");
+            fs::create_dir_all(&outside_sub).unwrap();
+            fs::write(outside_sub.join("evil.py"), b"evil").unwrap();
+            let link_dir = tmp.path().join("linkdir");
+            let res2 = std::os::unix::fs::symlink(&outside_sub, &link_dir);
+            if res2.is_ok() {
+                let paths2: BTreeSet<String> =
+                    ["linkdir/evil.py".to_string()].into_iter().collect();
+                let delta2 = idx.refresh_paths(&paths2).unwrap();
+                assert!(
+                    !delta2
+                        .project
+                        .files
+                        .iter()
+                        .any(|f| f.relative_path == "linkdir/evil.py"),
+                    "path through symlinked dir must not be indexed"
+                );
+            }
+        }
+        #[cfg(windows)]
+        {
+            let outside_sub = outside_dir.path().join("sub");
+            let _ = fs::create_dir_all(&outside_sub);
+            let _ = fs::write(outside_sub.join("evil.py"), b"evil");
+            let link_dir = tmp.path().join("linkdir");
+            let res2 = std::os::windows::fs::symlink_dir(&outside_sub, &link_dir);
+            if res2.is_ok() {
+                let paths2: BTreeSet<String> =
+                    ["linkdir/evil.py".to_string()].into_iter().collect();
+                let delta2 = idx.refresh_paths(&paths2).unwrap();
+                assert!(!delta2
+                    .project
+                    .files
+                    .iter()
+                    .any(|f| f.relative_path == "linkdir/evil.py"));
+            }
+        }
     }
 }
