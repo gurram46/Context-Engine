@@ -329,7 +329,6 @@ impl ContextService {
         if backend_available {
             let embedder: Arc<dyn Embedder> = override_embedder
                 .unwrap_or_else(|| Arc::new(context_index::embed::configured_embedder()));
-            let fingerprint = embedder.fingerprint();
             match structural_store::open_db(&full.project.root) {
                 Ok(mut conn) => {
                     match context_index::vector::sync_missing_vectors_for_root(
@@ -348,10 +347,14 @@ impl ContextService {
                             tracing::warn!(error=%e, "full semantic sync failed, structural still ok");
                         }
                     }
-                    let _ = context_index::vector::gc_orphaned_vectors(&conn, &fingerprint);
                 }
                 Err(e) => tracing::warn!(error=%e, "open_db for semantic sync failed"),
             }
+        }
+        // Orphan GC is a local SQLite DELETE and must not be gated on the
+        // embedding backend (NF2). Use the full discovery fingerprint.
+        if let Ok(conn) = structural_store::open_db(&full.project.root) {
+            let _ = context_index::vector::gc_orphaned_vectors(&conn, &full.fingerprint);
         }
         // Publish the clean replacement snapshot only after the full semantic
         // backfill has completed (F6).
@@ -388,8 +391,9 @@ impl ContextService {
         // cannot split them (F1/F2).
         let access = self.runtime.dirty_access();
         let has_snapshot = self.runtime.current_snapshot().is_some();
+        let expired = self.runtime.is_verification_expired(now);
 
-        if access.state == RuntimeState::Clean && !self.runtime.is_verification_expired(now) {
+        if access.state == RuntimeState::Clean && !expired {
             let snapshot = self.runtime.current_snapshot().ok_or_else(|| {
                 ContextError::Internal("clean runtime has no project snapshot".into())
             })?;
@@ -406,34 +410,41 @@ impl ContextService {
             });
         }
 
-        if let Some(paths) = access.paths {
-            if has_snapshot {
-                let dirty_count = paths.len();
-                #[cfg(test)]
-                self.runtime.run_pre_reconcile_hook();
-                let (stats, project) = self
-                    .reconcile_dirty_paths_locked(override_embedder, &paths, access.epoch)
-                    .await?;
-                let generation = self
-                    .runtime
-                    .current_snapshot()
-                    .map(|s| s.generation)
-                    .unwrap_or(0);
-                return Ok(RuntimeAccess {
-                    project,
-                    generation,
-                    reconcile_skipped: false,
-                    discovery_calls: 0,
-                    reconcile_calls: 1,
-                    runtime_state: "dirty",
-                    dirty_file_count: Some(dirty_count),
-                    discovery_ms: 0,
-                    reconcile_ms: stats.elapsed_ms,
-                });
+        // Expired verification dominates DirtyState::Paths (NF1): every
+        // expired request performs exactly one full discovery/reconcile with
+        // runtime_state unknown, discovery_calls 1, reconcile_calls 1,
+        // dirty_file_count None.
+        if !expired {
+            if let Some(paths) = access.paths {
+                if has_snapshot {
+                    let dirty_count = paths.len();
+                    #[cfg(test)]
+                    self.runtime.run_pre_reconcile_hook();
+                    let (stats, project) = self
+                        .reconcile_dirty_paths_locked(override_embedder, &paths, access.epoch)
+                        .await?;
+                    let generation = self
+                        .runtime
+                        .current_snapshot()
+                        .map(|s| s.generation)
+                        .unwrap_or(0);
+                    return Ok(RuntimeAccess {
+                        project,
+                        generation,
+                        reconcile_skipped: false,
+                        discovery_calls: 0,
+                        reconcile_calls: 1,
+                        runtime_state: "dirty",
+                        dirty_file_count: Some(dirty_count),
+                        discovery_ms: 0,
+                        reconcile_ms: stats.elapsed_ms,
+                    });
+                }
             }
         }
 
-        // Unknown, expired, or dirty-without-snapshot: one full discovery/reconcile.
+        // Unknown, expired (including Dirty+expired), or dirty-without-snapshot:
+        // one full discovery/reconcile.
         let (stats, project, discovery_ms) =
             self.reconcile_and_publish_locked(override_embedder).await?;
         let generation = self
@@ -2088,14 +2099,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn path_local_reconcile_preserves_verification_deadline() {
+    async fn dirty_path_local_preserves_verification_deadline() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
         let svc = ContextService::new(Some(root.clone())).await.unwrap();
 
-        // Force the full-verification deadline into the past.
+        // Non-expired deadline: 10s remaining.
+        let base = Instant::now() - crate::runtime::FULL_VERIFY_INTERVAL
+            + std::time::Duration::from_secs(10);
+        svc.runtime.set_last_full_verified(base);
+        let now = Instant::now();
+        assert!(
+            !svc.runtime.is_verification_expired(now),
+            "deadline should not be expired yet"
+        );
+
+        fs::write(root.join("a.py"), b"def foo():\n    return 2\n").unwrap();
+        svc.runtime.tracker.mark_paths(["a.py".to_string()]);
+
+        let res = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(res.stats.discovery_calls, Some(0));
+        assert_eq!(res.stats.reconcile_calls, Some(1));
+        assert_eq!(res.stats.runtime_state.as_deref(), Some("dirty"));
+        assert_eq!(res.stats.dirty_file_count, Some(1));
+
+        // Path-local publish must not refresh the full-verification deadline.
+        // Synthetic instant just beyond the original deadline distinguishes
+        // preservation (expired) from a reset to now (not expired).
+        let synthetic =
+            base + crate::runtime::FULL_VERIFY_INTERVAL + std::time::Duration::from_secs(1);
+        assert!(
+            svc.runtime.is_verification_expired(synthetic),
+            "path-local publish must not reset the full-verification deadline"
+        );
+        assert!(
+            !svc.runtime.is_verification_expired(now),
+            "still not expired at the original now"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_expired_triggers_full_reconcile() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("a.py"), b"def foo():\n    pass\n").unwrap();
+        let svc = ContextService::new(Some(root.clone())).await.unwrap();
+
         let now = Instant::now();
         svc.runtime.set_last_full_verified(
             now - crate::runtime::FULL_VERIFY_INTERVAL - std::time::Duration::from_secs(1),
@@ -2106,13 +2158,21 @@ mod tests {
         svc.runtime.tracker.mark_paths(["a.py".to_string()]);
 
         let res = svc.search("foo", SearchOptions::default()).await.unwrap();
+        assert_eq!(
+            res.stats.discovery_calls,
+            Some(1),
+            "dirty+expired must perform exactly one full discovery"
+        );
         assert_eq!(res.stats.reconcile_calls, Some(1));
-        assert_eq!(res.stats.runtime_state.as_deref(), Some("dirty"));
+        assert_eq!(res.stats.runtime_state.as_deref(), Some("unknown"));
+        assert_eq!(
+            res.stats.dirty_file_count, None,
+            "expired fallback must report null dirty_file_count"
+        );
 
-        // Path-local publish must not refresh the full-verification deadline (F4).
         assert!(
-            svc.runtime.is_verification_expired(now),
-            "path-local publish must not reset the full-verification deadline"
+            !svc.runtime.is_verification_expired(Instant::now()),
+            "full discovery must clear the expired deadline"
         );
     }
 }
