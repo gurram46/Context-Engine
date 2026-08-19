@@ -151,18 +151,29 @@ def main():
     registry=[]
     for name, Cls in [("context_engine_hot", ContextEngineHotAdapter), ("rg_baseline", RgBaselineAdapter), ("codebase_memory", CodebaseMemoryAdapter), ("serena", SerenaAdapter), ("oci", OciAdapter)]:
         if Cls is None:
-            latency_placeholder=None
+            registry.append((name, None))
+            continue
+        # check binary/executable availability for external adapters before probe
+        blocked_reason=None
+        if name=="serena" and shutil.which("serena-agent") is None:
+            blocked_reason="serena-agent not in PATH"
+        elif name=="oci" and shutil.which("node") is None:
+            blocked_reason="node not in PATH"
+        elif name=="codebase_memory":
+            try:
+                from adapters.codebase_memory import BIN as _cbm_bin
+                if not _cbm_bin.exists():
+                    blocked_reason=f"cbm binary not found {_cbm_bin}"
+            except: blocked_reason="cbm import failed"
+        if blocked_reason:
+            registry.append((name, None))
             continue
         try:
-            # quick availability check: try to instantiate, but for serena check binary exists
             inst=Cls()
-            # for external adapters, ensure binary/server available else mark BLOCKED
-            # we keep instance for later; close after check
             try: inst.close()
             except: pass
             registry.append((name, Cls))
         except Exception as e:
-            # mark as blocked
             registry.append((name, None))
     # fallback to at least CE+rg if registry empty
     if not registry:

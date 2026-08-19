@@ -109,13 +109,12 @@ class CodebaseMemoryAdapter(BenchmarkAdapter):
                     except: score=None
                     hits.append(SearchHit(file=f, score=score, line=l, text=line[:400], provenance="cbm:search_graph"))
                     if len(hits)>=top_n: break
-            # generic fallback: extract file-like paths from tool output
+            # generic fallback: extract file-like paths and verify under repo
             if not hits:
                 seen=set()
                 cands=[]
                 for cand in re.findall(r"[\w./-]+\.\w+", txt):
                     norm=cand.replace("\\","/")
-                    # keep only plausible files (has extension, not too long)
                     if len(norm)>120: continue
                     if norm not in seen:
                         seen.add(norm)
@@ -123,7 +122,27 @@ class CodebaseMemoryAdapter(BenchmarkAdapter):
                 cands=sorted(set(cands))
                 for cand in cands:
                     if len(hits)>=top_n: break
-                    hits.append(SearchHit(file=cand, score=None, text=txt[:400], provenance="cbm:fallback"))
+                    # verify candidate maps to existing repo-relative file
+                    try:
+                        # normalize to repo-relative POSIX
+                        cand_norm=cand.replace("\\","/").lstrip("./")
+                        # check if file exists under repo_path
+                        if (repo_path / cand_norm).is_file():
+                            rel=cand_norm
+                        else:
+                            # try basename search
+                            base=Path(cand_norm).name
+                            found=None
+                            for p in repo_path.rglob(base):
+                                if p.is_file() and p.name.lower()==base.lower():
+                                    rel=p.relative_to(repo_path).as_posix()
+                                    found=rel
+                                    break
+                            if found is None:
+                                continue
+                            rel=found
+                    except: continue
+                    hits.append(SearchHit(file=rel, score=None, text=txt[:400], provenance="cbm:fallback"))
             common=_tok(" ".join(h.text or "" for h in hits)) if hits else 0
             return SearchResult(query=query, hits=hits[:top_n], candidate_count=len(hits), evidence_count=len(hits), files_returned=len(set(h.file for h in hits)), candidate_tokens=None, packed_tokens=common, retrievers_used=[f"cbm:search_graph:{len(hits)}"], elapsed_ms=wall, wall_ms=wall, internal_ms=wall, raw={"text":txt[:2000]})
         except Exception as e:
