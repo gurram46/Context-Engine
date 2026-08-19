@@ -41,14 +41,32 @@ try:
     from adapters.context_engine_hot import ContextEngineHotAdapter  # noqa: E402
 except Exception as _e:
     ContextEngineHotAdapter = None  # type: ignore
+try:
+    from adapters.oci import OciAdapter  # noqa: E402
+except Exception as _e:
+    OciAdapter = None  # type: ignore
+try:
+    from adapters.codebase_memory import CodebaseMemoryAdapter  # noqa: E402
+except Exception as _e:
+    CodebaseMemoryAdapter = None  # type: ignore
+try:
+    from adapters.serena import SerenaAdapter  # noqa: E402
+except Exception as _e:
+    SerenaAdapter = None  # type: ignore
 
 ADAPTERS = {
     "context_engine": ContextEngineAdapter,
     "rg_baseline": RgBaselineAdapter,
-    # future: oci, codebase_memory, serena (not mandatory in C0)
+    # oci, codebase_memory, serena now enabled for C0 closure
 }
 if ContextEngineHotAdapter is not None:
     ADAPTERS["context_engine_hot"] = ContextEngineHotAdapter
+if OciAdapter is not None:
+    ADAPTERS["oci"] = OciAdapter
+if CodebaseMemoryAdapter is not None:
+    ADAPTERS["codebase_memory"] = CodebaseMemoryAdapter
+if SerenaAdapter is not None:
+    ADAPTERS["serena"] = SerenaAdapter
 
 
 def _timing_record(cold_res, warm_res, one_res, neutral_query="Model", had_index_before=True, adapter="context_engine", repo="test", profile="official"):
