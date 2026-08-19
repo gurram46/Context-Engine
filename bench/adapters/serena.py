@@ -92,11 +92,10 @@ class _SerenaClient:
         self._send(obj)
 
     def _initialize(self):
+        time.sleep(4)
         self._req("initialize", {"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"bench-serena","version":"0.1"}}, timeout=15)
         self._notify("notifications/initialized", {})
-        time.sleep(1)
-        # ensure project activated (auto via --project)
-        time.sleep(2)
+        time.sleep(35)
 
     def call(self, name, args, timeout=90):
         r=self._req("tools/call", {"name":name,"arguments":args}, timeout=timeout)
@@ -142,64 +141,47 @@ class SerenaAdapter(BenchmarkAdapter):
         t0=time.perf_counter()
         term=_extract_term(query)
         is_caller = "calls" in query.lower() or "caller" in query.lower()
-        # For caller, use find_referencing_symbols on the target symbol
         if is_caller:
             try:
                 c=self._client(repo_path)
-                # Find the target symbol via find_symbol, then get its references
-                text,_=c.call("find_symbol", {"name_path":term,"depth":0,"include_body":False}, timeout=60)
+                text,_=c.call("find_symbol", {"name_path_pattern":term,"depth":0,"include_body":False}, timeout=60)
                 try:
                     data=json.loads(text)
                 except:
                     data=[]
-                # pick candidates that are likely definitions in the relevant language (for django, list.py/detail.py etc)
-                # For generic, take the first 2 that have term in name_path and are Method/Class
                 cands=[]
                 if isinstance(data, list):
-                    # Prefer non-test, non-admin for django, and nest-factory for nestjs, main.rs for ripgrep
-                    # This is deterministic generic filtering, not expected-file tuning
                     filtered=[]
                     for entry in data:
                         rel=entry.get("relative_path","").replace("\\","/")
-                        if "tests/" in rel or "test/" in rel:
+                        low=rel.lower()
+                        if "/test/" in low or low.startswith("test/") or "/tests/" in low or low.startswith("tests/") or "/__tests__/" in low or "/testing/" in low:
                             continue
-                        if repo_path.name=="django" and "contrib/admin" in rel:
+                        fname=Path(rel).name.lower()
+                        if fname.startswith("test_") or fname.startswith("test."):
                             continue
-                        if term.lower() in entry.get("name_path","").lower():
-                            filtered.append(entry)
-                    # If filtered empty, fallback to original
+                        if term.lower() not in entry.get("name_path","").lower():
+                            continue
+                        filtered.append(entry)
                     source=filtered if filtered else [e for e in data if term.lower() in e.get("name_path","").lower()]
-                    # For get_queryset in django, prefer MultipleObjectMixin and SingleObjectMixin
-                    if term=="get_queryset" and repo_path.name=="django":
-                        # prioritize those two
-                        pref=[e for e in source if e.get("name_path") in ("MultipleObjectMixin/get_queryset","SingleObjectMixin/get_queryset")]
-                        if pref:
-                            cands=pref[:2]
+                    def _leaf(e):
+                        np=e.get("name_path","")
+                        leaf=np.split("/")[-1]
+                        leaf=leaf.split("[")[0].split(":")[0]
+                        return leaf
+                    exact=[]
+                    others=[]
+                    for e in source:
+                        leaf=_leaf(e)
+                        if leaf.lower()==term.lower():
+                            exact.append(e)
                         else:
-                            cands=source[:3]
-                    elif term=="create" and repo_path.name=="nestjs":
-                        # prefer NestFactoryStatic/create
-                        pref=[e for e in source if "NestFactory" in e.get("name_path","") and "create" in e.get("name_path","").lower()]
-                        if pref:
-                            cands=pref[:1]
-                        else:
-                            # fallback to NestFactory class
-                            for e in data:
-                                if e.get("name_path")=="NestFactory":
-                                    cands=[e]
-                                    break
-                            if not cands:
-                                cands=source[:1]
-                    elif term=="search" and repo_path.name=="ripgrep":
-                        pref=[e for e in source if e.get("relative_path","").replace("\\","/")=="crates/core/main.rs" and e.get("name_path")=="search[1]"]
-                        if pref:
-                            cands=pref[:1]
-                        else:
-                            cands=source[:1]
-                    else:
-                        cands=source[:3]
+                            others.append(e)
+                    exact_sorted=sorted(exact, key=lambda x: (x.get("name_path",""), x.get("relative_path","")))
+                    others_sorted=sorted(others, key=lambda x: (x.get("name_path",""), x.get("relative_path","")))
+                    cands=(exact_sorted+others_sorted)[:3]
                     if not cands and data:
-                        cands=data[:2]
+                        cands=sorted(data, key=lambda x: (x.get("name_path",""), x.get("relative_path","")))[:2]
                 hits=[]
                 seen_files=set()
                 for cand in cands:
@@ -209,19 +191,15 @@ class SerenaAdapter(BenchmarkAdapter):
                         if not name_path or not rel:
                             continue
                         txt,_=c.call("find_referencing_symbols", {"name_path":name_path,"relative_path":rel}, timeout=60)
-                        # txt is json mapping file -> {kind: [{name_path, body_location, content_around_reference}]}
                         try:
                             ref_data=json.loads(txt)
                             if isinstance(ref_data, dict):
                                 for f, kind_map in ref_data.items():
                                     f_norm=f.replace("\\","/")
-                                    # f is like "django\\views\\generic\\list.py" -> normalize
                                     if f_norm not in seen_files:
                                         seen_files.add(f_norm)
-                                        # try to get line from first reference
                                         line=None
                                         try:
-                                            # kind_map is dict like {"Variable": [{...}]}
                                             for kind, lst in kind_map.items():
                                                 if lst and isinstance(lst[0], dict):
                                                     line=lst[0].get("body_location",{}).get("start_line")
@@ -231,7 +209,6 @@ class SerenaAdapter(BenchmarkAdapter):
                                         if len(hits)>=top_n:
                                             break
                         except:
-                            # txt may be plain text with file:line
                             for line in txt.splitlines():
                                 m=re.search(r"(\S+\.\w+):(\d+):", line)
                                 if m:
@@ -243,63 +220,41 @@ class SerenaAdapter(BenchmarkAdapter):
                             break
                     except:
                         continue
-                # if we got hits via referencing, use them directly, but fallback to search_for_pattern if not enough
-                if hits and len(hits) >= 1:
-                    # For caller, if we have some hits but not covering expected, try to supplement with search_for_pattern
-                    if len(hits) < top_n or (repo_path.name=="nestjs" and term=="create" and "sample/01-cats-app" not in str(hits)):
+                if not hits:
+                    try:
+                        txt2,_=c.call("search_for_pattern", {"substring_pattern":term}, timeout=60)
+                        added=False
                         try:
-                            term_pat = "NestFactory.create" if term=="create" and repo_path.name=="nestjs" else term
-                            if term=="get_queryset":
-                                term_pat = "get_queryset"
-                            elif term=="search":
-                                term_pat = "search("
-                            txt2,_=c.call("search_for_pattern", {"substring_pattern":term_pat}, timeout=60)
-                            # txt2 may be JSON dict mapping file -> list, or plain text
-                            added=False
-                            try:
-                                # try to parse as JSON dict
-                                # The text may contain outer json with content, but txt2 is already the inner text
-                                # For search_for_pattern, txt2 is like '{"sample\\01-cats-app\\src\\main.ts": ["  >   5: ..."]}'
-                                # Try to find JSON object inside
-                                j_start=txt2.find("{")
-                                j_end=txt2.rfind("}")
-                                if j_start!=-1 and j_end!=-1:
-                                    jtxt=txt2[j_start:j_end+1]
-                                    data2=json.loads(jtxt)
-                                    if isinstance(data2, dict):
-                                        for f in data2.keys():
-                                            f_norm=f.replace("\\","/")
-                                            if f_norm not in [h[0] for h in hits]:
-                                                hits.append((f_norm, 0.9, None, f"pattern {term_pat} in {f_norm}"))
-                                                added=True
-                                        # also check nested
-                            except: pass
-                            if not added:
-                                for line in txt2.splitlines():
-                                    m=re.search(r"^\s*-\s*(\S+):(\d+):", line)
-                                    if not m:
-                                        m=re.search(r"(\S+\.\w+)", line)
-                                    if m:
-                                        f=m.group(1).replace("\\","/")
-                                        if f not in [h[0] for h in hits]:
-                                            hits.append((f, 0.7, None, line[:200]))
-                                            if len(hits)>=top_n*2: break
-                            # ensure sample for nestjs
-                            if "sample/01-cats-app" not in str(hits) and repo_path.name=="nestjs":
-                                # try to extract from txt2 directly
-                                if "sample/01-cats-app" in txt2:
-                                    hits.append(("sample/01-cats-app/src/main.ts", 0.9, 6, "NestFactory.create in sample"))
-                                elif "main.ts" in txt2:
-                                    # fallback to first main.ts
-                                    m=re.search(r"sample[^\"]*main\.ts", txt2)
-                                    if m:
-                                        f=m.group(0).replace("\\","/")
-                                        hits.append((f, 0.8, 6, f"pattern {term_pat}"))
+                            j_start=txt2.find("{")
+                            j_end=txt2.rfind("}")
+                            if j_start!=-1 and j_end!=-1:
+                                jtxt=txt2[j_start:j_end+1]
+                                data2=json.loads(jtxt)
+                                if isinstance(data2, dict):
+                                    for f in data2.keys():
+                                        f_norm=f.replace("\\","/")
+                                        if f_norm not in seen_files:
+                                            seen_files.add(f_norm)
+                                            hits.append((f_norm, 0.9, None, f"pattern {term} in {f_norm}"))
+                                            added=True
                         except: pass
-                    # dedup and sort (already)
+                        if not added:
+                            for line in txt2.splitlines():
+                                m=re.search(r"(\S+\.\w+):(\d+):", line)
+                                if m:
+                                    f=m.group(1).replace("\\","/")
+                                    if f not in seen_files:
+                                        seen_files.add(f)
+                                        try: l=int(m.group(2))
+                                        except: l=None
+                                        hits.append((f, 0.7, l, line[:200]))
+                                        if len(hits)>=top_n*2: break
+                    except: pass
+                if hits:
                     seen=set()
                     out=[]
-                    for f,score,line,txt in hits:
+                    hits_sorted_generic=sorted(hits, key=lambda x: x[0])
+                    for f,score,line,txt in hits_sorted_generic:
                         if f not in seen:
                             seen.add(f)
                             out.append(SearchHit(file=f, score=score, line=line, text=txt, provenance="serena:find_referencing_symbols"))
@@ -317,7 +272,7 @@ class SerenaAdapter(BenchmarkAdapter):
             hits=[]
             # try find_symbol first (good for definition)
             try:
-                text,_=c.call("find_symbol", {"name_path":term,"depth":0,"include_body":False}, timeout=60)
+                text,_=c.call("find_symbol", {"name_path_pattern":term,"depth":0,"include_body":False}, timeout=60)
                 # text is json list of symbols
                 # try to parse as json
                 try:
@@ -346,7 +301,7 @@ class SerenaAdapter(BenchmarkAdapter):
             if len(hits)<top_n:
                 try:
                     text2,_=c.call("search_for_pattern", {"substring_pattern":term}, timeout=60)
-                    # text2 is like "Found 10 occurrences in 5 files:\n- django/db/models/base.py:508: class Model..."
+                    # text2 is like "Found 10 occurrences in 5 files:\n- example/repo/file.py:10: class Example..."
                     for line in text2.splitlines():
                         m=re.search(r"^\s*-\s*(\S+):(\d+):", line)
                         if m:
