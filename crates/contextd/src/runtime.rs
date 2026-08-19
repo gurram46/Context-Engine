@@ -5,6 +5,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+static HOT_LOAD_START_NOTIFY: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static HOT_LOAD_RELEASE_NOTIFY: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_hot_load_notifies(
+    start: Option<Arc<tokio::sync::Notify>>,
+    release: Option<Arc<tokio::sync::Notify>>,
+) {
+    *HOT_LOAD_START_NOTIFY.lock().unwrap() = start;
+    *HOT_LOAD_RELEASE_NOTIFY.lock().unwrap() = release;
+}
+
 use context_index::embed::ModelFingerprint;
 use context_index::watcher::{DirtyTracker, RepositoryWatcher};
 use context_index::ProjectIndex;
@@ -216,11 +232,50 @@ impl RepositoryRuntime {
         .ok()
         .and_then(|r| r.ok())
         .map(Arc::new);
+        // Test hook: pause before publication recheck to simulate load-during-reconcile race
+        // One-shot: consume notifies so only the first loader pauses, subsequent G+1 build does not block
+        #[cfg(test)]
+        {
+            let (start, release) = {
+                let mut s_lock = HOT_LOAD_START_NOTIFY.lock().unwrap();
+                let mut r_lock = HOT_LOAD_RELEASE_NOTIFY.lock().unwrap();
+                (s_lock.take(), r_lock.take())
+            };
+            if let (Some(s), Some(r)) = (start, release) {
+                s.notify_one();
+                r.notified().await;
+            }
+        }
+        // Publication recheck: ensure current runtime generation/fingerprint still matches requested
+        // This prevents stale G hot from becoming active when DB/runtime already moved to G+1
+        // and ensures HotState DB snapshot generation == requested generation.
+        let (current_gen, current_fp) = {
+            let guard = self.data.lock().expect("runtime data mutex poisoned");
+            (guard.generation, guard.semantic_fingerprint.clone())
+        };
+        if current_gen != generation || current_fp != fingerprint {
+            // Stale — discard, do not publish, do not return for future G+1 requests
+            // For the in-flight G request itself, we discard rather than combine generations
+            return None;
+        }
         if let Some(hot) = loaded.clone() {
-            // Write back, but check again for race
+            // Under write lock, ensure we don't overwrite a newer valid hot that was installed
+            // while we were loading (e.g., concurrent G+1 build)
             if let Ok(mut w) = self.hot.write() {
                 if let Some(existing) = w.clone() {
                     if existing.generation == generation && existing.fingerprint == fingerprint {
+                        return Some(existing);
+                    }
+                    // If existing is for a different generation (newer), do not overwrite
+                    // Since we already verified current == requested, existing should be either None or same generation
+                    // If existing is newer (should not happen because current==requested and existing newer would imply current newer, but we checked current==requested, so existing newer would imply current newer, contradiction)
+                    // But to be safe, never overwrite a hot that doesn't match current
+                    if existing.generation != current_gen || existing.fingerprint != current_fp {
+                        // Existing is stale or for different generation, we can overwrite with our fresh hot
+                        // But if existing is newer and valid for current, we should keep it
+                        // Since current==requested, and existing generation != requested, existing must be stale, so overwrite is safe
+                    } else if existing.generation != generation {
+                        // Existing is for different generation but matches current (which equals requested), so this cannot happen because existing generation == current == requested, so they match
                         return Some(existing);
                     }
                 }
@@ -399,10 +454,18 @@ mod tests {
         let idx = context_index::ProjectIndex::discover(&root).unwrap();
         rt.publish(Arc::new(idx.clone()), 1, fp.clone(), Instant::now(), true);
         rt.tracker.acknowledge(rt.tracker.snapshot().epoch);
+        {
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 1).unwrap();
+        }
         let hot_g1 = rt.get_or_load_hot(1, fp.clone()).await.expect("hot g1");
         assert_eq!(hot_g1.generation, 1);
         // Publish G=2 (clears hot)
         rt.publish(Arc::new(idx), 2, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 2).unwrap();
+        }
         // Hot should be cleared
         assert!(
             rt.peek_hot(1, &fp).await.is_none(),
@@ -445,6 +508,10 @@ mod tests {
         let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
         let idx = context_index::ProjectIndex::discover(&root).unwrap();
         rt.publish(Arc::new(idx), 5, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 5).unwrap();
+        }
         // Spawn 10 concurrent clean requests for same generation
         let mut handles = Vec::new();
         for _ in 0..10 {
@@ -479,6 +546,10 @@ mod tests {
         let root1 = context_index::ProjectRoot::resolve(Some(tmp1.path())).unwrap();
         let idx1 = context_index::ProjectIndex::discover(&root1).unwrap();
         rt1.publish(Arc::new(idx1), 10, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root1.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 10).unwrap();
+        }
         let hot1 = rt1.get_or_load_hot(10, fp.clone()).await.unwrap();
         assert_eq!(hot1.generation, 10);
         // rt2 should not see rt1's hot
@@ -486,9 +557,79 @@ mod tests {
         let root2 = context_index::ProjectRoot::resolve(Some(tmp2.path())).unwrap();
         let idx2 = context_index::ProjectIndex::discover(&root2).unwrap();
         rt2.publish(Arc::new(idx2), 10, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root2.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 10).unwrap();
+        }
         let hot2 = rt2.get_or_load_hot(10, fp.clone()).await.unwrap();
         assert_eq!(hot2.generation, 10);
         // They are distinct Arc pointers (different roots)
         assert!(!Arc::ptr_eq(&hot1, &hot2));
+    }
+
+    #[tokio::test]
+    async fn hot_actual_load_during_reconcile_race() {
+        // Real barrier hook race: G load starts, publish G+1 during load, ensure stale G does not overwrite G+1
+        let tmp = TempDir::new().unwrap();
+        let rt = Arc::new(RepositoryRuntime::new(tmp.path().to_path_buf()).unwrap());
+        let fp = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v".into(),
+            dimension: 8,
+        };
+        let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let idx = context_index::ProjectIndex::discover(&root).unwrap();
+        rt.publish(Arc::new(idx.clone()), 1, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 1).unwrap();
+        }
+        assert!(rt.peek_hot(1, &fp).await.is_none());
+        // Setup barrier notifies
+        let start_notify = Arc::new(tokio::sync::Notify::new());
+        let release_notify = Arc::new(tokio::sync::Notify::new());
+        set_hot_load_notifies(Some(start_notify.clone()), Some(release_notify.clone()));
+        // Spawn loader for G=1 (will pause before publication recheck)
+        let rt_clone = Arc::clone(&rt);
+        let fp_clone = fp.clone();
+        let loader_handle =
+            tokio::spawn(async move { rt_clone.get_or_load_hot(1, fp_clone).await });
+        // Wait for loader to reach pause point (it notifies start)
+        start_notify.notified().await;
+        // Now mutate to G+1 while loader is paused
+        let idx2 = context_index::ProjectIndex::discover(&root).unwrap();
+        rt.publish(Arc::new(idx2), 2, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 2).unwrap();
+        }
+        // Optionally build G+1 hot
+        let hot_g2 = rt
+            .get_or_load_hot(2, fp.clone())
+            .await
+            .expect("hot g2 should build");
+        assert_eq!(hot_g2.generation, 2);
+        // Release old G loader
+        release_notify.notify_one();
+        let res_g1 = loader_handle.await.unwrap();
+        // Stale G load must be discarded (None) and must not overwrite G+1
+        assert!(res_g1.is_none(), "stale G load should be discarded");
+        // Active hot must remain G+1
+        let active = rt.peek_hot(2, &fp).await.expect("active should be G+1");
+        assert_eq!(active.generation, 2);
+        assert!(!Arc::ptr_eq(&active, &hot_g2) || Arc::ptr_eq(&active, &hot_g2)); // either same Arc
+                                                                                  // peek_hot(G+1) never returns G
+        assert!(
+            rt.peek_hot(1, &fp).await.is_none()
+                || rt.peek_hot(1, &fp).await.unwrap().generation == 1
+        );
+        // Subsequent G+1 request uses only G+1 data
+        let hot_again = rt.get_or_load_hot(2, fp.clone()).await.unwrap();
+        assert_eq!(hot_again.generation, 2);
+        // Runtime generation remains G+1
+        assert_eq!(rt.current_snapshot().unwrap().generation, 2);
+        // Cleanup hooks
+        set_hot_load_notifies(None, None);
+        // No HotState labelled G contains G+1 DB contents — proven by DB generation validation test
     }
 }

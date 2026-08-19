@@ -366,18 +366,38 @@ pub struct HotState {
 impl HotState {
     pub fn load_blocking(
         root: &Path,
-        generation: u64,
+        requested_generation: u64,
         fingerprint: ModelFingerprint,
     ) -> anyhow::Result<Self> {
         let conn = structural_store::open_db(root)?;
+        // Use a read transaction for a consistent snapshot across all loads.
+        conn.execute("BEGIN", [])?;
+        let db_generation = structural_store::get_generation(&conn).unwrap_or(0);
+        if db_generation != requested_generation {
+            let _ = conn.execute("ROLLBACK", []);
+            anyhow::bail!(
+                "generation mismatch: requested {} db {}",
+                requested_generation,
+                db_generation
+            );
+        }
         let bm25 = HotBm25::load(&conn)?;
-        // Vectors only if backend available and fingerprint matches? We still load if vectors exist.
         let vectors = match HotVectors::load(&conn, &fingerprint) {
             Ok(v) if v.count() > 0 => Some(v),
             _ => None,
         };
+        let db_generation2 = structural_store::get_generation(&conn).unwrap_or(0);
+        if db_generation2 != requested_generation {
+            let _ = conn.execute("ROLLBACK", []);
+            anyhow::bail!(
+                "generation changed during load: requested {} db now {}",
+                requested_generation,
+                db_generation2
+            );
+        }
+        let _ = conn.execute("COMMIT", []);
         Ok(Self {
-            generation,
+            generation: db_generation,
             fingerprint,
             bm25,
             vectors,
@@ -725,5 +745,33 @@ mod tests {
         );
         assert_eq!(p1.files, p2.files, "pack files must be identical");
         assert_eq!(p1.markdown, p2.markdown, "pack markdown must be identical");
+    }
+
+    #[test]
+    fn hot_state_db_generation_validation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let conn = structural_store::open_db(root).unwrap();
+        structural_store::set_generation(&conn, 5).unwrap();
+        let fp = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v".into(),
+            dimension: 8,
+        };
+        let res = HotState::load_blocking(root, 3, fp.clone());
+        assert!(
+            res.is_err(),
+            "should reject generation mismatch: requested 3 db 5"
+        );
+        let Err(e) = res else { panic!("should err") };
+        assert!(e.to_string().contains("generation mismatch"));
+        let res2 = HotState::load_blocking(root, 5, fp.clone())
+            .expect("should succeed for matching generation");
+        assert_eq!(res2.generation, 5);
+        assert_eq!(res2.fingerprint, fp);
+        structural_store::set_generation(&conn, 6).unwrap();
+        let res3 = HotState::load_blocking(root, 5, fp);
+        assert!(res3.is_err(), "old G hot must not be built from G+1 DB");
     }
 }
