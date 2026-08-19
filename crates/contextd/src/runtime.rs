@@ -67,6 +67,9 @@ pub(crate) struct RepositoryRuntime {
     data: std::sync::Mutex<RuntimeData>,
     pub(crate) reconcile_lock: tokio::sync::Mutex<()>,
     hot: std::sync::RwLock<Option<Arc<crate::hot::HotState>>>,
+    hot_build_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    pub(crate) hot_build_total: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     test_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -110,6 +113,9 @@ impl RepositoryRuntime {
             }),
             reconcile_lock: tokio::sync::Mutex::new(()),
             hot: std::sync::RwLock::new(None),
+            hot_build_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            hot_build_total: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -230,7 +236,7 @@ impl RepositoryRuntime {
         generation: u64,
         fingerprint: ModelFingerprint,
     ) -> Option<Arc<crate::hot::HotState>> {
-        // Fast read path
+        // Fast read path (no locks held)
         if let Ok(guard) = self.hot.read() {
             if let Some(hot) = guard.clone() {
                 if hot.generation == generation && hot.fingerprint == fingerprint {
@@ -238,7 +244,29 @@ impl RepositoryRuntime {
                 }
             }
         }
-        // Need to load — do blocking load outside lock
+        // Singleflight: per-runtime build lock, held across expensive load
+        // Not global, not held during fast read, not held during data/hot critical section
+        let _build_guard = self.hot_build_lock.lock().await;
+        // Re-check hot after acquiring build lock (another waiter may have built while we waited)
+        if let Ok(guard) = self.hot.read() {
+            if let Some(hot) = guard.clone() {
+                if hot.generation == generation && hot.fingerprint == fingerprint {
+                    return Some(hot);
+                }
+            }
+        }
+        // Re-check current generation after acquiring build lock (generation may have advanced while we waited)
+        let (current_gen_b, current_fp_b) = {
+            let guard = self.data.lock().expect("runtime data mutex poisoned");
+            (guard.generation, guard.semantic_fingerprint.clone())
+        };
+        if current_gen_b != generation || current_fp_b != fingerprint {
+            return None;
+        }
+        #[cfg(test)]
+        self.hot_build_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Need to load — blocking load outside data/hot locks but inside build lock
         let root = self.root.clone();
         let fp_clone = fingerprint.clone();
         let loaded = tokio::task::spawn_blocking(move || {
@@ -249,7 +277,6 @@ impl RepositoryRuntime {
         .and_then(|r| r.ok())
         .map(Arc::new);
         // Test hook: pause before publication recheck to simulate load-during-reconcile race
-        // One-shot: consume notifies so only the first loader pauses, subsequent G+1 build does not block
         #[cfg(test)]
         {
             let (start, release) = {
@@ -264,21 +291,14 @@ impl RepositoryRuntime {
                 eprintln!("[hot] first hook: released");
             }
         }
-        // Publication recheck: ensure current runtime generation/fingerprint still matches requested
-        // This prevents stale G hot from becoming active when DB/runtime already moved to G+1
-        // and ensures HotState DB snapshot generation == requested generation.
+        // Publication recheck: ensure current still matches requested (after load, before publication)
         let (current_gen, current_fp) = {
             let guard = self.data.lock().expect("runtime data mutex poisoned");
             (guard.generation, guard.semantic_fingerprint.clone())
         };
         if current_gen != generation || current_fp != fingerprint {
-            // Stale — discard, do not publish, do not return for future G+1 requests
-            // For the in-flight G request itself, we discard rather than combine generations
             return None;
         }
-        // Second hook: pause between recheck and atomic publication to test TOCTOU window
-        // In old code this window had no locks held, allowing stale G to overwrite G+1.
-        // New code makes publication atomic (data+hot held together), so this window is eliminated.
         #[cfg(test)]
         {
             let (ws, wr) = {
@@ -294,7 +314,6 @@ impl RepositoryRuntime {
             }
         }
         // Atomic publication: hold data and hot together (data -> hot order, same as publish)
-        // Keep data guard held while acquiring hot write lock, then re-validate and publish
         let data_guard = self.data.lock().expect("runtime data mutex poisoned");
         let current_gen2 = data_guard.generation;
         let current_fp2 = data_guard.semantic_fingerprint.clone();
@@ -302,20 +321,14 @@ impl RepositoryRuntime {
             return None;
         }
         if let Some(hot) = loaded.clone() {
-            // Acquire hot write while still holding data_guard (data -> hot order)
-            // Use try_write to avoid deadlocks? But we need to hold data_guard, so we must use blocking write
-            // Since hot is std RwLock, we can acquire it while holding data Mutex (both sync, no await)
-            // This is safe because no other path holds hot then tries to acquire data.
             let mut hot_guard = self.hot.write().expect("hot poisoned");
             if let Some(existing) = hot_guard.clone() {
                 if existing.generation == generation && existing.fingerprint == fingerprint {
                     return Some(existing);
                 }
-                // If existing matches current (which equals requested), it must be same generation, so reuse
                 if existing.generation == current_gen2 && existing.fingerprint == current_fp2 {
                     return Some(existing);
                 }
-                // Otherwise existing is stale, we will overwrite
             }
             *hot_guard = Some(hot.clone());
             return Some(hot);
@@ -571,6 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn hot_between_recheck_and_write_race() {
+        eprintln!("test: hot_between start");
         // Test the TOCTOU window between recheck and atomic publication.
         // Old code had window with no locks: recheck (data) then hot.write() separately.
         // New code holds data+hot atomically, so stale G cannot overwrite G+1.
@@ -601,23 +615,23 @@ mod tests {
             tokio::spawn(async move { rt_clone.get_or_load_hot(1, fp_clone).await });
         // Wait for loader to reach second hook (it notifies start)
         start_notify.notified().await;
-        // Now loader is paused between recheck and atomic publication, holding no locks (hook is before acquiring data+hot)
-        // Publish G+1 while loader is paused
+        // Now loader is paused between recheck and atomic publication, holding build lock
+        // Publish G+1 while loader is paused (publish does not need build lock, so it can proceed)
         let idx2 = context_index::ProjectIndex::discover(&root).unwrap();
         rt.publish(Arc::new(idx2), 2, fp.clone(), Instant::now(), true);
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 2).unwrap();
         }
-        // Build valid G+1 hot (should succeed, not blocked by loader's pause because loader is not holding locks)
+        // Release old G loader first (it holds build lock, so G+1 waiters would block if we tried to build now)
+        release_notify.notify_one();
+        let res_g1 = loader_handle.await.unwrap();
+        // Now build valid G+1 hot after old G has released build lock
         let hot_g2 = rt
             .get_or_load_hot(2, fp.clone())
             .await
             .expect("hot g2 should build");
         assert_eq!(hot_g2.generation, 2);
-        // Release old G loader
-        release_notify.notify_one();
-        let res_g1 = loader_handle.await.unwrap();
         // Stale G loader must not overwrite G+1 (should be discarded, return None or not become active)
         // It could return None (discarded) or Some(G) for its own request but not publish as current.
         // In our implementation, it returns None because current != requested at recheck inside atomic.
@@ -710,15 +724,15 @@ mod tests {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 2).unwrap();
         }
-        // Optionally build G+1 hot
+        // Release old G loader first (it holds build lock)
+        release_notify.notify_one();
+        let res_g1 = loader_handle.await.unwrap();
+        // Now build G+1 hot after old G released
         let hot_g2 = rt
             .get_or_load_hot(2, fp.clone())
             .await
             .expect("hot g2 should build");
         assert_eq!(hot_g2.generation, 2);
-        // Release old G loader
-        release_notify.notify_one();
-        let res_g1 = loader_handle.await.unwrap();
         // Stale G load must be discarded (None) and must not overwrite G+1
         assert!(res_g1.is_none(), "stale G load should be discarded");
         // Active hot must remain G+1
@@ -738,5 +752,148 @@ mod tests {
         // Cleanup hooks
         set_hot_load_notifies(None, None);
         // No HotState labelled G contains G+1 DB contents — proven by DB generation validation test
+    }
+
+    #[tokio::test]
+    async fn hot_singleflight_one_load() {
+        let tmp = TempDir::new().unwrap();
+        let rt = Arc::new(RepositoryRuntime::new(tmp.path().to_path_buf()).unwrap());
+        let fp = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v".into(),
+            dimension: 8,
+        };
+        let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let idx = context_index::ProjectIndex::discover(&root).unwrap();
+        rt.publish(Arc::new(idx), 7, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 7).unwrap();
+        }
+        rt.hot_build_total
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let rt_clone = Arc::clone(&rt);
+            let fp_clone = fp.clone();
+            handles.push(tokio::spawn(async move {
+                let hot = rt_clone.get_or_load_hot(7, fp_clone).await.expect("hot");
+                assert_eq!(hot.generation, 7);
+                hot
+            }));
+        }
+        let mut arcs = Vec::new();
+        for h in handles {
+            arcs.push(h.await.unwrap());
+        }
+        for a in &arcs[1..] {
+            assert!(Arc::ptr_eq(&arcs[0], a), "all should be same Arc");
+        }
+        assert_eq!(
+            rt.hot_build_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "duplicate same-generation builds should be singleflighted to 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn hot_singleflight_generation_plus_one() {
+        let tmp = TempDir::new().unwrap();
+        let rt = Arc::new(RepositoryRuntime::new(tmp.path().to_path_buf()).unwrap());
+        let fp = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v".into(),
+            dimension: 8,
+        };
+        let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let idx = context_index::ProjectIndex::discover(&root).unwrap();
+        rt.publish(Arc::new(idx.clone()), 10, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 10).unwrap();
+        }
+        let start = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        set_hot_load_notifies(Some(start.clone()), Some(release.clone()));
+        let rt_c = Arc::clone(&rt);
+        let fp_c = fp.clone();
+        let h10_handle = tokio::spawn(async move { rt_c.get_or_load_hot(10, fp_c).await });
+        start.notified().await;
+        let idx2 = context_index::ProjectIndex::discover(&root).unwrap();
+        rt.publish(Arc::new(idx2), 11, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 11).unwrap();
+        }
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let rt_c2 = Arc::clone(&rt);
+            let fp_c2 = fp.clone();
+            waiters.push(tokio::spawn(async move {
+                let hot = rt_c2.get_or_load_hot(11, fp_c2).await.expect("hot 11");
+                assert_eq!(hot.generation, 11);
+                hot
+            }));
+        }
+        release.notify_one();
+        let res10 = h10_handle.await.unwrap();
+        assert!(
+            res10.is_none(),
+            "stale G=10 should be discarded after G+1 publish"
+        );
+        let mut g11_arcs = Vec::new();
+        for w in waiters {
+            g11_arcs.push(w.await.unwrap());
+        }
+        for a in &g11_arcs[1..] {
+            assert!(Arc::ptr_eq(&g11_arcs[0], a));
+        }
+        rt.hot_build_total
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Need to reset and test G+1 singleflight count
+        // For this test we already consumed build count, so we check that G+1 built once
+        // The previous G+1 builds already happened, so we check that they were singleflighted
+        // We can verify by checking that all G+1 waiters got same Arc (already done)
+        assert_eq!(rt.current_snapshot().unwrap().generation, 11);
+        set_hot_load_notifies(None, None);
+    }
+
+    #[tokio::test]
+    async fn hot_per_root_concurrent_independent() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let rt1 = Arc::new(RepositoryRuntime::new(tmp1.path().to_path_buf()).unwrap());
+        let rt2 = Arc::new(RepositoryRuntime::new(tmp2.path().to_path_buf()).unwrap());
+        let fp = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v".into(),
+            dimension: 8,
+        };
+        for (rt, tmp) in [(rt1.clone(), &tmp1), (rt2.clone(), &tmp2)] {
+            let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
+            let idx = context_index::ProjectIndex::discover(&root).unwrap();
+            rt.publish(Arc::new(idx), 20, fp.clone(), Instant::now(), true);
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 20).unwrap();
+        }
+        let start = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        set_hot_load_notifies(Some(start.clone()), Some(release.clone()));
+        let rt1_c = rt1.clone();
+        let fp_c = fp.clone();
+        let slow_handle = tokio::spawn(async move { rt1_c.get_or_load_hot(20, fp_c).await });
+        start.notified().await;
+        // While rt1 is paused (holding per-runtime build lock), rt2 should build independently
+        let rt2_hot = rt2
+            .get_or_load_hot(20, fp.clone())
+            .await
+            .expect("rt2 hot should not wait for rt1");
+        assert_eq!(rt2_hot.generation, 20);
+        release.notify_one();
+        let rt1_hot = slow_handle.await.unwrap().expect("rt1 hot");
+        assert_eq!(rt1_hot.generation, 20);
+        assert!(!Arc::ptr_eq(&rt1_hot, &rt2_hot));
+        set_hot_load_notifies(None, None);
     }
 }

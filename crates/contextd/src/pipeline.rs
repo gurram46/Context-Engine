@@ -779,6 +779,7 @@ pub async fn retrieve_context(
     let semantic_embed_ms: Option<u128>;
     let semantic_search_ms: Option<u128>;
     let mut vector_count_scanned: Option<usize> = None;
+    let mut hot_vector_used = false;
 
     // BM25 native — hot path uses in-memory HotBm25 when available, else SQLite fallback
     if run_bm25 {
@@ -1039,6 +1040,7 @@ pub async fn retrieve_context(
                     let search_res =
                         hv.search_brute(&qvec, context_index::vector::SEMANTIC_CANDIDATE_K);
                     total_search = total_search.saturating_add(t_search.elapsed().as_millis());
+                    hot_vector_used = true;
                     match search_res {
                         Ok(results) => {
                             for (rank, vc) in results.into_iter().enumerate() {
@@ -1337,8 +1339,12 @@ pub async fn retrieve_context(
         sqlite_open_ms: Some(sqlite_open_ms),
         sqlite_open_calls: Some(sqlite_open_calls),
         sqlite_query_ms: Some(sqlite_query_ms),
-        vector_load_ms: semantic_search_ms,
-        vector_scan_ms: None,
+        vector_load_ms: None,
+        vector_scan_ms: if hot_vector_used {
+            semantic_search_ms
+        } else {
+            None
+        },
         filesystem_ms: Some(filesystem_ms),
         files_read: Some(files_read),
         query_embedding_cache_hit: q_cache_hit,
