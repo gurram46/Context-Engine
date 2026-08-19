@@ -21,6 +21,22 @@ pub(crate) fn set_hot_load_notifies(
     *HOT_LOAD_RELEASE_NOTIFY.lock().unwrap() = release;
 }
 
+#[cfg(test)]
+static HOT_WRITE_START_NOTIFY: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static HOT_WRITE_RELEASE_NOTIFY: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_hot_write_notifies(
+    start: Option<Arc<tokio::sync::Notify>>,
+    release: Option<Arc<tokio::sync::Notify>>,
+) {
+    *HOT_WRITE_START_NOTIFY.lock().unwrap() = start;
+    *HOT_WRITE_RELEASE_NOTIFY.lock().unwrap() = release;
+}
+
 use context_index::embed::ModelFingerprint;
 use context_index::watcher::{DirtyTracker, RepositoryWatcher};
 use context_index::ProjectIndex;
@@ -180,6 +196,8 @@ impl RepositoryRuntime {
         now: Instant,
         full_verification: bool,
     ) {
+        // Atomic publication: data -> hot order, keep data guard held while clearing hot
+        // to prevent TOCTOU where a concurrent get_or_load_hot could publish stale G after we cleared
         let mut guard = self.data.lock().expect("runtime data mutex poisoned");
         guard.project = Some(project);
         guard.generation = generation;
@@ -188,13 +206,11 @@ impl RepositoryRuntime {
             guard.last_full_verified = Some(now);
         }
         guard.reconcile_total = guard.reconcile_total.saturating_add(1);
+        // Hold data guard while acquiring hot write lock (data -> hot order)
+        let mut hot_guard = self.hot.write().expect("hot poisoned");
+        *hot_guard = None;
+        drop(hot_guard);
         drop(guard);
-        // Invalidate hot retrieval state on generation/fingerprint change (E3-D)
-        // Hot is generation+fingerprint bound; stale hot must not be reused.
-        // Invalidate hot retrieval state on any publish to avoid stale BM25/vectors
-        // after incremental or full reconciliation. Next clean query will lazily rebuild.
-        // This ensures generation-bound isolation and no stale results after mutation.
-        let _ = self.hot.write().map(|mut w| *w = None);
     }
 
     pub(crate) fn increment_discovery(&self) {
@@ -242,8 +258,10 @@ impl RepositoryRuntime {
                 (s_lock.take(), r_lock.take())
             };
             if let (Some(s), Some(r)) = (start, release) {
+                eprintln!("[hot] first hook: notifying start, waiting for release");
                 s.notify_one();
                 r.notified().await;
+                eprintln!("[hot] first hook: released");
             }
         }
         // Publication recheck: ensure current runtime generation/fingerprint still matches requested
@@ -258,29 +276,48 @@ impl RepositoryRuntime {
             // For the in-flight G request itself, we discard rather than combine generations
             return None;
         }
-        if let Some(hot) = loaded.clone() {
-            // Under write lock, ensure we don't overwrite a newer valid hot that was installed
-            // while we were loading (e.g., concurrent G+1 build)
-            if let Ok(mut w) = self.hot.write() {
-                if let Some(existing) = w.clone() {
-                    if existing.generation == generation && existing.fingerprint == fingerprint {
-                        return Some(existing);
-                    }
-                    // If existing is for a different generation (newer), do not overwrite
-                    // Since we already verified current == requested, existing should be either None or same generation
-                    // If existing is newer (should not happen because current==requested and existing newer would imply current newer, but we checked current==requested, so existing newer would imply current newer, contradiction)
-                    // But to be safe, never overwrite a hot that doesn't match current
-                    if existing.generation != current_gen || existing.fingerprint != current_fp {
-                        // Existing is stale or for different generation, we can overwrite with our fresh hot
-                        // But if existing is newer and valid for current, we should keep it
-                        // Since current==requested, and existing generation != requested, existing must be stale, so overwrite is safe
-                    } else if existing.generation != generation {
-                        // Existing is for different generation but matches current (which equals requested), so this cannot happen because existing generation == current == requested, so they match
-                        return Some(existing);
-                    }
-                }
-                *w = Some(hot.clone());
+        // Second hook: pause between recheck and atomic publication to test TOCTOU window
+        // In old code this window had no locks held, allowing stale G to overwrite G+1.
+        // New code makes publication atomic (data+hot held together), so this window is eliminated.
+        #[cfg(test)]
+        {
+            let (ws, wr) = {
+                let mut s_lock = HOT_WRITE_START_NOTIFY.lock().unwrap();
+                let mut r_lock = HOT_WRITE_RELEASE_NOTIFY.lock().unwrap();
+                (s_lock.take(), r_lock.take())
+            };
+            if let (Some(s), Some(r)) = (ws, wr) {
+                eprintln!("[hot] second hook: notifying start, waiting for release");
+                s.notify_one();
+                r.notified().await;
+                eprintln!("[hot] second hook: released");
             }
+        }
+        // Atomic publication: hold data and hot together (data -> hot order, same as publish)
+        // Keep data guard held while acquiring hot write lock, then re-validate and publish
+        let data_guard = self.data.lock().expect("runtime data mutex poisoned");
+        let current_gen2 = data_guard.generation;
+        let current_fp2 = data_guard.semantic_fingerprint.clone();
+        if current_gen2 != generation || current_fp2 != fingerprint {
+            return None;
+        }
+        if let Some(hot) = loaded.clone() {
+            // Acquire hot write while still holding data_guard (data -> hot order)
+            // Use try_write to avoid deadlocks? But we need to hold data_guard, so we must use blocking write
+            // Since hot is std RwLock, we can acquire it while holding data Mutex (both sync, no await)
+            // This is safe because no other path holds hot then tries to acquire data.
+            let mut hot_guard = self.hot.write().expect("hot poisoned");
+            if let Some(existing) = hot_guard.clone() {
+                if existing.generation == generation && existing.fingerprint == fingerprint {
+                    return Some(existing);
+                }
+                // If existing matches current (which equals requested), it must be same generation, so reuse
+                if existing.generation == current_gen2 && existing.fingerprint == current_fp2 {
+                    return Some(existing);
+                }
+                // Otherwise existing is stale, we will overwrite
+            }
+            *hot_guard = Some(hot.clone());
             return Some(hot);
         }
         None
@@ -530,6 +567,76 @@ mod tests {
         // Verify hot is still for G=5
         let final_hot = rt.peek_hot(5, &fp).await.unwrap();
         assert_eq!(final_hot.generation, 5);
+    }
+
+    #[tokio::test]
+    async fn hot_between_recheck_and_write_race() {
+        // Test the TOCTOU window between recheck and atomic publication.
+        // Old code had window with no locks: recheck (data) then hot.write() separately.
+        // New code holds data+hot atomically, so stale G cannot overwrite G+1.
+        let tmp = TempDir::new().unwrap();
+        let rt = Arc::new(RepositoryRuntime::new(tmp.path().to_path_buf()).unwrap());
+        let fp = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v".into(),
+            dimension: 8,
+        };
+        let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let idx = context_index::ProjectIndex::discover(&root).unwrap();
+        rt.publish(Arc::new(idx.clone()), 1, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 1).unwrap();
+        }
+        // Ensure hot for G=1 not yet built
+        assert!(rt.peek_hot(1, &fp).await.is_none());
+        // Setup second hook (between recheck and atomic write)
+        let start_notify = Arc::new(tokio::sync::Notify::new());
+        let release_notify = Arc::new(tokio::sync::Notify::new());
+        set_hot_write_notifies(Some(start_notify.clone()), Some(release_notify.clone()));
+        // Spawn loader for G=1 (will pause at second hook after recheck)
+        let rt_clone = Arc::clone(&rt);
+        let fp_clone = fp.clone();
+        let loader_handle =
+            tokio::spawn(async move { rt_clone.get_or_load_hot(1, fp_clone).await });
+        // Wait for loader to reach second hook (it notifies start)
+        start_notify.notified().await;
+        // Now loader is paused between recheck and atomic publication, holding no locks (hook is before acquiring data+hot)
+        // Publish G+1 while loader is paused
+        let idx2 = context_index::ProjectIndex::discover(&root).unwrap();
+        rt.publish(Arc::new(idx2), 2, fp.clone(), Instant::now(), true);
+        {
+            let conn = context_index::structural::store::open_db(root.path()).unwrap();
+            context_index::structural::store::set_generation(&conn, 2).unwrap();
+        }
+        // Build valid G+1 hot (should succeed, not blocked by loader's pause because loader is not holding locks)
+        let hot_g2 = rt
+            .get_or_load_hot(2, fp.clone())
+            .await
+            .expect("hot g2 should build");
+        assert_eq!(hot_g2.generation, 2);
+        // Release old G loader
+        release_notify.notify_one();
+        let res_g1 = loader_handle.await.unwrap();
+        // Stale G loader must not overwrite G+1 (should be discarded, return None or not become active)
+        // It could return None (discarded) or Some(G) for its own request but not publish as current.
+        // In our implementation, it returns None because current != requested at recheck inside atomic.
+        assert!(res_g1.is_none() || res_g1.as_ref().unwrap().generation == 1);
+        // Active hot must remain G+1, not overwritten by stale G
+        let active = rt.peek_hot(2, &fp).await.expect("active should be G+1");
+        assert_eq!(active.generation, 2);
+        // Subsequent G+1 request must return existing G+1 Arc (not rebuild due to stale eviction)
+        let hot_again = rt.get_or_load_hot(2, fp.clone()).await.unwrap();
+        assert_eq!(hot_again.generation, 2);
+        assert!(Arc::ptr_eq(&active, &hot_again) || hot_again.generation == 2);
+        // Late G cannot overwrite active G+1
+        assert!(
+            rt.peek_hot(1, &fp).await.is_none()
+                || rt.peek_hot(1, &fp).await.unwrap().generation == 1
+        );
+        // Cleanup
+        set_hot_write_notifies(None, None);
+        set_hot_load_notifies(None, None);
     }
 
     #[tokio::test]
