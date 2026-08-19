@@ -1,0 +1,46 @@
+{
+  "context_engine_hot": {
+    "django": {
+      "disk": 1084305408,
+      "rss": 23
+    },
+    "gin": {
+      "disk": 41320448,
+      "rss": 23
+    },
+    "lodash": {
+      "disk": 45371392,
+      "rss": 23
+    },
+    "nestjs": {
+      "disk": 128036864,
+      "rss": 23
+    },
+    "ripgrep": {
+      "disk": 72552448,
+      "rss": 23
+    }
+  },
+  "rg_baseline": {
+    "django": {
+      "disk": 1084305408,
+      "rss": 39
+    },
+    "gin": {
+      "disk": 41320448,
+      "rss": 34
+    },
+    "lodash": {
+      "disk": 45371392,
+      "rss": 33
+    },
+    "nestjs": {
+      "disk": 128036864,
+      "rss": 31
+    },
+    "ripgrep": {
+      "disk": 72552448,
+      "rss": 30
+    }
+  }
+}

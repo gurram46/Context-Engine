@@ -1,0 +1,81 @@
+{
+  "context_engine": {
+    "name": "Context Engine (E3 frozen)",
+    "url": "https://github.com/gurram46/Context-Engine",
+    "version": "41e81d38a92ea4fc9b4c6968b33142866fa1c504 (main after E3 merge, contains 27d19d4)",
+    "commit": "27d19d4d0f54b0da51469477af7261ff4b243f0d",
+    "installation": "cargo build --release -p contextd (local Rust binary target/release/contextd.exe 37MB)",
+    "runtime": "Rust 1.97.1, Tokio, MCP stdio",
+    "dependencies": "tantivy-like BM25 (HotBm25 in-memory), rusqlite, tree-sitter, blake3, all-minilm 384d v2 embeddings",
+    "configuration": "CONTEXTD_SEMANTIC_ENABLED=1, model all-minilm 384d v2, semantic_representation v2, missing_vectors 0, top_n 5, persistent MCP hot runtime",
+    "embedding": "all-minilm 384",
+    "semantic_provider": "local all-minilm (no network)",
+    "local_vs_network": "local only, no network during query",
+    "status": "RUN, measured 26Q"
+  },
+  "rg_baseline": {
+    "name": "Plain rg/read baseline",
+    "url": "https://github.com/BurntSushi/ripgrep",
+    "version": "ripgrep 14.1.1 (rg --version)",
+    "installation": "cargo install ripgrep / system rg",
+    "runtime": "Rust rg + Python baseline adapter (bench/adapters/rg_baseline.py)",
+    "configuration": "rg --fixed-strings --max-count 50 --hidden --glob !.git/** --max-count 50, generic excludes (.git, .context, node_modules, dist, build, target, __pycache__, .pytest_cache, .next, .nuxt, coverage), term extraction via longest identifier token, deterministic file-sorted dedup per file, max 5 files",
+    "embedding": "none",
+    "semantic_provider": "none",
+    "local_vs_network": "local",
+    "status": "RUN, measured 26Q"
+  },
+  "oci": {
+    "name": "Open Codebase Index (OCI)",
+    "url": "https://github.com/opencode-ai/open-codebase-index (npm package open-codebase-index, alias opencode-codebase-index-mcp)",
+    "version": "not installed \u2014 documented version npm open-codebase-index latest at 2026-08-19 (Rust+tree-sitter, SQLite+usearch+BM25, MCP tools implementation_lookup/call_graph/codebase_context/codebase_peek)",
+    "installation": "npm install open-codebase-index  (requires Node >=20, Rust for optional native)",
+    "runtime": "Rust+Tree-sitter, SQLite/usearch/BM25, MCP",
+    "configuration": "intended: default hybrid (embeddings+BM25+branch-aware), local indexing, file watching, content-hash reuse \u2014 not exercised in C0",
+    "embedding": "unknown (not measured)",
+    "semantic_provider": "local (documented)",
+    "local_vs_network": "local (documented)",
+    "status": "NOT_RUN (not installed, would require npm install and opencode.json plugin config, separate indexing per repo; not faked)",
+    "reason": "C0 focused on CE vs rg baseline as primary publishable comparison; OCI indexing per repo would require additional setup and is deferred to follow-up C0.1. Stub adapter present (bench/adapters/oci.py) returns unavailable."
+  },
+  "codebase_memory": {
+    "name": "Codebase-Memory-MCP (DeusData)",
+    "url": "https://github.com/DeusData/codebase-memory-mcp",
+    "version": "not installed \u2014 README claims single static binary, Tree-sitter 158 languages, SQLite knowledge graph",
+    "installation": "shell script from GitHub (single static binary, no external deps) \u2014 not executed in C0",
+    "runtime": "Rust/Go? Tree-sitter, SQLite, MCP (Claude Code, Cursor, Zed, Codex CLI)",
+    "configuration": "intended: structural index (functions/classes/call chains/routes), graph queries \u2014 not exercised",
+    "local_vs_network": "local (documented)",
+    "status": "NOT_RUN",
+    "reason": "Same as OCI \u2014 would require binary install and ingestion per repo; not faked. Stub present."
+  },
+  "serena": {
+    "name": "Serena (oraios/serena)",
+    "url": "https://github.com/oraios/serena",
+    "version": "not installed \u2014 agent toolkit, MCP, LSP-based symbol-level retrieval, 30-40 languages",
+    "installation": "pip/uvx serena-agent + language servers per repo \u2014 not installed in C0",
+    "runtime": "Python + LSP (multilanguage), MCP (Claude Code/Desktop, Cursor, VS Code, Cline, Roo Code)",
+    "configuration": "intended: language server per repo (Python, Rust, Go, JS/TS) \u2014 not exercised; would require LSP availability report per repo",
+    "status": "NOT_RUN",
+    "reason": "Requires LSP setup per repo language (pyright, rust-analyzer, gopls, tsserver) and Serena MCP server; harness stub present."
+  },
+  "aider": {
+    "name": "Aider Repo Map",
+    "url": "https://github.com/Aider-AI/aider",
+    "version": "not installed \u2014 documented Tree-sitter + symbol graph + PageRank, token budget 1k, --show-repo-map",
+    "runtime": "Python, Tree-sitter",
+    "status": "NOT_COMPARABLE",
+    "reason": "AIDER_REPO_MAP_NOT_COMPARABLE \u2014 Repo Map does not expose query-oriented retrieval abstraction (prepare/query/top_k). It builds a dynamic PageRank over symbols relevant to current chat files, not a generic (repo, query, top_k) -> hits interface. Normalizing repo-map output to per-query hits would require forcing a file-context and inventing ranking, which is not defensible as head-to-head retrieval. Could be compared in same-agent coding outcome A/B later, not in retrieval bench."
+  },
+  "cursor": {
+    "name": "Cursor (proprietary)",
+    "url": "https://cursor.com",
+    "version": "proprietary, cloud-assisted IDE, vector embeddings + @Codebase/Agent mode",
+    "installation": "proprietary VS Code fork, requires Cursor backend",
+    "runtime": "Electron + cloud (embeddings via Cursor backend, model routing)",
+    "configuration": "Privacy Mode, .cursorignore, embeddings stored + plaintext discarded (per Cursor docs), requests pass through Cursor backend even with own API keys",
+    "local_vs_network": "cloud (requires network; retrieval not isolatable from model routing/agent loop/editor state)",
+    "status": "NOT_ISOLATABLE",
+    "reason": "CURSOR_RETRIEVAL_LANE_NOT_ISOLATABLE \u2014 Cursor is proprietary and its retrieval/context selection cannot be isolated from proprietary model routing, agent loop, editor state, and learned harness behavior while using same query/task. No documented standalone retrieval API (only IDE @Codebase). Even with Privacy Mode (zero retention), context passes through Cursor backend. Therefore no fair head-to-head retrieval number can be produced. Later compared in same-agent coding outcome benchmark if fair setup exists (controlled task, same model routing, disclosed methodology). Not a screenshot/anecdotal comparison."
+  }
+}

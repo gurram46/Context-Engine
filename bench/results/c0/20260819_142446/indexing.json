@@ -1,0 +1,261 @@
+{
+  "context_engine_hot": {
+    "django": {
+      "wall_ms": 12581,
+      "metrics": {
+        "initial_wall_ms": 12581,
+        "no_change_wall_ms": null,
+        "one_file_wall_ms": null,
+        "cpu_ms": null,
+        "peak_rss_mb": null,
+        "index_disk_bytes": null,
+        "files_indexed": 3039,
+        "symbols": 44010,
+        "bm25_docs": 43841,
+        "vector_count": 44188,
+        "affected_structural_updates": null,
+        "index_size_delta_bytes": null,
+        "unavailable": [
+          "index_disk_bytes",
+          "cpu_ms",
+          "peak_rss_mb",
+          "no_change_wall_ms",
+          "one_file_wall_ms"
+        ]
+      }
+    },
+    "gin": {
+      "wall_ms": 757,
+      "metrics": {
+        "initial_wall_ms": 757,
+        "no_change_wall_ms": null,
+        "one_file_wall_ms": null,
+        "cpu_ms": null,
+        "peak_rss_mb": null,
+        "index_disk_bytes": null,
+        "files_indexed": 99,
+        "symbols": 1529,
+        "bm25_docs": 1533,
+        "vector_count": 1531,
+        "affected_structural_updates": null,
+        "index_size_delta_bytes": null,
+        "unavailable": [
+          "index_disk_bytes",
+          "cpu_ms",
+          "peak_rss_mb",
+          "no_change_wall_ms",
+          "one_file_wall_ms"
+        ]
+      }
+    },
+    "lodash": {
+      "wall_ms": 790,
+      "metrics": {
+        "initial_wall_ms": 790,
+        "no_change_wall_ms": null,
+        "one_file_wall_ms": null,
+        "cpu_ms": null,
+        "peak_rss_mb": null,
+        "index_disk_bytes": null,
+        "files_indexed": 48,
+        "symbols": 1012,
+        "bm25_docs": 916,
+        "vector_count": 1076,
+        "affected_structural_updates": null,
+        "index_size_delta_bytes": null,
+        "unavailable": [
+          "index_disk_bytes",
+          "cpu_ms",
+          "peak_rss_mb",
+          "no_change_wall_ms",
+          "one_file_wall_ms"
+        ]
+      }
+    },
+    "nestjs": {
+      "wall_ms": 2979,
+      "metrics": {
+        "initial_wall_ms": 2979,
+        "no_change_wall_ms": null,
+        "one_file_wall_ms": null,
+        "cpu_ms": null,
+        "peak_rss_mb": null,
+        "index_disk_bytes": null,
+        "files_indexed": 1730,
+        "symbols": 5580,
+        "bm25_docs": 5650,
+        "vector_count": 5686,
+        "affected_structural_updates": null,
+        "index_size_delta_bytes": null,
+        "unavailable": [
+          "index_disk_bytes",
+          "cpu_ms",
+          "peak_rss_mb",
+          "no_change_wall_ms",
+          "one_file_wall_ms"
+        ]
+      }
+    },
+    "ripgrep": {
+      "wall_ms": 977,
+      "metrics": {
+        "initial_wall_ms": 977,
+        "no_change_wall_ms": null,
+        "one_file_wall_ms": null,
+        "cpu_ms": null,
+        "peak_rss_mb": null,
+        "index_disk_bytes": null,
+        "files_indexed": 110,
+        "symbols": 3602,
+        "bm25_docs": 3629,
+        "vector_count": 3627,
+        "affected_structural_updates": null,
+        "index_size_delta_bytes": null,
+        "unavailable": [
+          "index_disk_bytes",
+          "cpu_ms",
+          "peak_rss_mb",
+          "no_change_wall_ms",
+          "one_file_wall_ms"
+        ]
+      }
+    }
+  },
+  "rg_baseline": {
+    "django": {
+      "wall_ms": 4437,
+      "metrics": {
+        "initial_wall_ms": 4437,
+        "no_change_wall_ms": null,
+        "one_file_wall_ms": null,
+        "cpu_ms": null,
+        "peak_rss_mb": null,
+        "index_disk_bytes": null,
+        "files_indexed": 7084,
+        "symbols": null,
+        "bm25_docs": null,
+        "vector_count": null,
+        "affected_structural_updates": null,
+        "index_size_delta_bytes": null,
+        "unavailable": [
+          "symbols",
+          "bm25_docs",
+          "vector_count",
+          "index_disk_bytes",
+          "cpu_ms",
+          "peak_rss_mb",
+          "no_change_wall_ms",
+          "one_file_wall_ms"
+        ]
+      }
+    },
+    "gin": {
+      "wall_ms": 55,
+      "metrics": {
+        "initial_wall_ms": 55,
+        "no_change_wall_ms": null,
+        "one_file_wall_ms": null,
+        "cpu_ms": null,
+        "peak_rss_mb": null,
+        "index_disk_bytes": null,
+        "files_indexed": 130,
+        "symbols": null,
+        "bm25_docs": null,
+        "vector_count": null,
+        "affected_structural_updates": null,
+        "index_size_delta_bytes": null,
+        "unavailable": [
+          "symbols",
+          "bm25_docs",
+          "vector_count",
+          "index_disk_bytes",
+          "cpu_ms",
+          "peak_rss_mb",
+          "no_change_wall_ms",
+          "one_file_wall_ms"
+        ]
+      }
+    },
+    "lodash": {
+      "wall_ms": 57,
+      "metrics": {
+        "initial_wall_ms": 57,
+        "no_change_wall_ms": null,
+        "one_file_wall_ms": null,
+        "cpu_ms": null,
+        "peak_rss_mb": null,
+        "index_disk_bytes": null,
+        "files_indexed": 153,
+        "symbols": null,
+        "bm25_docs": null,
+        "vector_count": null,
+        "affected_structural_updates": null,
+        "index_size_delta_bytes": null,
+        "unavailable": [
+          "symbols",
+          "bm25_docs",
+          "vector_count",
+          "index_disk_bytes",
+          "cpu_ms",
+          "peak_rss_mb",
+          "no_change_wall_ms",
+          "one_file_wall_ms"
+        ]
+      }
+    },
+    "nestjs": {
+      "wall_ms": 1195,
+      "metrics": {
+        "initial_wall_ms": 1195,
+        "no_change_wall_ms": null,
+        "one_file_wall_ms": null,
+        "cpu_ms": null,
+        "peak_rss_mb": null,
+        "index_disk_bytes": null,
+        "files_indexed": 2131,
+        "symbols": null,
+        "bm25_docs": null,
+        "vector_count": null,
+        "affected_structural_updates": null,
+        "index_size_delta_bytes": null,
+        "unavailable": [
+          "symbols",
+          "bm25_docs",
+          "vector_count",
+          "index_disk_bytes",
+          "cpu_ms",
+          "peak_rss_mb",
+          "no_change_wall_ms",
+          "one_file_wall_ms"
+        ]
+      }
+    },
+    "ripgrep": {
+      "wall_ms": 138,
+      "metrics": {
+        "initial_wall_ms": 138,
+        "no_change_wall_ms": null,
+        "one_file_wall_ms": null,
+        "cpu_ms": null,
+        "peak_rss_mb": null,
+        "index_disk_bytes": null,
+        "files_indexed": 237,
+        "symbols": null,
+        "bm25_docs": null,
+        "vector_count": null,
+        "affected_structural_updates": null,
+        "index_size_delta_bytes": null,
+        "unavailable": [
+          "symbols",
+          "bm25_docs",
+          "vector_count",
+          "index_disk_bytes",
+          "cpu_ms",
+          "peak_rss_mb",
+          "no_change_wall_ms",
+          "one_file_wall_ms"
+        ]
+      }
+    }
+  }
+}
