@@ -385,3 +385,345 @@ impl HotState {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use context_index::bm25::{self};
+    use context_index::embed::{Embedder, FakeEmbedder, ModelFingerprint};
+    use context_index::structural::store::open_in_memory;
+    use context_index::structural::types::Chunk;
+    use context_index::vector;
+
+    fn make_test_bm25_conn() -> rusqlite::Connection {
+        let mut conn = open_in_memory().expect("mem db");
+        // Create 5 files with chunks of varying lengths/content for BM25 parity
+        let long_content = "long ".repeat(50);
+        let files = vec![
+            (
+                "a.py",
+                "PaymentRetryHandler payment_retry Server.Start backend/payment/retry.go",
+                "PaymentRetryHandler",
+            ),
+            ("b.py", "hello world hello", "hello"),
+            ("c.py", "hello world hello", "hello"), // tie with b.py
+            ("d.py", long_content.as_str(), "long"),
+            (
+                "e.py",
+                "snake_case and CamelCase and path-ish tokens",
+                "snake_case",
+            ),
+        ];
+        for (file, content, symbol) in files {
+            let chunk = Chunk {
+                id: format!("{}::0", file),
+                file: file.to_string(),
+                language: context_index::structural::language::Language::Python,
+                start_line: 1,
+                end_line: 2,
+                start_byte: 0,
+                end_byte: content.len(),
+                parent_symbol: Some(symbol.to_string()),
+                content_hash: blake3::hash(content.as_bytes()).to_hex().to_string(),
+                text_size_bytes: content.len(),
+            };
+            bm25::upsert_bm25_for_file(&mut conn, file, &[chunk], content).expect("upsert");
+        }
+        conn
+    }
+
+    fn assert_bm25_parity(query: &str, limit: usize) {
+        let conn = make_test_bm25_conn();
+        let cold = bm25::search_bm25(&conn, query, limit).expect("cold");
+        let hot = HotBm25::load(&conn)
+            .expect("hot")
+            .search(query, limit)
+            .expect("hot search");
+        // candidate count before top-K is not directly exposed, but we compare returned len and ordering
+        assert_eq!(
+            cold.len(),
+            hot.len(),
+            "count mismatch for query {:?}: cold {} hot {}",
+            query,
+            cold.len(),
+            hot.len()
+        );
+        for (i, (c, h)) in cold.iter().zip(hot.iter()).enumerate() {
+            assert_eq!(c.file, h.file, "file mismatch at {} for {:?}", i, query);
+            assert_eq!(
+                c.chunk_id, h.chunk_id,
+                "chunk_id mismatch at {} for {:?}",
+                i, query
+            );
+            assert_eq!(c.start_line, h.start_line, "start_line mismatch");
+            assert_eq!(c.end_line, h.end_line, "end_line mismatch");
+            let score_diff = (c.score - h.score).abs();
+            assert!(
+                score_diff < 1e-6,
+                "score mismatch at {} for {:?}: cold {} hot {} diff {}",
+                i,
+                query,
+                c.score,
+                h.score,
+                score_diff
+            );
+        }
+        // deterministic tie ordering: if scores equal, order must be same
+        // we already checked file order, so OK
+    }
+
+    #[test]
+    fn hot_bm25_parity_single_term() {
+        assert_bm25_parity("hello", 10);
+    }
+    #[test]
+    fn hot_bm25_parity_multiple_terms() {
+        assert_bm25_parity("hello world", 10);
+    }
+    #[test]
+    fn hot_bm25_parity_repeated_term() {
+        assert_bm25_parity("hello hello hello", 10);
+    }
+    #[test]
+    fn hot_bm25_parity_absent_term() {
+        assert_bm25_parity("nonexistenttermxyz", 10);
+    }
+    #[test]
+    fn hot_bm25_parity_mixed_case() {
+        assert_bm25_parity("HeLLo WoRLd", 10);
+    }
+    #[test]
+    fn hot_bm25_parity_punctuation() {
+        assert_bm25_parity("Server.Start!", 10);
+    }
+    #[test]
+    fn hot_bm25_parity_snake_case() {
+        assert_bm25_parity("payment_retry", 10);
+    }
+    #[test]
+    fn hot_bm25_parity_camel_case() {
+        assert_bm25_parity("PaymentRetryHandler", 10);
+    }
+    #[test]
+    fn hot_bm25_parity_path_tokens() {
+        assert_bm25_parity("backend/payment/retry.go", 10);
+    }
+    #[test]
+    fn hot_bm25_parity_different_lengths() {
+        // long doc should score differently but hot/cold must match
+        assert_bm25_parity("long", 10);
+    }
+    #[test]
+    fn hot_bm25_parity_tied_scores() {
+        // b.py and c.py have identical content, same score, tie should be deterministic by doc_id
+        let conn = make_test_bm25_conn();
+        let cold = bm25::search_bm25(&conn, "hello", 10).unwrap();
+        let hot = HotBm25::load(&conn).unwrap().search("hello", 10).unwrap();
+        // Both should return b.py and c.py in same order (doc_id asc)
+        assert!(cold.len() >= 2 && hot.len() >= 2);
+        assert_eq!(cold[0].score, cold[1].score, "expected tie for hello");
+        assert_eq!(hot[0].score, hot[1].score);
+        assert_eq!(cold[0].file, hot[0].file);
+        assert_eq!(cold[1].file, hot[1].file);
+    }
+    #[test]
+    fn hot_bm25_parity_topk_truncation() {
+        // limit 2 should give same top 2 as limit 10 truncated
+        let conn = make_test_bm25_conn();
+        let hot_full = HotBm25::load(&conn).unwrap();
+        let cold2 = bm25::search_bm25(&conn, "hello", 2).unwrap();
+        let hot2 = hot_full.search("hello", 2).unwrap();
+        assert_eq!(cold2.len(), 2);
+        assert_eq!(hot2.len(), 2);
+        for (c, h) in cold2.iter().zip(hot2.iter()) {
+            assert_eq!(c.file, h.file);
+            assert!((c.score - h.score).abs() < 1e-6);
+        }
+    }
+    #[test]
+    fn hot_bm25_parity_deterministic_tie() {
+        // Run same query twice, hot must be deterministic
+        let conn = make_test_bm25_conn();
+        let hot = HotBm25::load(&conn).unwrap();
+        let a = hot.search("hello", 10).unwrap();
+        let b = hot.search("hello", 10).unwrap();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.file, y.file);
+            assert_eq!(x.chunk_id, y.chunk_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn hot_vectors_parity() {
+        let mut conn = open_in_memory().unwrap();
+        let embedder = FakeEmbedder::new("test-model", 8);
+        let fp = embedder.fingerprint();
+        // Create 3 chunks with distinct content
+        let chunks = vec![
+            Chunk {
+                id: "c1".to_string(),
+                file: "a.py".to_string(),
+                language: context_index::structural::language::Language::Python,
+                start_line: 1,
+                end_line: 2,
+                start_byte: 0,
+                end_byte: 5,
+                parent_symbol: Some("foo".to_string()),
+                content_hash: "hash1".to_string(),
+                text_size_bytes: 5,
+            },
+            Chunk {
+                id: "c2".to_string(),
+                file: "b.py".to_string(),
+                language: context_index::structural::language::Language::Python,
+                start_line: 1,
+                end_line: 2,
+                start_byte: 0,
+                end_byte: 5,
+                parent_symbol: Some("bar".to_string()),
+                content_hash: "hash2".to_string(),
+                text_size_bytes: 5,
+            },
+            Chunk {
+                id: "c3".to_string(),
+                file: "c.py".to_string(),
+                language: context_index::structural::language::Language::Python,
+                start_line: 1,
+                end_line: 2,
+                start_byte: 0,
+                end_byte: 4,
+                parent_symbol: Some("baz".to_string()),
+                content_hash: "hash3".to_string(),
+                text_size_bytes: 4,
+            },
+        ];
+        // Insert files/chunks
+        for ch in &chunks {
+            conn.execute(
+                "INSERT OR IGNORE INTO files (path, hash, language) VALUES (?1, ?2, ?3)",
+                rusqlite::params![ch.file, "filehash", ch.language.as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO chunks (id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                rusqlite::params![ch.id, ch.file, ch.language.as_str(), ch.start_line as i64, ch.end_line as i64, ch.start_byte as i64, ch.end_byte as i64, ch.parent_symbol, ch.content_hash, ch.text_size_bytes as i64],
+            )
+            .unwrap();
+        }
+        // Create vectors via sync_vectors_for_file
+        let content_a = "hello";
+        let content_b = "world";
+        let content_c = "test";
+        // Use fake embedder to create vectors for distinct representations
+        // We need to create representation hashes via HotVectors load after sync
+        // For simplicity, we will directly use vector::sync_vectors_for_file to create vectors
+        vector::sync_vectors_for_file(&mut conn, "a.py", &chunks[0..1], content_a, &embedder)
+            .await
+            .unwrap();
+        vector::sync_vectors_for_file(&mut conn, "b.py", &chunks[1..2], content_b, &embedder)
+            .await
+            .unwrap();
+        vector::sync_vectors_for_file(&mut conn, "c.py", &chunks[2..3], content_c, &embedder)
+            .await
+            .unwrap();
+
+        let qvec = embedder.embed_query("hello").await.unwrap();
+        let cold = vector::search_brute(&conn, &qvec, &fp, 5).unwrap();
+        let hot = HotVectors::load(&conn, &fp).unwrap();
+        let hot_res = hot.search_brute(&qvec, 5).unwrap();
+
+        assert_eq!(cold.len(), hot_res.len(), "vector count mismatch");
+        for (c, h) in cold.iter().zip(hot_res.iter()) {
+            assert_eq!(c.file, h.file, "file mismatch");
+            assert_eq!(c.chunk_id, h.chunk_id, "chunk_id mismatch");
+            assert_eq!(c.start_line, h.start_line);
+            assert!(
+                (c.score - h.score).abs() < 1e-6,
+                "score mismatch {} vs {}",
+                c.score,
+                h.score
+            );
+        }
+        // deterministic tie: if scores equal, order file asc
+        // Run twice
+        let hot_res2 = hot.search_brute(&qvec, 5).unwrap();
+        assert_eq!(hot_res.len(), hot_res2.len());
+        for (a, b) in hot_res.iter().zip(hot_res2.iter()) {
+            assert_eq!(a.file, b.file);
+        }
+        // deletion: remove one chunk file, gc, then hot reload should not contain it
+        conn.execute("DELETE FROM chunks WHERE file='c.py'", [])
+            .unwrap();
+        let _ = vector::gc_orphaned_vectors(&conn, &fp);
+        let hot2 = HotVectors::load(&conn, &fp).unwrap();
+        let hot_res_after = hot2.search_brute(&qvec, 5).unwrap();
+        assert!(
+            !hot_res_after.iter().any(|c| c.file == "c.py"),
+            "deleted file c.py should not appear"
+        );
+        // generation/fingerprint invalidation: different fp should not hit same vectors
+        let fp2 = ModelFingerprint {
+            model_id: "other".to_string(),
+            version: "v1".to_string(),
+            dimension: 8,
+        };
+        let hot_other = HotVectors::load(&conn, &fp2).unwrap();
+        assert_eq!(
+            hot_other.count(),
+            0,
+            "different fingerprint should have 0 vectors"
+        );
+    }
+
+    #[test]
+    fn packer_parity_static_init() {
+        use context_rank::packer::{count_tokens, pack_evidence, PackOptions};
+        use context_rank::types::{Evidence, EvidenceRelation, QueryType, RetrievalSource};
+
+        let ev = Evidence {
+            source: RetrievalSource::Exact,
+            file: "a.py".into(),
+            start_line: Some(1),
+            end_line: Some(1),
+            symbol: Some("foo".into()),
+            symbol_kind: Some("function".into()),
+            text: Some("def foo(): pass".into()),
+            score: Some(1.0),
+            relation: Some(EvidenceRelation::Definition),
+            authority_score: Some(10),
+            final_score: Some(30.0),
+            provenance: Some("test".into()),
+            metadata: None,
+        };
+        let ranked = vec![ev.clone(); 5];
+        // First call initializes static BPE, second uses cached
+        let c1 = count_tokens("hello world test pack");
+        let c2 = count_tokens("hello world test pack");
+        assert_eq!(c1, c2, "token count must be deterministic with static BPE");
+        let p1 = pack_evidence(
+            &ranked,
+            "test",
+            QueryType::Symbol,
+            PackOptions {
+                budget: 1000,
+                max_files: 5,
+            },
+        );
+        let p2 = pack_evidence(
+            &ranked,
+            "test",
+            QueryType::Symbol,
+            PackOptions {
+                budget: 1000,
+                max_files: 5,
+            },
+        );
+        assert_eq!(
+            p1.token_estimate, p2.token_estimate,
+            "pack token estimate must be identical"
+        );
+        assert_eq!(p1.files, p2.files, "pack files must be identical");
+        assert_eq!(p1.markdown, p2.markdown, "pack markdown must be identical");
+    }
+}

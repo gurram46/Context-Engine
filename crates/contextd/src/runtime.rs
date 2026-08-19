@@ -384,4 +384,111 @@ mod tests {
         rt.set_last_full_verified(now);
         assert!(!rt.is_verification_expired(now));
     }
+
+    #[tokio::test]
+    async fn hot_generation_race_no_stale() {
+        let tmp = TempDir::new().unwrap();
+        let rt = RepositoryRuntime::new(tmp.path().to_path_buf()).unwrap();
+        let fp = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v".into(),
+            dimension: 8,
+        };
+        // Publish G=1 and build hot for G=1
+        let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let idx = context_index::ProjectIndex::discover(&root).unwrap();
+        rt.publish(Arc::new(idx.clone()), 1, fp.clone(), Instant::now(), true);
+        rt.tracker.acknowledge(rt.tracker.snapshot().epoch);
+        let hot_g1 = rt.get_or_load_hot(1, fp.clone()).await.expect("hot g1");
+        assert_eq!(hot_g1.generation, 1);
+        // Publish G=2 (clears hot)
+        rt.publish(Arc::new(idx), 2, fp.clone(), Instant::now(), true);
+        // Hot should be cleared
+        assert!(
+            rt.peek_hot(1, &fp).await.is_none(),
+            "hot for G=1 should not be valid after publish G=2 (cleared)"
+        );
+        assert!(
+            rt.peek_hot(2, &fp).await.is_none(),
+            "hot for G=2 not yet built"
+        );
+        // Simulate stale concurrent build for G=1 trying to write after G=2 publish
+        // Directly inject stale hot (generation 1) as if a delayed task finished
+        {
+            let mut w = rt.hot.write().unwrap();
+            *w = Some(hot_g1.clone());
+        }
+        // Now a G+1 request must NOT get stale G=1 hot
+        let peek_g2 = rt.peek_hot(2, &fp).await;
+        assert!(peek_g2.is_none(), "stale G=1 hot must not be usable at G+1");
+        // A correct G+1 request should build new hot for G=2
+        let hot_g2 = rt.get_or_load_hot(2, fp.clone()).await.expect("hot g2");
+        assert_eq!(hot_g2.generation, 2);
+        assert_ne!(hot_g1.generation, hot_g2.generation);
+        // Ensure repository generation remains G+1 (publish already set)
+        let snap = rt.current_snapshot().unwrap();
+        assert_eq!(snap.generation, 2);
+        // Stale build is discarded — active hot is G=2, not G=1
+        let active = rt.peek_hot(2, &fp).await.unwrap();
+        assert_eq!(active.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn hot_concurrent_clean_requests() {
+        let tmp = TempDir::new().unwrap();
+        let rt = Arc::new(RepositoryRuntime::new(tmp.path().to_path_buf()).unwrap());
+        let fp = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v".into(),
+            dimension: 8,
+        };
+        let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
+        let idx = context_index::ProjectIndex::discover(&root).unwrap();
+        rt.publish(Arc::new(idx), 5, fp.clone(), Instant::now(), true);
+        // Spawn 10 concurrent clean requests for same generation
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let rt_clone = Arc::clone(&rt);
+            let fp_clone = fp.clone();
+            handles.push(tokio::spawn(async move {
+                let hot = rt_clone.get_or_load_hot(5, fp_clone).await;
+                assert!(hot.is_some());
+                assert_eq!(hot.unwrap().generation, 5);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // All should have same generation, no panic, duplicate builds are performance-only
+        // Verify hot is still for G=5
+        let final_hot = rt.peek_hot(5, &fp).await.unwrap();
+        assert_eq!(final_hot.generation, 5);
+    }
+
+    #[tokio::test]
+    async fn hot_per_root_isolation() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let rt1 = RepositoryRuntime::new(tmp1.path().to_path_buf()).unwrap();
+        let rt2 = RepositoryRuntime::new(tmp2.path().to_path_buf()).unwrap();
+        let fp = ModelFingerprint {
+            model_id: "m".into(),
+            version: "v".into(),
+            dimension: 8,
+        };
+        let root1 = context_index::ProjectRoot::resolve(Some(tmp1.path())).unwrap();
+        let idx1 = context_index::ProjectIndex::discover(&root1).unwrap();
+        rt1.publish(Arc::new(idx1), 10, fp.clone(), Instant::now(), true);
+        let hot1 = rt1.get_or_load_hot(10, fp.clone()).await.unwrap();
+        assert_eq!(hot1.generation, 10);
+        // rt2 should not see rt1's hot
+        assert!(rt2.peek_hot(10, &fp).await.is_none());
+        let root2 = context_index::ProjectRoot::resolve(Some(tmp2.path())).unwrap();
+        let idx2 = context_index::ProjectIndex::discover(&root2).unwrap();
+        rt2.publish(Arc::new(idx2), 10, fp.clone(), Instant::now(), true);
+        let hot2 = rt2.get_or_load_hot(10, fp.clone()).await.unwrap();
+        assert_eq!(hot2.generation, 10);
+        // They are distinct Arc pointers (different roots)
+        assert!(!Arc::ptr_eq(&hot1, &hot2));
+    }
 }

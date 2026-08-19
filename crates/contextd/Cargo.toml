@@ -27,6 +27,7 @@ toml = { workspace = true }
 clap = { workspace = true }
 async-trait = { workspace = true }
 rusqlite = { workspace = true }
+blake3 = { workspace = true }
 
 [features]
 legacy-v2 = []
