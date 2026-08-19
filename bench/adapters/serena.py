@@ -47,10 +47,23 @@ class _SerenaClient:
         self._lock=threading.Lock()
         threading.Thread(target=self._reader, daemon=True).start()
         threading.Thread(target=self._err, daemon=True).start()
-        self._initialize()
-        # warm: wait for LSP ready (already indexed)
-        time.sleep(1)
-        self.pid=self.proc.pid
+        try:
+            self._initialize()
+            time.sleep(1)
+            self.pid=self.proc.pid
+        except Exception:
+            try:
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+            except: pass
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+            except: pass
+            try:
+                self.proc.kill()
+            except: pass
+            raise
 
     def _reader(self):
         for line in iter(self.proc.stdout.readline,""):
