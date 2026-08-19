@@ -26,6 +26,8 @@ from .interface import BenchmarkAdapter, IndexingMetrics, SearchHit, SearchResul
 ENGINE_EXCLUDES = [
     ".git",
     ".context",
+    ".opencode",
+    ".codebase-index",
     "node_modules",
     "dist",
     "build",
@@ -166,9 +168,15 @@ class RgBaselineAdapter(BenchmarkAdapter):
                 if h["file"] not in [x["file"] for x in top_hits]:
                     top_hits.append(h)
 
-        # Token counts: simple whitespace split on text
-        def tok(s: str) -> int:
-            return len(s.split())
+        # Token counts: common cl100k (same as CE) — fixed from whitespace
+        try:
+            import tiktoken
+            _enc = tiktoken.get_encoding("cl100k_base")
+            def tok(s: str) -> int:
+                return len(_enc.encode(s or ""))
+        except:
+            def tok(s: str) -> int:
+                return len((s or "").split())
 
         candidate_tokens = sum(tok(h["text"]) for h in deduped) if deduped else 0
         packed_tokens = sum(tok(h["text"]) for h in top_hits) if top_hits else 0
