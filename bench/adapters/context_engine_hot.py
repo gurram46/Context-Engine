@@ -163,7 +163,7 @@ class _McpClient:
                     "capabilities": {},
                     "clientInfo": {"name": "bench-hot", "version": "0.1.0"},
                 },
-                timeout=10,
+                timeout=60,
             )
         except Exception as e:
             # try fallback with 2025 version?

@@ -88,6 +88,35 @@ pub struct PipelineStats {
     pub reconcile_calls: Option<u32>,
     #[serde(default)]
     pub runtime_state: Option<String>,
+    // E3 hot retrieval telemetry — per-stage breakdown, Option<null> when not measured
+    #[serde(default)]
+    pub runtime_access_ms: Option<u128>,
+    #[serde(default)]
+    pub graph_ms: Option<u128>,
+    #[serde(default)]
+    pub test_ms: Option<u128>,
+    #[serde(default)]
+    pub sqlite_open_ms: Option<u128>,
+    #[serde(default)]
+    pub sqlite_open_calls: Option<usize>,
+    #[serde(default)]
+    pub sqlite_query_ms: Option<u128>,
+    #[serde(default)]
+    pub vector_load_ms: Option<u128>,
+    #[serde(default)]
+    pub vector_scan_ms: Option<u128>,
+    #[serde(default)]
+    pub filesystem_ms: Option<u128>,
+    #[serde(default)]
+    pub files_read: Option<usize>,
+    #[serde(default)]
+    pub query_embedding_cache_hit: Option<bool>,
+    #[serde(default)]
+    pub result_cache_hit: Option<bool>,
+    #[serde(default)]
+    pub total_internal_ms: Option<u128>,
+    #[serde(default)]
+    pub wall_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +297,7 @@ pub async fn retrieve_context(
     _providers: &Providers,
     budget_tokens: usize,
     max_results: usize,
+    hot: Option<std::sync::Arc<crate::hot::HotState>>,
 ) -> Result<ContextResult, anyhow::Error> {
     let t0 = Instant::now();
     let classified = classify_query(query);
@@ -295,6 +325,13 @@ pub async fn retrieve_context(
 
     let mut candidates: Vec<Evidence> = Vec::new();
     let mut retrievers_used = Vec::new();
+    // E3 telemetry accumulators — per query, truthful, bounded
+    let mut sqlite_open_ms: u128 = 0;
+    let mut sqlite_open_calls: usize = 0;
+    let mut sqlite_query_ms: u128 = 0;
+    let mut filesystem_ms: u128 = 0;
+    let mut files_read: usize = 0;
+    let mut query_embedding_cache_hit: Option<bool> = None;
 
     // Rust exact
     let t_exact = Instant::now();
@@ -333,13 +370,22 @@ pub async fn retrieve_context(
     let exact_ms = t_exact.elapsed().as_millis();
 
     // Native Rust structural symbol candidates (R3)
-    let t_struct = Instant::now();
+    let t_struct_sym = Instant::now();
     for sym in &plan.symbol_queries {
         let mut added = 0usize;
+        let t_open = Instant::now();
         let conn = structural_store::open_db_async(project.root.clone()).await?;
-        if let Ok(defs) = structural_store::find_definitions(&conn, sym) {
+        sqlite_open_ms += t_open.elapsed().as_millis();
+        sqlite_open_calls += 1;
+        let t_q = Instant::now();
+        let defs_res = structural_store::find_definitions(&conn, sym);
+        sqlite_query_ms += t_q.elapsed().as_millis();
+        if let Ok(defs) = defs_res {
             for def in defs.iter().take(5) {
+                let t_fs = Instant::now();
                 let text = load_symbol_snippet(&project.root, def).await;
+                filesystem_ms += t_fs.elapsed().as_millis();
+                files_read += 1;
                 candidates.push(Evidence {
                     source: context_rank::types::RetrievalSource::Symbol,
                     file: def.file.clone(),
@@ -359,9 +405,15 @@ pub async fn retrieve_context(
             }
         }
         if added == 0 {
-            if let Ok(pref) = structural_store::find_symbol_prefix(&conn, sym) {
+            let t_q2 = Instant::now();
+            let pref_res = structural_store::find_symbol_prefix(&conn, sym);
+            sqlite_query_ms += t_q2.elapsed().as_millis();
+            if let Ok(pref) = pref_res {
                 for def in pref.iter().take(5) {
+                    let t_fs = Instant::now();
                     let text = load_symbol_snippet(&project.root, def).await;
+                    filesystem_ms += t_fs.elapsed().as_millis();
+                    files_read += 1;
                     candidates.push(Evidence {
                         source: context_rank::types::RetrievalSource::Symbol,
                         file: def.file.clone(),
@@ -383,14 +435,22 @@ pub async fn retrieve_context(
         }
         retrievers_used.push(format!("rust-symbol:{}:{}", sym, added));
     }
+    let structural_sym_ms = t_struct_sym.elapsed().as_millis();
 
     // Native Rust structural graph — dedup same callsite across short+qualified queries
+    let t_graph = Instant::now();
     let mut seen_graph: std::collections::HashSet<String> = std::collections::HashSet::new();
     for gq in &plan.graph_queries {
         let mut added = 0usize;
+        let t_open = Instant::now();
         let conn = structural_store::open_db_async(project.root.clone()).await?;
+        sqlite_open_ms += t_open.elapsed().as_millis();
+        sqlite_open_calls += 1;
         if gq.direction == "callers" || gq.direction == "both" {
-            if let Ok(callers) = structural_store::find_callers(&conn, &gq.symbol) {
+            let t_q = Instant::now();
+            let callers_res = structural_store::find_callers(&conn, &gq.symbol);
+            sqlite_query_ms += t_q.elapsed().as_millis();
+            if let Ok(callers) = callers_res {
                 for edge in callers.iter().take(50) {
                     let target = edge
                         .resolved_symbol_id
@@ -400,6 +460,7 @@ pub async fn retrieve_context(
                     if !seen_graph.insert(graph_key.clone()) {
                         continue;
                     }
+                    let t_q2 = Instant::now();
                     let caller_sym = if edge.caller_symbol_id.is_empty() {
                         None
                     } else {
@@ -407,10 +468,19 @@ pub async fn retrieve_context(
                             .ok()
                             .flatten()
                     };
+                    sqlite_query_ms += t_q2.elapsed().as_millis();
                     let text = if let Some(s) = caller_sym.as_ref() {
-                        Some(load_symbol_snippet(&project.root, s).await)
+                        let t_fs = Instant::now();
+                        let txt = load_symbol_snippet(&project.root, s).await;
+                        filesystem_ms += t_fs.elapsed().as_millis();
+                        files_read += 1;
+                        Some(txt)
                     } else {
-                        load_file_snippet(&project.root, &edge.file, edge.line).await
+                        let t_fs = Instant::now();
+                        let txt = load_file_snippet(&project.root, &edge.file, edge.line).await;
+                        filesystem_ms += t_fs.elapsed().as_millis();
+                        files_read += 1;
+                        txt
                     };
                     candidates.push(Evidence {
                         source: context_rank::types::RetrievalSource::Graph,
@@ -440,7 +510,10 @@ pub async fn retrieve_context(
             }
         }
         if gq.direction == "callees" || gq.direction == "both" {
-            if let Ok(callees) = structural_store::find_callees(&conn, &gq.symbol) {
+            let t_q = Instant::now();
+            let callees_res = structural_store::find_callees(&conn, &gq.symbol);
+            sqlite_query_ms += t_q.elapsed().as_millis();
+            if let Ok(callees) = callees_res {
                 for edge in callees.iter().take(20) {
                     let target = edge
                         .resolved_symbol_id
@@ -453,6 +526,7 @@ pub async fn retrieve_context(
                     if !seen_graph.insert(graph_key.clone()) {
                         continue;
                     }
+                    let t_q2 = Instant::now();
                     let callee_sym = edge
                         .resolved_symbol_id
                         .as_deref()
@@ -466,8 +540,12 @@ pub async fn retrieve_context(
                                 .ok()
                                 .and_then(|v| v.into_iter().next())
                         });
+                    sqlite_query_ms += t_q2.elapsed().as_millis();
                     if let Some(sym) = callee_sym {
+                        let t_fs = Instant::now();
                         let text = load_symbol_snippet(&project.root, &sym).await;
+                        filesystem_ms += t_fs.elapsed().as_millis();
+                        files_read += 1;
                         candidates.push(Evidence {
                             source: context_rank::types::RetrievalSource::Graph,
                             file: sym.file.clone(),
@@ -492,6 +570,10 @@ pub async fn retrieve_context(
                         });
                         added += 1;
                     } else {
+                        let t_fs = Instant::now();
+                        let txt = load_file_snippet(&project.root, &edge.file, edge.line).await;
+                        filesystem_ms += t_fs.elapsed().as_millis();
+                        files_read += 1;
                         candidates.push(Evidence {
                             source: context_rank::types::RetrievalSource::Graph,
                             file: edge.file.clone(),
@@ -499,7 +581,7 @@ pub async fn retrieve_context(
                             end_line: Some(edge.line),
                             symbol: Some(edge.callee_name.clone()),
                             symbol_kind: None,
-                            text: load_file_snippet(&project.root, &edge.file, edge.line).await,
+                            text: txt,
                             score: Some(0.6),
                             relation: Some(context_rank::types::EvidenceRelation::Callee),
                             authority_score: None,
@@ -514,14 +596,25 @@ pub async fn retrieve_context(
         }
         retrievers_used.push(format!("rust-graph:{}:{}", gq.symbol, added));
     }
+    let graph_ms_val = t_graph.elapsed().as_millis();
 
     // Native Rust structural test lookup
+    let t_test = Instant::now();
     for tq in &plan.test_queries {
         let mut added = 0usize;
+        let t_open = Instant::now();
         let conn = structural_store::open_db_async(project.root.clone()).await?;
-        if let Ok(tests) = structural_store::find_tests_related(&conn, tq) {
+        sqlite_open_ms += t_open.elapsed().as_millis();
+        sqlite_open_calls += 1;
+        let t_q = Instant::now();
+        let tests_res = structural_store::find_tests_related(&conn, tq);
+        sqlite_query_ms += t_q.elapsed().as_millis();
+        if let Ok(tests) = tests_res {
             for sym in tests.iter().take(5) {
+                let t_fs = Instant::now();
                 let text = load_symbol_snippet(&project.root, sym).await;
+                filesystem_ms += t_fs.elapsed().as_millis();
+                files_read += 1;
                 candidates.push(Evidence {
                     source: context_rank::types::RetrievalSource::Test,
                     file: sym.file.clone(),
@@ -605,25 +698,29 @@ pub async fn retrieve_context(
         }
         // Source-local inline tests: symbol def file itself contains structural test symbols (same file)
         if added == 0 {
-            if let Ok(defs) = structural_store::find_definitions(&conn, tq) {
+            let t_q2 = Instant::now();
+            let defs_inline = structural_store::find_definitions(&conn, tq);
+            sqlite_query_ms += t_q2.elapsed().as_millis();
+            if let Ok(defs) = defs_inline {
                 for def in defs.iter().take(2) {
                     let file = &def.file;
-                    let has_inline =
-                        if let Ok(syms) = structural_store::load_symbols_for_file(&conn, file) {
-                            syms.iter().any(|s| {
-                                let n = s.name.to_lowercase();
-                                let q = s.qualified_name.to_lowercase();
-                                // precise: only tests/test/test_ prefix, not broad contains (avoids contest/latest/testament)
-                                n == "tests"
-                                    || n == "test"
-                                    || n.starts_with("test_")
-                                    || q == "tests"
-                                    || q == "test"
-                                    || q.starts_with("test_")
-                            })
-                        } else {
-                            false
-                        };
+                    let t_q3 = Instant::now();
+                    let syms_res = structural_store::load_symbols_for_file(&conn, file);
+                    sqlite_query_ms += t_q3.elapsed().as_millis();
+                    let has_inline = if let Ok(syms) = syms_res {
+                        syms.iter().any(|s| {
+                            let n = s.name.to_lowercase();
+                            let q = s.qualified_name.to_lowercase();
+                            n == "tests"
+                                || n == "test"
+                                || n.starts_with("test_")
+                                || q == "tests"
+                                || q == "test"
+                                || q.starts_with("test_")
+                        })
+                    } else {
+                        false
+                    };
                     if has_inline {
                         candidates.push(Evidence {
                             source: context_rank::types::RetrievalSource::Test,
@@ -650,7 +747,10 @@ pub async fn retrieve_context(
         }
         retrievers_used.push(format!("rust-test:{}:{}", tq, added));
     }
-    let structural_ms = t_struct.elapsed().as_millis();
+    let test_ms_val = t_test.elapsed().as_millis();
+    let structural_ms = structural_sym_ms;
+    let graph_ms = graph_ms_val;
+    let test_ms = test_ms_val;
 
     // Determine sufficiency before heavy retrieval
     let suff = sufficiency(classified.query_type, &candidates, query);
@@ -679,11 +779,11 @@ pub async fn retrieve_context(
     let semantic_embed_ms: Option<u128>;
     let semantic_search_ms: Option<u128>;
     let mut vector_count_scanned: Option<usize> = None;
+    let mut hot_vector_used = false;
 
-    // BM25 native — for SYMBOL/DEPENDENCY insufficient, fallback to raw query if no semantic_queries
+    // BM25 native — hot path uses in-memory HotBm25 when available, else SQLite fallback
     if run_bm25 {
         let t_bm25 = Instant::now();
-        let conn = structural_store::open_db_async(project.root.clone()).await?;
         let bm25_queries: Vec<String> = if !plan.semantic_queries.is_empty() {
             plan.semantic_queries.clone()
         } else if classified.query_type == QueryType::Symbol
@@ -693,71 +793,161 @@ pub async fn retrieve_context(
         } else {
             vec![]
         };
-        for sq in &bm25_queries {
-            match context_index::bm25::search_bm25(&conn, sq, 10) {
-                Ok(results) => {
-                    for (rank, bm) in results.into_iter().enumerate() {
-                        let text = load_chunk_snippet(&project.root, &bm).await;
-                        let ev = Evidence {
-                            source: context_rank::types::RetrievalSource::Bm25,
-                            file: bm.file.clone(),
-                            start_line: Some(bm.start_line),
-                            end_line: Some(bm.end_line),
-                            symbol: bm.symbol.clone(),
-                            symbol_kind: None,
-                            text: Some(text),
-                            score: Some(bm.score),
-                            relation: Some(context_rank::types::EvidenceRelation::Unknown),
-                            authority_score: None,
-                            final_score: None,
-                            provenance: Some("rust:bm25".into()),
-                            metadata: None,
-                        };
-                        bm25_candidates.push((ev, rank + 1, bm.score));
-                    }
-                    retrievers_used.push(format!(
-                        "rust-bm25:{}:{}",
-                        sq.chars().take(15).collect::<String>(),
-                        bm25_candidates.len()
-                    ));
-                    break; // only first semantic query for BM25
-                }
-                Err(e) => {
-                    tracing::debug!(error=%e, "bm25 search failed");
-                    retrievers_used.push("rust-bm25:0".into());
-                }
-            }
-        }
-        // Also BM25 for test queries if needed
-        if bm25_candidates.is_empty() && !plan.test_queries.is_empty() {
-            for tq in &plan.test_queries {
-                if let Ok(res) = context_index::bm25::search_bm25(&conn, tq, 5) {
-                    for (rank, bm) in res.into_iter().enumerate() {
-                        let text = load_chunk_snippet(&project.root, &bm).await;
-                        let ev = Evidence {
-                            source: context_rank::types::RetrievalSource::Bm25,
-                            file: bm.file.clone(),
-                            start_line: Some(bm.start_line),
-                            end_line: Some(bm.end_line),
-                            symbol: bm.symbol.clone(),
-                            symbol_kind: None,
-                            text: Some(text),
-                            score: Some(bm.score),
-                            relation: Some(context_rank::types::EvidenceRelation::Test),
-                            authority_score: None,
-                            final_score: None,
-                            provenance: Some("rust:bm25".into()),
-                            metadata: None,
-                        };
-                        bm25_candidates.push((ev, rank + 1, bm.score));
-                    }
-                    if !bm25_candidates.is_empty() {
+        if let Some(hot_state) = hot.clone() {
+            // Hot BM25 in-memory search — no SQLite open, no sqlite query
+            for sq in &bm25_queries {
+                match hot_state.bm25.search(sq, 10) {
+                    Ok(results) => {
+                        for (rank, bm) in results.into_iter().enumerate() {
+                            let t_fs = Instant::now();
+                            let text = load_chunk_snippet(&project.root, &bm).await;
+                            filesystem_ms += t_fs.elapsed().as_millis();
+                            files_read += 1;
+                            let ev = Evidence {
+                                source: context_rank::types::RetrievalSource::Bm25,
+                                file: bm.file.clone(),
+                                start_line: Some(bm.start_line),
+                                end_line: Some(bm.end_line),
+                                symbol: bm.symbol.clone(),
+                                symbol_kind: None,
+                                text: Some(text),
+                                score: Some(bm.score),
+                                relation: Some(context_rank::types::EvidenceRelation::Unknown),
+                                authority_score: None,
+                                final_score: None,
+                                provenance: Some("hot:bm25".into()),
+                                metadata: None,
+                            };
+                            bm25_candidates.push((ev, rank + 1, bm.score));
+                        }
+                        retrievers_used.push(format!(
+                            "hot-bm25:{}:{}",
+                            sq.chars().take(15).collect::<String>(),
+                            bm25_candidates.len()
+                        ));
                         break;
                     }
+                    Err(e) => {
+                        tracing::debug!(error=%e, "hot bm25 search failed");
+                        retrievers_used.push("hot-bm25:0".into());
+                    }
                 }
             }
+            if bm25_candidates.is_empty() && !plan.test_queries.is_empty() {
+                for tq in &plan.test_queries {
+                    if let Ok(res) = hot_state.bm25.search(tq, 5) {
+                        for (rank, bm) in res.into_iter().enumerate() {
+                            let t_fs = Instant::now();
+                            let text = load_chunk_snippet(&project.root, &bm).await;
+                            filesystem_ms += t_fs.elapsed().as_millis();
+                            files_read += 1;
+                            let ev = Evidence {
+                                source: context_rank::types::RetrievalSource::Bm25,
+                                file: bm.file.clone(),
+                                start_line: Some(bm.start_line),
+                                end_line: Some(bm.end_line),
+                                symbol: bm.symbol.clone(),
+                                symbol_kind: None,
+                                text: Some(text),
+                                score: Some(bm.score),
+                                relation: Some(context_rank::types::EvidenceRelation::Test),
+                                authority_score: None,
+                                final_score: None,
+                                provenance: Some("hot:bm25".into()),
+                                metadata: None,
+                            };
+                            bm25_candidates.push((ev, rank + 1, bm.score));
+                        }
+                        if !bm25_candidates.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+            bm25_ms = t_bm25.elapsed().as_millis();
+        } else {
+            // Fallback: SQLite BM25 (cold or hot not yet built)
+            let t_open = Instant::now();
+            let conn = structural_store::open_db_async(project.root.clone()).await?;
+            sqlite_open_ms += t_open.elapsed().as_millis();
+            sqlite_open_calls += 1;
+            for sq in &bm25_queries {
+                let t_q = Instant::now();
+                let bm_res = context_index::bm25::search_bm25(&conn, sq, 10);
+                sqlite_query_ms += t_q.elapsed().as_millis();
+                match bm_res {
+                    Ok(results) => {
+                        for (rank, bm) in results.into_iter().enumerate() {
+                            let t_fs = Instant::now();
+                            let text = load_chunk_snippet(&project.root, &bm).await;
+                            filesystem_ms += t_fs.elapsed().as_millis();
+                            files_read += 1;
+                            let ev = Evidence {
+                                source: context_rank::types::RetrievalSource::Bm25,
+                                file: bm.file.clone(),
+                                start_line: Some(bm.start_line),
+                                end_line: Some(bm.end_line),
+                                symbol: bm.symbol.clone(),
+                                symbol_kind: None,
+                                text: Some(text),
+                                score: Some(bm.score),
+                                relation: Some(context_rank::types::EvidenceRelation::Unknown),
+                                authority_score: None,
+                                final_score: None,
+                                provenance: Some("rust:bm25".into()),
+                                metadata: None,
+                            };
+                            bm25_candidates.push((ev, rank + 1, bm.score));
+                        }
+                        retrievers_used.push(format!(
+                            "rust-bm25:{}:{}",
+                            sq.chars().take(15).collect::<String>(),
+                            bm25_candidates.len()
+                        ));
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(error=%e, "bm25 search failed");
+                        retrievers_used.push("rust-bm25:0".into());
+                    }
+                }
+            }
+            if bm25_candidates.is_empty() && !plan.test_queries.is_empty() {
+                for tq in &plan.test_queries {
+                    let t_q = Instant::now();
+                    let bm_res2 = context_index::bm25::search_bm25(&conn, tq, 5);
+                    sqlite_query_ms += t_q.elapsed().as_millis();
+                    if let Ok(res) = bm_res2 {
+                        for (rank, bm) in res.into_iter().enumerate() {
+                            let t_fs = Instant::now();
+                            let text = load_chunk_snippet(&project.root, &bm).await;
+                            filesystem_ms += t_fs.elapsed().as_millis();
+                            files_read += 1;
+                            let ev = Evidence {
+                                source: context_rank::types::RetrievalSource::Bm25,
+                                file: bm.file.clone(),
+                                start_line: Some(bm.start_line),
+                                end_line: Some(bm.end_line),
+                                symbol: bm.symbol.clone(),
+                                symbol_kind: None,
+                                text: Some(text),
+                                score: Some(bm.score),
+                                relation: Some(context_rank::types::EvidenceRelation::Test),
+                                authority_score: None,
+                                final_score: None,
+                                provenance: Some("rust:bm25".into()),
+                                metadata: None,
+                            };
+                            bm25_candidates.push((ev, rank + 1, bm.score));
+                        }
+                        if !bm25_candidates.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+            bm25_ms = t_bm25.elapsed().as_millis();
         }
-        bm25_ms = t_bm25.elapsed().as_millis();
     } else {
         retrievers_used.push("rust-bm25:skipped".into());
     }
@@ -774,6 +964,7 @@ pub async fn retrieve_context(
             semantic_embed_ms = Some(0);
             semantic_search_ms = Some(0);
             vector_count_scanned = None;
+            query_embedding_cache_hit = None;
         } else {
             let t_sem = Instant::now();
             let mut total_embed: u128 = 0;
@@ -782,9 +973,21 @@ pub async fn retrieve_context(
             let embedder: std::sync::Arc<dyn context_index::embed::Embedder> =
                 std::sync::Arc::new(context_index::embed::configured_embedder());
             let fp = embedder.fingerprint();
-            // Check model change invalidation
-            let conn = structural_store::open_db_async(project.root.clone()).await?;
-            let _ = context_index::vector::invalidate_stale_model(&conn, &fp);
+            let hot_vec_opt = hot.clone().and_then(|h| h.vectors.clone());
+            let use_hot_vec = hot_vec_opt
+                .as_ref()
+                .map(|hv| hv.fingerprint() == &fp && hv.count() > 0)
+                .unwrap_or(false);
+            // Check model change invalidation only for cold path
+            if !use_hot_vec {
+                let t_open = Instant::now();
+                let conn = structural_store::open_db_async(project.root.clone()).await?;
+                sqlite_open_ms += t_open.elapsed().as_millis();
+                sqlite_open_calls += 1;
+                let t_q = Instant::now();
+                let _ = context_index::vector::invalidate_stale_model(&conn, &fp);
+                sqlite_query_ms += t_q.elapsed().as_millis();
+            }
             let semantic_queries: Vec<String> = if !plan.semantic_queries.is_empty() {
                 plan.semantic_queries.clone()
             } else if classified.query_type == QueryType::Symbol
@@ -798,17 +1001,17 @@ pub async fn retrieve_context(
                 let q = sq.clone();
                 // Embed query without holding DB connection (Connection is !Send)
                 let t_embed = Instant::now();
-                let qvec = {
+                let (qvec, was_cached) = {
                     let cached = context_index::embed::QUERY_CACHE.get(&fp, &q).await;
                     if let Some(v) = cached {
-                        v
+                        (v, true)
                     } else {
                         match embedder.embed_query(&q).await {
                             Ok(v) => {
                                 context_index::embed::QUERY_CACHE
                                     .insert(&fp, &q, v.clone())
                                     .await;
-                                v
+                                (v, false)
                             }
                             Err(e) => {
                                 tracing::debug!(error=%e, "query embed failed");
@@ -818,65 +1021,144 @@ pub async fn retrieve_context(
                         }
                     }
                 };
+                if query_embedding_cache_hit.is_none() {
+                    query_embedding_cache_hit = Some(was_cached);
+                } else if was_cached {
+                    query_embedding_cache_hit = Some(true);
+                }
                 total_embed = total_embed.saturating_add(t_embed.elapsed().as_millis());
-                // Now open DB for brute search (moved off async executor thread)
-                let conn = structural_store::open_db_async(project.root.clone()).await?;
-                let cnt = context_index::vector::count_vectors(&conn, &fp).unwrap_or(0);
-                if cnt == 0 {
-                    tracing::debug!("no vectors for model {}, skipping semantic", fp.model_id);
-                    retrievers_used.push(format!("rust-semantic:0:{}", fp.model_id));
-                    vector_count_scanned = Some(0);
-                    continue;
-                }
-                if vector_count_scanned.is_none() {
-                    vector_count_scanned = Some(cnt as usize);
-                } else {
-                    // keep max
-                    vector_count_scanned = Some(vector_count_scanned.unwrap().max(cnt as usize));
-                }
-                let t_search = Instant::now();
-                match context_index::vector::search_brute(
-                    &conn,
-                    &qvec,
-                    &fp,
-                    context_index::vector::SEMANTIC_CANDIDATE_K,
-                ) {
-                    Ok(results) => {
-                        for (rank, vc) in results.into_iter().enumerate() {
-                            let text = load_file_snippet(&project.root, &vc.file, vc.start_line)
-                                .await
-                                .unwrap_or_else(|| {
-                                    format!("{} {}", vc.file, vc.symbol.clone().unwrap_or_default())
-                                });
-                            let ev = Evidence {
-                                source: context_rank::types::RetrievalSource::Semantic,
-                                file: vc.file.clone(),
-                                start_line: Some(vc.start_line),
-                                end_line: Some(vc.end_line),
-                                symbol: vc.symbol.clone(),
-                                symbol_kind: None,
-                                text: Some(text),
-                                score: Some(vc.score),
-                                relation: Some(context_rank::types::EvidenceRelation::Unknown),
-                                authority_score: None,
-                                final_score: None,
-                                provenance: Some("rust:semantic".into()),
-                                metadata: None,
-                            };
-                            vector_candidates.push((ev, rank + 1, vc.score));
-                        }
-                        retrievers_used.push(format!(
-                            "rust-semantic:{}:{}",
-                            q.chars().take(15).collect::<String>(),
-                            vector_candidates.len()
-                        ));
-                        total_search = total_search.saturating_add(t_search.elapsed().as_millis());
-                        break;
+                if use_hot_vec {
+                    let hv = hot_vec_opt.as_ref().unwrap();
+                    let cnt = hv.count();
+                    if vector_count_scanned.is_none() {
+                        vector_count_scanned = Some(cnt);
+                    } else {
+                        vector_count_scanned = Some(vector_count_scanned.unwrap().max(cnt));
                     }
-                    Err(e) => {
-                        tracing::debug!(error=%e, "vector search failed");
-                        retrievers_used.push("rust-semantic:0".into());
-                        total_search = total_search.saturating_add(t_search.elapsed().as_millis());
+                    let t_search = Instant::now();
+                    let search_res =
+                        hv.search_brute(&qvec, context_index::vector::SEMANTIC_CANDIDATE_K);
+                    total_search = total_search.saturating_add(t_search.elapsed().as_millis());
+                    hot_vector_used = true;
+                    match search_res {
+                        Ok(results) => {
+                            for (rank, vc) in results.into_iter().enumerate() {
+                                let t_fs = Instant::now();
+                                let text =
+                                    load_file_snippet(&project.root, &vc.file, vc.start_line)
+                                        .await
+                                        .unwrap_or_else(|| {
+                                            format!(
+                                                "{} {}",
+                                                vc.file,
+                                                vc.symbol.clone().unwrap_or_default()
+                                            )
+                                        });
+                                filesystem_ms += t_fs.elapsed().as_millis();
+                                files_read += 1;
+                                let ev = Evidence {
+                                    source: context_rank::types::RetrievalSource::Semantic,
+                                    file: vc.file.clone(),
+                                    start_line: Some(vc.start_line),
+                                    end_line: Some(vc.end_line),
+                                    symbol: vc.symbol.clone(),
+                                    symbol_kind: None,
+                                    text: Some(text),
+                                    score: Some(vc.score),
+                                    relation: Some(context_rank::types::EvidenceRelation::Unknown),
+                                    authority_score: None,
+                                    final_score: None,
+                                    provenance: Some("hot:semantic".into()),
+                                    metadata: None,
+                                };
+                                vector_candidates.push((ev, rank + 1, vc.score));
+                            }
+                            retrievers_used.push(format!(
+                                "hot-semantic:{}:{}",
+                                q.chars().take(15).collect::<String>(),
+                                vector_candidates.len()
+                            ));
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::debug!(error=%e, "hot vector search failed");
+                            retrievers_used.push("hot-semantic:0".into());
+                        }
+                    }
+                } else {
+                    // Cold path: SQLite vectors
+                    let t_open2 = Instant::now();
+                    let conn = structural_store::open_db_async(project.root.clone()).await?;
+                    sqlite_open_ms += t_open2.elapsed().as_millis();
+                    sqlite_open_calls += 1;
+                    let t_cnt = Instant::now();
+                    let cnt = context_index::vector::count_vectors(&conn, &fp).unwrap_or(0);
+                    sqlite_query_ms += t_cnt.elapsed().as_millis();
+                    if cnt == 0 {
+                        tracing::debug!("no vectors for model {}, skipping semantic", fp.model_id);
+                        retrievers_used.push(format!("rust-semantic:0:{}", fp.model_id));
+                        vector_count_scanned = Some(0);
+                        continue;
+                    }
+                    if vector_count_scanned.is_none() {
+                        vector_count_scanned = Some(cnt as usize);
+                    } else {
+                        vector_count_scanned =
+                            Some(vector_count_scanned.unwrap().max(cnt as usize));
+                    }
+                    let t_search = Instant::now();
+                    let search_res = context_index::vector::search_brute(
+                        &conn,
+                        &qvec,
+                        &fp,
+                        context_index::vector::SEMANTIC_CANDIDATE_K,
+                    );
+                    sqlite_query_ms += t_search.elapsed().as_millis();
+                    total_search = total_search.saturating_add(t_search.elapsed().as_millis());
+                    match search_res {
+                        Ok(results) => {
+                            for (rank, vc) in results.into_iter().enumerate() {
+                                let t_fs = Instant::now();
+                                let text =
+                                    load_file_snippet(&project.root, &vc.file, vc.start_line)
+                                        .await
+                                        .unwrap_or_else(|| {
+                                            format!(
+                                                "{} {}",
+                                                vc.file,
+                                                vc.symbol.clone().unwrap_or_default()
+                                            )
+                                        });
+                                filesystem_ms += t_fs.elapsed().as_millis();
+                                files_read += 1;
+                                let ev = Evidence {
+                                    source: context_rank::types::RetrievalSource::Semantic,
+                                    file: vc.file.clone(),
+                                    start_line: Some(vc.start_line),
+                                    end_line: Some(vc.end_line),
+                                    symbol: vc.symbol.clone(),
+                                    symbol_kind: None,
+                                    text: Some(text),
+                                    score: Some(vc.score),
+                                    relation: Some(context_rank::types::EvidenceRelation::Unknown),
+                                    authority_score: None,
+                                    final_score: None,
+                                    provenance: Some("rust:semantic".into()),
+                                    metadata: None,
+                                };
+                                vector_candidates.push((ev, rank + 1, vc.score));
+                            }
+                            retrievers_used.push(format!(
+                                "rust-semantic:{}:{}",
+                                q.chars().take(15).collect::<String>(),
+                                vector_candidates.len()
+                            ));
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::debug!(error=%e, "vector search failed");
+                            retrievers_used.push("rust-semantic:0".into());
+                        }
                     }
                 }
             }
@@ -1001,6 +1283,8 @@ pub async fn retrieve_context(
     let pack_ms = t_pack.elapsed().as_millis();
 
     let elapsed_ms = t0.elapsed().as_millis();
+    // E3: query embedding cache hit collapses to bool if any semantic query was cached
+    let q_cache_hit = query_embedding_cache_hit;
 
     let candidate_count = fused.ranked.len() + fused.deduped + fused.collapsed;
     let stats = PipelineStats {
@@ -1016,8 +1300,14 @@ pub async fn retrieve_context(
                 format!("pack:{}", pack_ms),
                 format!("exact_ms:{}", exact_ms),
                 format!("structural_ms:{}", structural_ms),
+                format!("graph_ms:{}", graph_ms),
+                format!("test_ms:{}", test_ms),
                 format!("bm25_ms:{}", bm25_ms),
                 format!("semantic_ms:{}", semantic_ms),
+                format!("sqlite_open_ms:{}", sqlite_open_ms),
+                format!("sqlite_query_ms:{}", sqlite_query_ms),
+                format!("filesystem_ms:{}", filesystem_ms),
+                format!("files_read:{}", files_read),
             ])
             .collect(),
         elapsed_ms,
@@ -1037,11 +1327,29 @@ pub async fn retrieve_context(
         generation: None,
         dirty_file_count: None,
         vector_count_scanned,
-        cache_hit: None,
+        cache_hit: q_cache_hit,
         reconcile_skipped: None,
         discovery_calls: None,
         reconcile_calls: None,
         runtime_state: None,
+        runtime_access_ms: None,
+        graph_ms: Some(graph_ms),
+        test_ms: Some(test_ms),
+        sqlite_open_ms: Some(sqlite_open_ms),
+        sqlite_open_calls: Some(sqlite_open_calls),
+        sqlite_query_ms: Some(sqlite_query_ms),
+        vector_load_ms: None,
+        vector_scan_ms: if hot_vector_used {
+            semantic_search_ms
+        } else {
+            None
+        },
+        filesystem_ms: Some(filesystem_ms),
+        files_read: Some(files_read),
+        query_embedding_cache_hit: q_cache_hit,
+        result_cache_hit: None,
+        total_internal_ms: Some(elapsed_ms),
+        wall_ms: None,
     };
 
     Ok(ContextResult {

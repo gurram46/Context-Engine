@@ -3,17 +3,10 @@ use std::collections::{HashMap, HashSet};
 
 /// Count tokens using tiktoken cl100k_base (gpt-4). Fallback to chars/4.
 pub fn count_tokens(text: &str) -> usize {
-    // Use tiktoken-rs with cl100k_base
-    // For R2, we use a simple approximation if tiktoken fails, but try to use it.
-    // tiktoken-rs 0.12 uses `r50k_base` etc, but we can use `cl100k_base` via `get_bpe_from_model`
-    // For simplicity, use `tiktoken_rs::cl100k_base` if available, else fallback.
-    // The crate `tiktoken-rs` 0.12 provides `cl100k_base` function.
-    // We use `tiktoken_rs::cl100k_base().unwrap().encode_with_special_tokens(text).len()`
-    // But to avoid heavy init each call, we use a once_cell.
-
-    // For R2, we approximate with chars/4 if tiktoken not available quickly.
-    // Try to use tiktoken, fallback to chars/4.
-    match tiktoken_rs::cl100k_base() {
+    use std::sync::LazyLock;
+    static BPE: LazyLock<Result<tiktoken_rs::CoreBPE, String>> =
+        LazyLock::new(|| tiktoken_rs::cl100k_base().map_err(|e| e.to_string()));
+    match &*BPE {
         Ok(bpe) => bpe.encode_with_special_tokens(text).len(),
         Err(_) => (text.len() as f64 / 4.0).ceil() as usize,
     }

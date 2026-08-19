@@ -99,6 +99,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let svc = ContextService::new(root).await?;
             let res = svc.search(&query, search_opts).await?;
             if is_json {
+                let stats_json = serde_json::to_value(&res.stats).unwrap_or(serde_json::json!({}));
                 let mut out = serde_json::json!({
                     "query": res.query,
                     "type": res.query_type.as_str(),
@@ -113,31 +114,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         "finalScore": e.final_score,
                     })).collect::<Vec<_>>(),
                     "context": res.packed.markdown,
-                    "stats": {
-                        "candidate_count": res.stats.candidate_count,
-                        "evidence_count": res.stats.evidence_count,
-                        "files_returned": res.stats.files_returned,
-                        "packed_tokens": res.stats.packed_tokens,
-                        "retrievers": res.stats.retrievers_used,
-                        "elapsed_ms": res.stats.elapsed_ms,
-                        "total_ms": res.stats.total_ms,
-                        "discovery_ms": res.stats.discovery_ms,
-                        "reconcile_ms": res.stats.reconcile_ms,
-                        "exact_ms": res.stats.exact_ms,
-                        "structural_ms": res.stats.structural_ms,
-                        "bm25_ms": res.stats.bm25_ms,
-                        "semantic_ms": res.stats.semantic_ms,
-                        "semantic_embed_ms": res.stats.semantic_embed_ms,
-                        "semantic_search_ms": res.stats.semantic_search_ms,
-                        "rank_ms": res.stats.rank_ms,
-                        "authority_ms": res.stats.authority_ms,
-                        "fusion_ms": res.stats.fusion_ms,
-                        "pack_ms": res.stats.pack_ms,
-                        "generation": res.stats.generation,
-                        "dirty_file_count": res.stats.dirty_file_count,
-                        "vector_count_scanned": res.stats.vector_count_scanned,
-                        "cache_hit": res.stats.cache_hit,
-                    }
+                    "stats": stats_json
                 });
                 // Debug observability only when --debug is set, not in normal JSON output
                 if cli.debug {
