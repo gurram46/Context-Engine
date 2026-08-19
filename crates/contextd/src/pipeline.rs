@@ -947,7 +947,6 @@ pub async fn retrieve_context(
                 }
             }
             bm25_ms = t_bm25.elapsed().as_millis();
-            sqlite_query_ms += bm25_ms;
         }
     } else {
         retrievers_used.push("rust-bm25:skipped".into());
