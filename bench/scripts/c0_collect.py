@@ -14,6 +14,15 @@ sys.path.insert(0, str(REPO_ROOT / "bench"))
 
 from adapters.context_engine_hot import ContextEngineHotAdapter
 from adapters.rg_baseline import RgBaselineAdapter
+try:
+    from adapters.codebase_memory import CodebaseMemoryAdapter
+except: CodebaseMemoryAdapter=None
+try:
+    from adapters.serena import SerenaAdapter
+except: SerenaAdapter=None
+try:
+    from adapters.oci import OciAdapter
+except: OciAdapter=None
 
 def hot_latency(adapter, repo_path, query, samples=11):
     # warm already done outside, do samples
@@ -45,8 +54,23 @@ def hot_latency(adapter, repo_path, query, samples=11):
         "internal_p95": p95(internals_sorted),
     }
 
-def measure_resource(repo_path):
-    # disk: size of .context/index if exists else None
+def _rss_for_pid(pid):
+    try:
+        import psutil
+        if pid is None:
+            return None
+        proc=psutil.Process(int(pid))
+        rss=proc.memory_info().rss
+        # include children
+        try:
+            for child in proc.children(recursive=True):
+                try: rss+=child.memory_info().rss
+                except: pass
+        except: pass
+        return int(rss/1024/1024)
+    except: return None
+
+def measure_resource(repo_path, adapter=None):
     idx = repo_path / ".context" / "index"
     disk=None
     if idx.exists():
@@ -56,13 +80,57 @@ def measure_resource(repo_path):
                 try: total+=p.stat().st_size
                 except: pass
         disk=total
-    # RSS: try psutil, else None
-    rss=None
+    controller_rss=None
+    sut_rss=None
+    auxiliary_rss=None
     try:
         import psutil
-        rss=int(psutil.Process().memory_info().rss/1024/1024)
+        controller_rss=int(psutil.Process().memory_info().rss/1024/1024)
     except: pass
-    return {"disk": disk, "rss": rss}
+    # try to get SUT pid from adapter where available
+    try:
+        pid=None
+        if adapter is not None:
+            # generic: adapter may expose resource_processes or _clients
+            if hasattr(adapter, "resource_processes"):
+                try: procs=adapter.resource_processes(repo_path)
+                except: procs=None
+                if procs:
+                    # procs is dict or list of pids
+                    if isinstance(procs, dict):
+                        sut_rss=procs.get("sut_rss_mb")
+                        auxiliary_rss=procs.get("auxiliary_rss_mb")
+                        controller_rss=procs.get("controller_rss_mb", controller_rss)
+                        pid=None
+                    elif isinstance(procs, list):
+                        # first is sut
+                        pid=procs[0] if procs else None
+            if pid is None and hasattr(adapter, "_clients"):
+                try:
+                    key=str(repo_path.resolve())
+                    c=adapter._clients.get(key)
+                    if c is not None:
+                        pid=getattr(c, "contextd_pid", None) or getattr(c, "os_pid", None) or getattr(c, "pid", None) or getattr(c, "proc", None) and getattr(c.proc, "pid", None)
+                except: pass
+            if pid is None and hasattr(adapter, "_client"):
+                try:
+                    # for serena adapter with _clients
+                    key=str(repo_path.resolve())
+                    if hasattr(adapter, "_clients"):
+                        c=adapter._clients.get(key)
+                        if c is not None:
+                            pid=getattr(c, "pid", None) or getattr(c, "proc", None) and getattr(c.proc, "pid", None)
+                except: pass
+            if sut_rss is None and pid is not None:
+                sut_rss=_rss_for_pid(pid)
+                # auxiliary: try children already included; for serena try to sum LSP children via psutil children already
+                # for OCI also try to get Node+Ollama separate if adapter provides
+                # we keep auxiliary as None for now, sut includes children
+        if sut_rss is None and auxiliary_rss is None:
+            # fallback: if no sut, keep controller only
+            pass
+    except: pass
+    return {"disk": disk, "controller_rss_mb": controller_rss, "sut_rss_mb": sut_rss, "auxiliary_rss_mb": auxiliary_rss, "rss": controller_rss}
 
 def main():
     out_dir = REPO_ROOT / "bench/results/c0" / time.strftime("%Y%m%d_%H%M%S")
@@ -79,22 +147,63 @@ def main():
     for q in qs:
         by_repo.setdefault(q["repo"], []).append(q)
 
+    # build adapter registry with availability
+    registry=[]
+    for name, Cls in [("context_engine_hot", ContextEngineHotAdapter), ("rg_baseline", RgBaselineAdapter), ("codebase_memory", CodebaseMemoryAdapter), ("serena", SerenaAdapter), ("oci", OciAdapter)]:
+        if Cls is None:
+            registry.append((name, None))
+            continue
+        # check binary/executable availability for external adapters before probe
+        blocked_reason=None
+        if name=="serena" and shutil.which("serena-agent") is None:
+            blocked_reason="serena-agent not in PATH"
+        elif name=="oci" and shutil.which("node") is None:
+            blocked_reason="node not in PATH"
+        elif name=="codebase_memory":
+            try:
+                from adapters.codebase_memory import BIN as _cbm_bin
+                if not _cbm_bin.exists():
+                    blocked_reason=f"cbm binary not found {_cbm_bin}"
+            except: blocked_reason="cbm import failed"
+        if blocked_reason:
+            registry.append((name, None))
+            continue
+        try:
+            inst=Cls()
+            try: inst.close()
+            except: pass
+            registry.append((name, Cls))
+        except Exception as e:
+            registry.append((name, None))
+    # fallback to at least CE+rg if registry empty
+    if not registry:
+        registry=[("context_engine_hot", ContextEngineHotAdapter), ("rg_baseline", RgBaselineAdapter)]
+
     # hot latency
     latency={}
-    for name, AdapterCls in [("context_engine_hot", ContextEngineHotAdapter), ("rg_baseline", RgBaselineAdapter)]:
-        adapter=AdapterCls()
+    for name, AdapterCls in registry:
+        if AdapterCls is None:
+            latency[name]={"status": "BLOCKED", "reason": "adapter not available / binary missing"}
+            continue
+        try:
+            adapter=AdapterCls()
+        except Exception as e:
+            latency[name]={"status": "BLOCKED", "reason": str(e)[:200]}
+            continue
         latency[name]={}
         for repo, qlist in by_repo.items():
             repo_path=REPO_ROOT/"bench/repos"/repo
             query=qlist[0]["query"]
-            # ensure hot built: for context_engine_hot, do one warm query
             try:
                 adapter.search(query, repo_path, top_n=5)
             except: pass
             time.sleep(0.2)
-            res=hot_latency(adapter, repo_path, query, samples=11)
-            latency[name][repo]=res
-            print(f"[{name}] {repo} wall p50 {res['wall_p50']} p95 {res['wall_p95']} internal p50 {res['internal_p50']}")
+            try:
+                res=hot_latency(adapter, repo_path, query, samples=11)
+                latency[name][repo]=res
+                print(f"[{name}] {repo} wall p50 {res['wall_p50']} p95 {res['wall_p95']} internal p50 {res['internal_p50']}")
+            except Exception as e:
+                latency[name][repo]={"status": "BLOCKED", "reason": str(e)[:200]}
         try: adapter.close()
         except: pass
     (out_dir/"latency.json").write_text(json.dumps(latency, indent=2))
@@ -102,19 +211,29 @@ def main():
     # indexing detailed + resource
     indexing={}
     resources={}
-    for name, AdapterCls in [("context_engine_hot", ContextEngineHotAdapter), ("rg_baseline", RgBaselineAdapter)]:
-        adapter=AdapterCls()
+    for name, AdapterCls in registry:
+        if AdapterCls is None:
+            indexing[name]={"status": "BLOCKED"}
+            resources[name]={"status": "BLOCKED"}
+            continue
+        try:
+            adapter=AdapterCls()
+        except Exception as e:
+            indexing[name]={"status": "BLOCKED", "reason": str(e)[:200]}
+            resources[name]={"status": "BLOCKED", "reason": str(e)[:200]}
+            continue
         indexing[name]={}
         resources[name]={}
         for repo in by_repo:
             repo_path=REPO_ROOT/"bench/repos"/repo
-            # initial via adapter.index (already hot, but we measure)
             t0=time.perf_counter()
             try: idx=adapter.index(repo_path)
             except Exception as e: idx={"error": str(e)}
             wall=int((time.perf_counter()-t0)*1000)
-            # also get resource
-            res=measure_resource(repo_path)
+            try:
+                res=measure_resource(repo_path, adapter)
+            except:
+                res=measure_resource(repo_path, None)
             indexing[name][repo]={"wall_ms": wall, "metrics": idx.__dict__ if hasattr(idx,"__dict__") else idx}
             resources[name][repo]=res
         try: adapter.close()

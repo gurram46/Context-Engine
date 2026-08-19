@@ -123,16 +123,58 @@ class RgBaselineAdapter(BenchmarkAdapter):
         file_hits = []
         import re as _re
 
+        candidates=[]
         for cand in _re.findall(r"[\w./-]+\.\w+", query):
-            cand_clean = cand.strip('",.?:;()')
+            cand_clean = cand.strip('",.?:;()').replace("\\","/")
+            # normalize: remove leading ./ etc
+            cand_clean=cand_clean.lstrip("./")
+            candidates.append(cand_clean)
+        # for each candidate, collect all basename matches and rank path-aware
+        best_hits=[]
+        for cand_clean in candidates:
             base = Path(cand_clean).name
+            if not base: continue
+            matches=[]
             for p in repo_path.rglob(base):
                 if p.is_file() and p.name.lower() == base.lower():
                     rel = p.relative_to(repo_path).as_posix()
-                    file_hits.append({"file": rel, "line": 1, "text": f"File exists: {rel}"})
-                    break
-            if file_hits:
+                    matches.append(rel)
+            if not matches:
+                continue
+            # rank matches: exact rel match, suffix, basename, lexical
+            def _rank(rel):
+                rel_low=rel.lower()
+                cand_low=cand_clean.lower()
+                if rel_low==cand_low:
+                    return (0, rel)
+                if rel_low.endswith("/"+cand_low) or rel_low.endswith(cand_low):
+                    # suffix length priority: longer suffix (more specific) first
+                    return (1, -len(cand_low), rel)
+                # basename match fallback
+                return (2, rel)
+            matches_sorted=sorted(matches, key=_rank)
+            # take top ranked
+            rel=matches_sorted[0]
+            best_hits.append({"file": rel, "line": 1, "text": f"File exists: {rel}"})
+            # if we found exact match, break; otherwise continue to next candidate?
+            if rel.lower()==cand_clean.lower():
                 break
+        # dedup and keep deterministic order: exact matches first
+        seen=set()
+        file_hits=[]
+        for h in best_hits:
+            if h["file"] not in seen:
+                seen.add(h["file"])
+                file_hits.append(h)
+        # also handle query with just basename: if multiple matches, rank by suffix above, but we already did per candidate
+        # fallback: if no file_hits but candidates existed, collect all basename matches for first candidate and rank lexically
+        if not file_hits and candidates:
+            # try first candidate's basename all matches lexically
+            base=Path(candidates[0]).name
+            all_matches=[p.relative_to(repo_path).as_posix() for p in repo_path.rglob(base) if p.is_file() and p.name.lower()==base.lower()]
+            if all_matches:
+                all_matches_sorted=sorted(all_matches)
+                file_hits=[{"file": all_matches_sorted[0], "line": 1, "text": f"File exists: {all_matches_sorted[0]}"}]
 
         term = _extract_term(query)
         hits = _rg_search(repo_path, term, max_results=100)
