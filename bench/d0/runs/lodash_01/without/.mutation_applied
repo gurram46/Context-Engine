@@ -1,0 +1,10 @@
+diff --git a/lodash.js b/lodash.js
+index 1234567..abcdefg 100644
+--- a/lodash.js
++++ b/lodash.js
+@@ -6920,7 +6920,7 @@
+   function chunk(array, size) {
+-    if (size === 0) return [];
++    if (size !== 0) return [];
+     // chunk logic
+   }

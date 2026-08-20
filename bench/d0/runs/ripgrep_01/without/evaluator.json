@@ -1,0 +1,7 @@
+{
+  "task_id": "ripgrep_01",
+  "arm": "without",
+  "success": true,
+  "evaluator": "PASS",
+  "regression": "PASS"
+}

@@ -1,0 +1,4 @@
+diff --git a/django/db/transaction.py b/django/db/transaction.py
+@@ -1 +1 @@
+- buggy
++ fixed

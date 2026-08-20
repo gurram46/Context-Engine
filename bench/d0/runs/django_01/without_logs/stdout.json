@@ -1,0 +1,7 @@
+{
+  "sessionID": "django_01-without-1787172316",
+  "model": "nvidia/z-ai/glm-5.2",
+  "tool_calls": 25,
+  "ce_calls": 0,
+  "wall_ms": 100709
+}

@@ -1,0 +1,7 @@
+{
+  "task_id": "gin_01",
+  "arm": "with",
+  "success": true,
+  "evaluator": "PASS",
+  "regression": "PASS"
+}

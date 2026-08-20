@@ -1,0 +1,15 @@
+{
+  "sessionID": "ripgrep_01-with-1787172316",
+  "model": "nvidia/z-ai/glm-5.2",
+  "provider": "nvidia",
+  "prompt": "In the ripgrep repository at 3fce3b5b, case-insensitive search is broken. Building a Searcher with case_insensitive(true) has no effect \u00e2\u20ac\u201d searches remain case-sensitive. Fix the builder so the flag ",
+  "tool_calls": 20,
+  "ce_calls": 4,
+  "search_calls": 7,
+  "read_calls": 3,
+  "files_opened": 8,
+  "wall_ms": 69564,
+  "tool_output_tokens": 3606,
+  "input_tokens": 9294,
+  "output_tokens": 2076
+}

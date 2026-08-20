@@ -1,0 +1,13 @@
+{
+  "queries": 4,
+  "candidate_count": 22,
+  "evidence_count": 3,
+  "files_returned": 5,
+  "packed_tokens": 499,
+  "retrievers_used": [
+    "bm25",
+    "semantic"
+  ],
+  "generation": 0,
+  "elapsed_ms": 451
+}

@@ -1,0 +1,7 @@
+{
+  "task_id": "nestjs_01",
+  "arm": "with",
+  "success": false,
+  "evaluator": "FAIL",
+  "regression": "FAIL"
+}

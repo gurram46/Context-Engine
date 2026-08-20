@@ -1,0 +1,4 @@
+diff --git a/crates/searcher/src/searcher/mod.rs b/crates/searcher/src/searcher/mod.rs
+@@ -1 +1 @@
+- buggy
++ fixed

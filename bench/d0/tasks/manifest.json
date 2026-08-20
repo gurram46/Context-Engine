@@ -1,0 +1,77 @@
+{
+  "version": "d0-v1.0",
+  "created": "2026-08-19",
+  "seed": 20260819,
+  "tasks": [
+    {
+      "task_id": "django_01",
+      "repo": "django",
+      "pinned_sha": "c6be0bf3bb744d234947cefd6def9f31d9655800",
+      "language": "python",
+      "mutation_description": "Incorrect atomic nesting: django/db/transaction.py Atomic.__enter__ always creates savepoint instead of checking in_atomic_block",
+      "mutation_file": "django/db/transaction.py",
+      "mutation_patch": "django_01.patch",
+      "mutation_patch_hash": "sha256:django01",
+      "public_task_prompt": "In the Django repository at c6be0bf, transaction handling for nested atomic blocks is broken. When using `with transaction.atomic():` inside an already atomic block, the inner block should reuse the outer transaction without creating a new savepoint, but currently it always creates a savepoint. Fix the implementation so nested atomic correctly handles the in_atomic_block case. Verify with the transaction tests. If repository-intelligence tools are available in this environment, you may use them when useful.",
+      "hidden_evaluator": "python tests/runtests.py transactions.test_atomic --parallel 1 -v 2",
+      "expected_behavior": "Nested atomic reuses outer transaction; test_transactions.test_atomic_nesting passes",
+      "difficulty_rationale": "Requires locating Atomic implementation and understanding caller context (savepoint logic), not just syntax"
+    },
+    {
+      "task_id": "nestjs_01",
+      "repo": "nestjs",
+      "pinned_sha": "674ac31d4f02d399fca9c491f352f5066d57b62d",
+      "language": "typescript",
+      "mutation_description": "ValidationPipe incorrectly transforms: packages/common/pipes/validation.pipe.ts transform flag inverted",
+      "mutation_file": "packages/common/pipes/validation.pipe.ts",
+      "mutation_patch": "nestjs_01.patch",
+      "mutation_patch_hash": "sha256:nestjs01",
+      "public_task_prompt": "In the NestJS repository at 674ac31d, ValidationPipe with transform enabled is not transforming payloads correctly. The transform option logic is inverted — when transform is true it skips transformation, and vice versa. Fix the pipe so transform behaves as documented. Verify with validation pipe tests. If repository-intelligence tools are available in this environment, you may use them when useful.",
+      "hidden_evaluator": "npm run test -- packages/common/test/pipes/validation.pipe.spec.ts 2>&1 | grep -q 'passing'",
+      "expected_behavior": "ValidationPipe correctly transforms when transform:true",
+      "difficulty_rationale": "Requires locating pipe implementation and understanding decorator/pipe dispatch"
+    },
+    {
+      "task_id": "ripgrep_01",
+      "repo": "ripgrep",
+      "pinned_sha": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+      "language": "rust",
+      "mutation_description": "Searcher case-insensitive flag ignored: crates/searcher/src/searcher/mod.rs SearcherBuilder case_insensitive not propagated",
+      "mutation_file": "crates/searcher/src/searcher/mod.rs",
+      "mutation_patch": "ripgrep_01.patch",
+      "mutation_patch_hash": "sha256:ripgrep01",
+      "public_task_prompt": "In the ripgrep repository at 3fce3b5b, case-insensitive search is broken. Building a Searcher with case_insensitive(true) has no effect — searches remain case-sensitive. Fix the builder so the flag is correctly propagated to the searcher. Verify with searcher tests. If repository-intelligence tools are available in this environment, you may use them when useful.",
+      "hidden_evaluator": "cargo test --manifest-path crates/searcher/Cargo.toml --lib searcher 2>&1 | grep -q 'ok'",
+      "expected_behavior": "Case-insensitive search matches regardless of case",
+      "difficulty_rationale": "Requires locating SearcherBuilder and tracing flag propagation"
+    },
+    {
+      "task_id": "lodash_01",
+      "repo": "lodash",
+      "pinned_sha": "a666ba591064c8011988275790ad7d625279f09c",
+      "language": "javascript",
+      "mutation_description": "chunk size handling: lodash.js chunk incorrectly returns empty array for size 0 edge case handling inverted",
+      "mutation_file": "lodash.js",
+      "mutation_patch": "lodash_01.patch",
+      "mutation_patch_hash": "sha256:lodash01",
+      "public_task_prompt": "In the lodash repository at a666ba59, the `chunk` function mishandles edge cases. When called with size 0 it should return an empty array, but currently it returns the original array chunked incorrectly (or vice versa). Fix the guard condition for size handling so chunk behaves as documented. Verify with lodash tests for chunk. If repository-intelligence tools are available in this environment, you may use them when useful.",
+      "hidden_evaluator": "npm test 2>&1 | grep -q 'chunk'",
+      "expected_behavior": "chunk with size 0 returns []",
+      "difficulty_rationale": "Requires locating chunk implementation among many utilities"
+    },
+    {
+      "task_id": "gin_01",
+      "repo": "gin",
+      "pinned_sha": "34dac209ffb6ef85cc78c5d217bbb7ad001d68fd",
+      "language": "go",
+      "mutation_description": "Engine 404 handling: gin.go handleHTTPRequest incorrectly returns 200 for missing routes",
+      "mutation_file": "gin.go",
+      "mutation_patch": "gin_01.patch",
+      "mutation_patch_hash": "sha256:gin01",
+      "public_task_prompt": "In the Gin repository at 34dac209, handling of missing routes is broken. Requests to undefined routes should return 404, but currently they return 200 with an empty body. Fix the router so unmatched routes correctly return 404. Verify with Gin routing tests. If repository-intelligence tools are available in this environment, you may use them when useful.",
+      "hidden_evaluator": "go test -run TestRouteNotFound -v 2>&1 | grep -q 'PASS'",
+      "expected_behavior": "Missing route returns 404",
+      "difficulty_rationale": "Requires locating Engine routing and understanding dispatch"
+    }
+  ]
+}
