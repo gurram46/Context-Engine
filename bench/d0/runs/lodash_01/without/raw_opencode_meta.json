@@ -1,0 +1,9 @@
+{
+  "wall_ms": 190740,
+  "returncode": 0,
+  "timeout": false,
+  "pid": 19508,
+  "model": "opencode/x-preview-f-free",
+  "arm": "without",
+  "task_id": "lodash_01"
+}

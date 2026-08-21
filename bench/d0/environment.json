@@ -1,10 +1,13 @@
 {
   "opencode_version": "1.18.18",
-  "opencode_help": "opencode run --model nvidia/z-ai/glm-5.2 --format json --dir <workdir> <prompt>",
-  "model": "nvidia/z-ai/glm-5.2",
-  "provider": "nvidia",
+  "opencode_help": "opencode run --model opencode/x-preview-f-free --format json --dir <workdir> <prompt>",
+  "model": "opencode/x-preview-f-free",
+  "model_alias": "Ox Alpha Free (OpenCode Zen max, 100T free quota)",
+  "provider": "opencode",
+  "provider_alt": "openrouter/stealth/ox-alpha",
   "reasoning_level": "default",
-  "small_model": "nvidia/deepseek-ai/deepseek-v4-flash",
+  "small_model": "hetzner/Qwen3.8-27B",
+  "small_model_alt": "openai/gpt-5.6-luna-fast",
   "context_window": 131072,
   "tool_configuration": "file read, grep/search, glob, shell, edit/write, test execution; CE MCP context_search,symbol_lookup,dependency_trace,test_lookup,context_status when enabled",
   "session_export": "opencode export [sessionID] -> JSON",
@@ -16,5 +19,5 @@
   "base_sha": "d7a38332d5777d1f902ed2bd2e136de83b28e714",
   "branch": "d0/controlled-agent-ab",
   "subagents": "DISABLED",
-  "model_control": "ONE exact model nvidia/z-ai/glm-5.2 for all 10 runs, no subagents, no fallback"
+  "model_control": "ONE exact model opencode/x-preview-f-free (Ox Alpha Free, 100T) for all 10 runs, no subagents, no fallback; openrouter/stealth/ox-alpha same weights alt provider"
 }

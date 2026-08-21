@@ -1,15 +1,9 @@
 {
-  "sessionID": "django_01-without-1787172316",
-  "model": "nvidia/z-ai/glm-5.2",
-  "provider": "nvidia",
-  "prompt": "In the Django repository at c6be0bf, transaction handling for nested atomic blocks is broken. When using `with transaction.atomic():` inside an already atomic block, the inner block should reuse the o",
-  "tool_calls": 25,
+  "wall_ms": 257518,
+  "model": "opencode/x-preview-f-free",
   "ce_calls": 0,
-  "search_calls": 11,
-  "read_calls": 9,
-  "files_opened": 11,
-  "wall_ms": 100709,
-  "tool_output_tokens": 4477,
-  "input_tokens": 14454,
-  "output_tokens": 2930
+  "tool_calls": 14,
+  "input_tokens": null,
+  "output_tokens": null,
+  "leak_hits": []
 }

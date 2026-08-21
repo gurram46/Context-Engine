@@ -1,0 +1,9 @@
+{
+  "wall_ms": 284935,
+  "returncode": 0,
+  "timeout": false,
+  "pid": 5244,
+  "model": "opencode/x-preview-f-free",
+  "arm": "without",
+  "task_id": "gin_01"
+}

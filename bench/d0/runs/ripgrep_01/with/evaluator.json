@@ -1,7 +1,8 @@
 {
-  "task_id": "ripgrep_01",
-  "arm": "with",
-  "success": true,
-  "evaluator": "PASS",
-  "regression": "PASS"
+  "command": "python -c \"import sys; d=open('crates/searcher/src/searcher/mod.rs').read(); sys.exit(0 if 'MUTATED' not in d and 'invert_match = yes' in d else 1)\"",
+  "returncode": 0,
+  "wall_ms": 339,
+  "pass": true,
+  "stdout": "",
+  "stderr": ""
 }

@@ -1,15 +1,9 @@
 {
-  "sessionID": "gin_01-with-1787172316",
-  "model": "nvidia/z-ai/glm-5.2",
-  "provider": "nvidia",
-  "prompt": "In the Gin repository at 34dac209, handling of missing routes is broken. Requests to undefined routes should return 404, but currently they return 200 with an empty body. Fix the router so unmatched r",
-  "tool_calls": 16,
-  "ce_calls": 2,
-  "search_calls": 5,
-  "read_calls": 5,
-  "files_opened": 4,
-  "wall_ms": 84763,
-  "tool_output_tokens": 2912,
-  "input_tokens": 8034,
-  "output_tokens": 2927
+  "wall_ms": 204336,
+  "model": "opencode/x-preview-f-free",
+  "ce_calls": 0,
+  "tool_calls": 9,
+  "input_tokens": null,
+  "output_tokens": null,
+  "leak_hits": []
 }

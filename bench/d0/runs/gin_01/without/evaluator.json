@@ -1,7 +1,8 @@
 {
-  "task_id": "gin_01",
-  "arm": "without",
-  "success": true,
-  "evaluator": "PASS",
-  "regression": "PASS"
+  "command": "python -c \"import sys; d=open('gin.go').read(); sys.exit(0 if 'MUTATED' not in d and 'StatusNotFound' in d else 1)\"",
+  "returncode": 0,
+  "wall_ms": 276,
+  "pass": true,
+  "stdout": "",
+  "stderr": ""
 }

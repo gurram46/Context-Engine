@@ -1,4 +1,13 @@
 diff --git a/packages/common/pipes/validation.pipe.ts b/packages/common/pipes/validation.pipe.ts
-@@ -1 +1 @@
-- buggy
-+ fixed
+index b381aaa..654e6c8 100644
+--- a/packages/common/pipes/validation.pipe.ts
++++ b/packages/common/pipes/validation.pipe.ts
+@@ -78,7 +78,7 @@ export class ValidationPipe implements PipeTransform<any> {
+     // @see [https://github.com/nestjs/nest/issues/10683#issuecomment-1413690508](https://github.com/nestjs/nest/issues/10683#issuecomment-1413690508)
+     this.validatorOptions = { forbidUnknownValues: false, ...validatorOptions };
+ 
+-    this.isTransformEnabled = !transform; // MUTATED: inverted
++    this.isTransformEnabled = !!transform;
+     this.transformOptions = transformOptions;
+     this.isDetailedOutputDisabled = disableErrorMessages;
+     this.validateCustomDecorators = validateCustomDecorators || false;

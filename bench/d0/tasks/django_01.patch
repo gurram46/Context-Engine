@@ -1,11 +1,12 @@
 diff --git a/django/db/transaction.py b/django/db/transaction.py
-index 1234567..abcdefg 100644
 --- a/django/db/transaction.py
 +++ b/django/db/transaction.py
-@@ -45,7 +45,7 @@ class Atomic:
-     def __enter__(self):
--        if self.connection.in_atomic_block:
-+        if False:
-             # already in atomic, reuse
-             self._in_atomic_block = True
-         else:
+@@ -215,7 +215,7 @@
+                 connection.in_atomic_block = True
+                 connection.commit_on_exit = False
+ 
+-        if connection.in_atomic_block:
++        if False:  # MUTATED: always create transaction not savepoint
+             # We're already in a transaction; create a savepoint, unless we
+             # were told not to or we're already waiting for a rollback. The
+             # second condition avoids creating useless savepoints and prevents

@@ -1,4 +1,13 @@
 diff --git a/crates/searcher/src/searcher/mod.rs b/crates/searcher/src/searcher/mod.rs
-@@ -1 +1 @@
-- buggy
-+ fixed
+index 46ebe6d..6e4ff94 100644
+--- a/crates/searcher/src/searcher/mod.rs
++++ b/crates/searcher/src/searcher/mod.rs
+@@ -356,7 +356,7 @@ impl SearcherBuilder {
+     ///
+     /// By default, this is disabled.
+     pub fn invert_match(&mut self, yes: bool) -> &mut SearcherBuilder {
+-        self.config.invert_match = false; // MUTATED: always false
++        self.config.invert_match = yes;
+         self
+     }
+ 

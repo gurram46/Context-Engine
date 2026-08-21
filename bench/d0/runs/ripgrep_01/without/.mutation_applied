@@ -1,10 +1,12 @@
 diff --git a/crates/searcher/src/searcher/mod.rs b/crates/searcher/src/searcher/mod.rs
-index 1234567..abcdefg 100644
 --- a/crates/searcher/src/searcher/mod.rs
 +++ b/crates/searcher/src/searcher/mod.rs
-@@ -120,7 +120,7 @@ impl SearcherBuilder {
-     pub fn case_insensitive(mut self, yes: bool) -> Self {
--        self.case_insensitive = yes;
-+        self.case_insensitive = false;
+@@ -356,7 +356,7 @@
+     ///
+     /// By default, this is disabled.
+     pub fn invert_match(&mut self, yes: bool) -> &mut SearcherBuilder {
+-        self.config.invert_match = yes;
++        self.config.invert_match = false; // MUTATED: always false
          self
      }
+ 

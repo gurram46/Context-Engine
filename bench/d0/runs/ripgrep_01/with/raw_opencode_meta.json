@@ -1,0 +1,9 @@
+{
+  "wall_ms": 120006,
+  "returncode": 0,
+  "timeout": false,
+  "pid": 1224,
+  "model": "opencode/x-preview-f-free",
+  "arm": "with",
+  "task_id": "ripgrep_01"
+}

@@ -1,7 +1,8 @@
 {
-  "task_id": "lodash_01",
-  "arm": "without",
-  "success": false,
-  "evaluator": "FAIL",
-  "regression": "FAIL"
+  "command": "python -c \"import sys; d=open('lodash.js').read(); sys.exit(0 if 'MUTATED' not in d and 'size < 1' in d else 1)\"",
+  "returncode": 0,
+  "wall_ms": 320,
+  "pass": true,
+  "stdout": "",
+  "stderr": ""
 }

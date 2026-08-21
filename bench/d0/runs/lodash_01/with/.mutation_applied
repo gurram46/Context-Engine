@@ -1,10 +1,12 @@
 diff --git a/lodash.js b/lodash.js
-index 1234567..abcdefg 100644
 --- a/lodash.js
 +++ b/lodash.js
-@@ -6920,7 +6920,7 @@
-   function chunk(array, size) {
--    if (size === 0) return [];
-+    if (size !== 0) return [];
-     // chunk logic
-   }
+@@ -6938,7 +6938,7 @@
+         size = nativeMax(toInteger(size), 0);
+       }
+       var length = array == null ? 0 : array.length;
+-      if (!length || size < 1) {
++      if (!length || size < 0) { // MUTATED: size 0 no longer returns []
+         return [];
+       }
+       var index = 0,

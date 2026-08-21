@@ -1,0 +1,1 @@
+[93m[1m! [0mpermission requested: external_directory (C:\Users\Dell\AppData\Local\npm-cache\_logs\*); auto-rejecting

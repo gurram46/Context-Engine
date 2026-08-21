@@ -1,10 +1,12 @@
 diff --git a/packages/common/pipes/validation.pipe.ts b/packages/common/pipes/validation.pipe.ts
-index 1234567..abcdefg 100644
 --- a/packages/common/pipes/validation.pipe.ts
 +++ b/packages/common/pipes/validation.pipe.ts
-@@ -45,7 +45,7 @@ export class ValidationPipe {
-   async transform(value: any, metadata: ArgumentMetadata) {
--    if (this.options.transform) {
-+    if (!this.options.transform) {
-       // transform logic
-     }
+@@ -78,7 +78,7 @@
+     // @see [https://github.com/nestjs/nest/issues/10683#issuecomment-1413690508](https://github.com/nestjs/nest/issues/10683#issuecomment-1413690508)
+     this.validatorOptions = { forbidUnknownValues: false, ...validatorOptions };
+ 
+-    this.isTransformEnabled = !!transform;
++    this.isTransformEnabled = !transform; // MUTATED: inverted
+     this.transformOptions = transformOptions;
+     this.isDetailedOutputDisabled = disableErrorMessages;
+     this.validateCustomDecorators = validateCustomDecorators || false;

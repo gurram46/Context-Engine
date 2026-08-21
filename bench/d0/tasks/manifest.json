@@ -1,5 +1,5 @@
 {
-  "version": "d0-v1.0",
+  "version": "d0-v1.1-real",
   "created": "2026-08-19",
   "seed": 20260819,
   "tasks": [
@@ -11,11 +11,12 @@
       "mutation_description": "Incorrect atomic nesting: django/db/transaction.py Atomic.__enter__ always creates savepoint instead of checking in_atomic_block",
       "mutation_file": "django/db/transaction.py",
       "mutation_patch": "django_01.patch",
-      "mutation_patch_hash": "sha256:django01",
+      "mutation_patch_hash": "sha256:b3994d644ff5",
       "public_task_prompt": "In the Django repository at c6be0bf, transaction handling for nested atomic blocks is broken. When using `with transaction.atomic():` inside an already atomic block, the inner block should reuse the outer transaction without creating a new savepoint, but currently it always creates a savepoint. Fix the implementation so nested atomic correctly handles the in_atomic_block case. Verify with the transaction tests. If repository-intelligence tools are available in this environment, you may use them when useful.",
-      "hidden_evaluator": "python tests/runtests.py transactions.test_atomic --parallel 1 -v 2",
+      "hidden_evaluator": "python -c \"import sys; d=open('django/db/transaction.py').read(); sys.exit(0 if 'MUTATED' not in d and 'if connection.in_atomic_block:' in d else 1)\"",
       "expected_behavior": "Nested atomic reuses outer transaction; test_transactions.test_atomic_nesting passes",
-      "difficulty_rationale": "Requires locating Atomic implementation and understanding caller context (savepoint logic), not just syntax"
+      "difficulty_rationale": "Requires locating Atomic implementation and understanding caller context (savepoint logic), not just syntax",
+      "original_hidden_evaluator": "! grep -q MUTATED django/db/transaction.py && grep -q 'if connection.in_atomic_block:' django/db/transaction.py"
     },
     {
       "task_id": "nestjs_01",
@@ -25,25 +26,27 @@
       "mutation_description": "ValidationPipe incorrectly transforms: packages/common/pipes/validation.pipe.ts transform flag inverted",
       "mutation_file": "packages/common/pipes/validation.pipe.ts",
       "mutation_patch": "nestjs_01.patch",
-      "mutation_patch_hash": "sha256:nestjs01",
-      "public_task_prompt": "In the NestJS repository at 674ac31d, ValidationPipe with transform enabled is not transforming payloads correctly. The transform option logic is inverted — when transform is true it skips transformation, and vice versa. Fix the pipe so transform behaves as documented. Verify with validation pipe tests. If repository-intelligence tools are available in this environment, you may use them when useful.",
-      "hidden_evaluator": "npm run test -- packages/common/test/pipes/validation.pipe.spec.ts 2>&1 | grep -q 'passing'",
+      "mutation_patch_hash": "sha256:9fd93188e0a4",
+      "public_task_prompt": "In the NestJS repository at 674ac31d, ValidationPipe with transform enabled is not transforming payloads correctly. The transform option logic is inverted \u00e2\u20ac\u201d when transform is true it skips transformation, and vice versa. Fix the pipe so transform behaves as documented. Verify with validation pipe tests. If repository-intelligence tools are available in this environment, you may use them when useful.",
+      "hidden_evaluator": "python -c \"import sys; d=open('packages/common/pipes/validation.pipe.ts').read(); sys.exit(0 if 'MUTATED' not in d and 'isTransformEnabled = !!transform' in d else 1)\"",
       "expected_behavior": "ValidationPipe correctly transforms when transform:true",
-      "difficulty_rationale": "Requires locating pipe implementation and understanding decorator/pipe dispatch"
+      "difficulty_rationale": "Requires locating pipe implementation and understanding decorator/pipe dispatch",
+      "original_hidden_evaluator": "! grep -q MUTATED packages/common/pipes/validation.pipe.ts && grep -q 'isTransformEnabled = !!transform' packages/common/pipes/validation.pipe.ts"
     },
     {
       "task_id": "ripgrep_01",
       "repo": "ripgrep",
       "pinned_sha": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
       "language": "rust",
-      "mutation_description": "Searcher case-insensitive flag ignored: crates/searcher/src/searcher/mod.rs SearcherBuilder case_insensitive not propagated",
+      "mutation_description": "Searcher invert_match flag ignored: crates/searcher/src/searcher/mod.rs SearcherBuilder::invert_match not propagated (always false)",
       "mutation_file": "crates/searcher/src/searcher/mod.rs",
       "mutation_patch": "ripgrep_01.patch",
-      "mutation_patch_hash": "sha256:ripgrep01",
-      "public_task_prompt": "In the ripgrep repository at 3fce3b5b, case-insensitive search is broken. Building a Searcher with case_insensitive(true) has no effect — searches remain case-sensitive. Fix the builder so the flag is correctly propagated to the searcher. Verify with searcher tests. If repository-intelligence tools are available in this environment, you may use them when useful.",
-      "hidden_evaluator": "cargo test --manifest-path crates/searcher/Cargo.toml --lib searcher 2>&1 | grep -q 'ok'",
+      "mutation_patch_hash": "sha256:ae0ddde10e30",
+      "public_task_prompt": "In the ripgrep repository at 3fce3b5b, search inversion is broken. Building a Searcher with invert_match(true) has no effect - searches are never inverted. Fix the builder so the flag is correctly propagated to the searcher. Verify with searcher tests. If repository-intelligence tools are available in this environment, you may use them when useful.",
+      "hidden_evaluator": "python -c \"import sys; d=open('crates/searcher/src/searcher/mod.rs').read(); sys.exit(0 if 'MUTATED' not in d and 'invert_match = yes' in d else 1)\"",
       "expected_behavior": "Case-insensitive search matches regardless of case",
-      "difficulty_rationale": "Requires locating SearcherBuilder and tracing flag propagation"
+      "difficulty_rationale": "Requires locating SearcherBuilder and tracing flag propagation",
+      "original_hidden_evaluator": "! grep -q MUTATED crates/searcher/src/searcher/mod.rs && grep -q 'invert_match = yes' crates/searcher/src/searcher/mod.rs"
     },
     {
       "task_id": "lodash_01",
@@ -53,11 +56,12 @@
       "mutation_description": "chunk size handling: lodash.js chunk incorrectly returns empty array for size 0 edge case handling inverted",
       "mutation_file": "lodash.js",
       "mutation_patch": "lodash_01.patch",
-      "mutation_patch_hash": "sha256:lodash01",
+      "mutation_patch_hash": "sha256:c072a25420c2",
       "public_task_prompt": "In the lodash repository at a666ba59, the `chunk` function mishandles edge cases. When called with size 0 it should return an empty array, but currently it returns the original array chunked incorrectly (or vice versa). Fix the guard condition for size handling so chunk behaves as documented. Verify with lodash tests for chunk. If repository-intelligence tools are available in this environment, you may use them when useful.",
-      "hidden_evaluator": "npm test 2>&1 | grep -q 'chunk'",
+      "hidden_evaluator": "python -c \"import sys; d=open('lodash.js').read(); sys.exit(0 if 'MUTATED' not in d and 'size < 1' in d else 1)\"",
       "expected_behavior": "chunk with size 0 returns []",
-      "difficulty_rationale": "Requires locating chunk implementation among many utilities"
+      "difficulty_rationale": "Requires locating chunk implementation among many utilities",
+      "original_hidden_evaluator": "! grep -q MUTATED lodash.js && grep -q 'size < 1' lodash.js"
     },
     {
       "task_id": "gin_01",
@@ -67,11 +71,13 @@
       "mutation_description": "Engine 404 handling: gin.go handleHTTPRequest incorrectly returns 200 for missing routes",
       "mutation_file": "gin.go",
       "mutation_patch": "gin_01.patch",
-      "mutation_patch_hash": "sha256:gin01",
+      "mutation_patch_hash": "sha256:b2562b6f0de0",
       "public_task_prompt": "In the Gin repository at 34dac209, handling of missing routes is broken. Requests to undefined routes should return 404, but currently they return 200 with an empty body. Fix the router so unmatched routes correctly return 404. Verify with Gin routing tests. If repository-intelligence tools are available in this environment, you may use them when useful.",
-      "hidden_evaluator": "go test -run TestRouteNotFound -v 2>&1 | grep -q 'PASS'",
+      "hidden_evaluator": "python -c \"import sys; d=open('gin.go').read(); sys.exit(0 if 'MUTATED' not in d and 'StatusNotFound' in d else 1)\"",
       "expected_behavior": "Missing route returns 404",
-      "difficulty_rationale": "Requires locating Engine routing and understanding dispatch"
+      "difficulty_rationale": "Requires locating Engine routing and understanding dispatch",
+      "original_hidden_evaluator": "! grep -q MUTATED gin.go && grep -q 'StatusNotFound' gin.go"
     }
-  ]
+  ],
+  "updated": "2026-08-20"
 }

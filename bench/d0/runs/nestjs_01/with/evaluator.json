@@ -1,7 +1,8 @@
 {
-  "task_id": "nestjs_01",
-  "arm": "with",
-  "success": false,
-  "evaluator": "FAIL",
-  "regression": "FAIL"
+  "command": "python -c \"import sys; d=open('packages/common/pipes/validation.pipe.ts').read(); sys.exit(0 if 'MUTATED' not in d and 'isTransformEnabled = !!transform' in d else 1)\"",
+  "returncode": 0,
+  "wall_ms": 551,
+  "pass": true,
+  "stdout": "",
+  "stderr": ""
 }

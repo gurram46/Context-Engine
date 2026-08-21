@@ -1,7 +1,8 @@
 {
-  "task_id": "django_01",
-  "arm": "with",
-  "success": true,
-  "evaluator": "PASS",
-  "regression": "PASS"
+  "command": "python -c \"import sys; d=open('django/db/transaction.py').read(); sys.exit(0 if 'MUTATED' not in d and 'if connection.in_atomic_block:' in d else 1)\"",
+  "returncode": 0,
+  "wall_ms": 0,
+  "pass": true,
+  "stdout": "",
+  "stderr": ""
 }
