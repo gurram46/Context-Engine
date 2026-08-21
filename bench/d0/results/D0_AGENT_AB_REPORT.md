@@ -1,7 +1,7 @@
 # D0 REAL Agent A/B — LIVE EVIDENCE (Ox Alpha Free)
 
 BASE: d7a38332d5777d1f902ed2bd2e136de83b28e714
-HEAD: <to be filled after commit> (branch d0/controlled-agent-ab)
+HEAD: ce1768fb66ea6f66a55379f14c0249b44363d843 (branch d0/controlled-agent-ab, pushed 2026-08-21)
 BRANCH: d0/controlled-agent-ab
 
 OPENCODE:
