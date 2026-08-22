@@ -1,0 +1,27 @@
+{
+  "task_id": "gin_02",
+  "original": {
+    "command": "go test ./binding -run TestValidationFails -count=1 -v",
+    "returncode": 0,
+    "wall_ms": 59598,
+    "pass": true,
+    "stdout": "=== RUN   TestValidationFails\n--- PASS: TestValidationFails (0.00s)\nPASS\nok  \tgithub.com/gin-gonic/gin/binding\t8.756s\n",
+    "stderr": ""
+  },
+  "mutated": {
+    "command": "go test ./binding -run TestValidationFails -count=1 -v",
+    "returncode": 1,
+    "wall_ms": 23725,
+    "pass": false,
+    "stdout": "=== RUN   TestValidationFails\n    binding_test.go:754: \n        \tError Trace:\tC:/Users/Dell/context/Context-Engine/bench/d0/v2/runs/_validate_gin_02_mutated/binding/binding_test.go:754\n        \tError:      \tAn error is expected but got nil.\n        \tTest:       \tTestValidationFails\n--- FAIL: TestValidationFails (0.00s)\nFAIL\nFAIL\tgithub.com/gin-gonic/gin/binding\t9.641s\nFAIL\n",
+    "stderr": ""
+  },
+  "reference": {
+    "command": "go test ./binding -run TestValidationFails -count=1 -v",
+    "returncode": 0,
+    "wall_ms": 37988,
+    "pass": true,
+    "stdout": "=== RUN   TestValidationFails\n--- PASS: TestValidationFails (0.00s)\nPASS\nok  \tgithub.com/gin-gonic/gin/binding\t9.704s\n",
+    "stderr": ""
+  }
+}

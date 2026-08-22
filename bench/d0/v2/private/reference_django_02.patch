@@ -1,0 +1,13 @@
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -200,7 +200,9 @@ class Q(tree.Node):
+             return True
+ 
+     def deconstruct(self):
+         path = "%s.%s" % (self.__class__.__module__, self.__class__.__name__)
++        if path.startswith("django.db.models.query_utils"):
++            path = path.replace("django.db.models.query_utils", "django.db.models")
+         args = tuple(self.children)
+         kwargs = {}
+         if self.connector != self.default:

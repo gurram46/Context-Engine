@@ -1,0 +1,11 @@
+diff --git a/binding/default_validator.go b/binding/default_validator.go
+--- a/binding/default_validator.go
++++ b/binding/default_validator.go
+@@ -93,6 +93,6 @@ func (v *defaultValidator) Engine() any {
+ func (v *defaultValidator) lazyinit() {
+ 	v.once.Do(func() {
+ 		v.validate = validator.New()
+-		v.validate.SetTagName("validate")
++		v.validate.SetTagName("binding")
+ 	})
+ }

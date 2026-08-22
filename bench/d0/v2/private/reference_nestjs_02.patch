@@ -1,0 +1,15 @@
+diff --git a/packages/core/services/reflector.service.ts b/packages/core/services/reflector.service.ts
+--- a/packages/core/services/reflector.service.ts
++++ b/packages/core/services/reflector.service.ts
+@@ -258,8 +258,8 @@ export class Reflector {
+   ): TResult | undefined {
+     for (const target of targets) {
+       const result = this.get(metadataKeyOrDecorator, target);
+-      if (result) {
++      if (result !== undefined) {
+         return result;
+       }
+     }
+     return undefined;
+   }
+ }

@@ -1,0 +1,7 @@
+{
+  "context_search": true,
+  "symbol_lookup": true,
+  "dependency_trace": true,
+  "test_lookup": true,
+  "context_status": true
+}

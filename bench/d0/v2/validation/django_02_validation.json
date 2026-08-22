@@ -1,0 +1,27 @@
+{
+  "task_id": "django_02",
+  "original": {
+    "command": "C:\\Users\\Dell\\AppData\\Roaming\\uv\\python\\cpython-3.12-windows-x86_64-none\\python.exe C:\\Users\\Dell\\context\\Context-Engine\\bench\\d0\\v2\\private\\evaluator_django_02.py",
+    "returncode": 0,
+    "wall_ms": 10564,
+    "pass": true,
+    "stdout": "pass\n",
+    "stderr": ""
+  },
+  "mutated": {
+    "command": "C:\\Users\\Dell\\AppData\\Roaming\\uv\\python\\cpython-3.12-windows-x86_64-none\\python.exe C:\\Users\\Dell\\context\\Context-Engine\\bench\\d0\\v2\\private\\evaluator_django_02.py",
+    "returncode": 1,
+    "wall_ms": 9467,
+    "pass": false,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"C:\\Users\\Dell\\context\\Context-Engine\\bench\\d0\\v2\\private\\evaluator_django_02.py\", line 6, in <module>\n    assert p=='django.db.models.Q', f'bad path {p}'\n           ^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: bad path django.db.models.query_utils.Q\n"
+  },
+  "reference": {
+    "command": "C:\\Users\\Dell\\AppData\\Roaming\\uv\\python\\cpython-3.12-windows-x86_64-none\\python.exe C:\\Users\\Dell\\context\\Context-Engine\\bench\\d0\\v2\\private\\evaluator_django_02.py",
+    "returncode": 0,
+    "wall_ms": 6161,
+    "pass": true,
+    "stdout": "pass\n",
+    "stderr": ""
+  }
+}

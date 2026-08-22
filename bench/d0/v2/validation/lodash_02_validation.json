@@ -1,0 +1,27 @@
+{
+  "task_id": "lodash_02",
+  "original": {
+    "command": "node -e \"const _=require('./lodash.js'); const a=require('assert'); a.deepStrictEqual(_.slice([1,2,3,4],1,3),[2,3]); a.deepStrictEqual(_.take([1,2,3],2),[1,2]); a.deepStrictEqual(_.drop([1,2,3],1),[2,3]); a.deepStrictEqual(_.slice([1,2,3,4],0,2),[1,2]); a.deepStrictEqual(_.slice([1,2,3],-2),[2,3]); console.log('pass')\"",
+    "returncode": 0,
+    "wall_ms": 2415,
+    "pass": true,
+    "stdout": "pass\n",
+    "stderr": ""
+  },
+  "mutated": {
+    "command": "node -e \"const _=require('./lodash.js'); const a=require('assert'); a.deepStrictEqual(_.slice([1,2,3,4],1,3),[2,3]); a.deepStrictEqual(_.take([1,2,3],2),[1,2]); a.deepStrictEqual(_.drop([1,2,3],1),[2,3]); a.deepStrictEqual(_.slice([1,2,3,4],0,2),[1,2]); a.deepStrictEqual(_.slice([1,2,3],-2),[2,3]); console.log('pass')\"",
+    "returncode": 1,
+    "wall_ms": 646,
+    "pass": false,
+    "stdout": "",
+    "stderr": "node:assert:150\n  throw new AssertionError(obj);\n  ^\n\nAssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\n+ actual - expected\n\n  [\n    2,\n-   3\n  ]\n\n    at [eval]:1:62\n    at runScriptInThisContext (node:internal/vm:209:10)\n    at node:internal/process/execution:446:12\n    at [eval]-wrapper:6:24\n    at runScriptInContext (node:internal/process/execution:444:60)\n    at evalFunction (node:internal/process/execution:279:30)\n    at evalTypeScript (node:internal/process/execution:291:3)\n    at node:internal/main/eval_string:74:3 {\n  generatedMessage: true,\n  code: 'ERR_ASSERTION',\n  actual: [ 2 ],\n  expected: [ 2, 3 ],\n  operator: 'deepStrictEqual',\n  diff: 'simple'\n}\n\nNode.js v22.23.2\n"
+  },
+  "reference": {
+    "command": "node -e \"const _=require('./lodash.js'); const a=require('assert'); a.deepStrictEqual(_.slice([1,2,3,4],1,3),[2,3]); a.deepStrictEqual(_.take([1,2,3],2),[1,2]); a.deepStrictEqual(_.drop([1,2,3],1),[2,3]); a.deepStrictEqual(_.slice([1,2,3,4],0,2),[1,2]); a.deepStrictEqual(_.slice([1,2,3],-2),[2,3]); console.log('pass')\"",
+    "returncode": 0,
+    "wall_ms": 1193,
+    "pass": true,
+    "stdout": "pass\n",
+    "stderr": ""
+  }
+}

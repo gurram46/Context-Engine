@@ -1,0 +1,27 @@
+{
+  "task_id": "nestjs_02",
+  "original": {
+    "command": "python C:\\Users\\Dell\\context\\Context-Engine\\bench\\d0\\v2\\private\\evaluator_nestjs_02.py",
+    "returncode": 0,
+    "wall_ms": 26760,
+    "pass": true,
+    "stdout": "pass\n\n",
+    "stderr": "\n"
+  },
+  "mutated": {
+    "command": "python C:\\Users\\Dell\\context\\Context-Engine\\bench\\d0\\v2\\private\\evaluator_nestjs_02.py",
+    "returncode": 1,
+    "wall_ms": 8115,
+    "pass": false,
+    "stdout": "\n",
+    "stderr": "FAIL: expected false but got admin\n\n"
+  },
+  "reference": {
+    "command": "python C:\\Users\\Dell\\context\\Context-Engine\\bench\\d0\\v2\\private\\evaluator_nestjs_02.py",
+    "returncode": 0,
+    "wall_ms": 8021,
+    "pass": true,
+    "stdout": "pass\n\n",
+    "stderr": "\n"
+  }
+}
