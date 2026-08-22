@@ -7,6 +7,12 @@ pub struct Config {
     pub context_budget: usize,
     pub watcher_enabled: bool,
     pub index_location: Option<PathBuf>,
+    #[serde(default = "default_memory_budget_mb")]
+    pub memory_budget_mb: usize,
+}
+
+fn default_memory_budget_mb() -> usize {
+    512
 }
 
 impl Default for Config {
@@ -17,8 +23,17 @@ impl Default for Config {
             context_budget: 10000,
             watcher_enabled: true,
             index_location: None,
+            memory_budget_mb: 512,
         }
     }
+}
+
+pub fn memory_budget_bytes() -> usize {
+    let mb = std::env::var("CONTEXTD_MEMORY_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512);
+    mb * 1024 * 1024
 }
 
 impl Config {
@@ -49,6 +64,11 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CONTEXTD_SEMANTIC_ENABLED") {
             cfg.semantic_enabled = v != "0" && v.to_lowercase() != "false";
+        }
+        if let Ok(mb) = std::env::var("CONTEXTD_MEMORY_BUDGET_MB") {
+            if let Ok(n) = mb.parse::<usize>() {
+                cfg.memory_budget_mb = n;
+            }
         }
 
         // CLI overrides

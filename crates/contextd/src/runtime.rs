@@ -231,12 +231,22 @@ impl RepositoryRuntime {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn get_or_load_hot(
         &self,
         generation: u64,
         fingerprint: ModelFingerprint,
     ) -> Option<Arc<crate::hot::HotState>> {
-        // Fast read path (no locks held)
+        self.get_or_load_hot_with_vectors(generation, fingerprint, true).await
+    }
+
+    pub(crate) async fn get_or_load_hot_with_vectors(
+        &self,
+        generation: u64,
+        fingerprint: ModelFingerprint,
+        need_vectors: bool,
+    ) -> Option<Arc<crate::hot::HotState>> {
+        // Fast read path
         if let Ok(guard) = self.hot.read() {
             if let Some(hot) = guard.clone() {
                 if hot.generation == generation && hot.fingerprint == fingerprint {
@@ -270,7 +280,12 @@ impl RepositoryRuntime {
         let root = self.root.clone();
         let fp_clone = fingerprint.clone();
         let loaded = tokio::task::spawn_blocking(move || {
-            crate::hot::HotState::load_blocking(&root, generation, fp_clone)
+            crate::hot::HotState::load_blocking_with_options(
+                &root,
+                generation,
+                fp_clone,
+                need_vectors,
+            )
         })
         .await
         .ok()

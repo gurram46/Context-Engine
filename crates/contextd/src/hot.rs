@@ -182,10 +182,14 @@ impl HotBm25 {
 }
 
 /// Hot vector state — contiguous in-memory exact scan.
+/// ponytail: compact contiguous matrix + O(K) heap, avoids per-vector heap + O(N) String sort.
 pub struct HotVectors {
     fingerprint: ModelFingerprint,
-    // vectors as (representation_hash, Vec<f32>)
-    vectors: Vec<(String, Vec<f32>)>,
+    dimension: usize,
+    // contiguous row-major: matrix[i*dimension .. (i+1)*dimension] == vector i
+    matrix: Box<[f32]>,
+    // hash per row, aligned with matrix, for tie-break and chunk_map lookup
+    hashes: Vec<String>,
     // hash -> chunks
     chunk_map: HashMap<String, Vec<VectorChunkInfo>>,
 }
@@ -206,10 +210,11 @@ impl HotVectors {
         fingerprint: &ModelFingerprint,
     ) -> anyhow::Result<Arc<Self>> {
         use rusqlite::params;
-        let mut vectors: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut hashes: Vec<String> = Vec::new();
+        let mut flat: Vec<f32> = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT representation_hash, vector, dimension FROM vectors WHERE representation_version=?1 AND model_id=?2 AND version=?3 AND dimension=?4",
+                "SELECT representation_hash, vector, dimension FROM vectors WHERE representation_version=?1 AND model_id=?2 AND version=?3 AND dimension=?4 ORDER BY representation_hash ASC",
             )?;
             let rows = stmt.query_map(
                 params![
@@ -231,15 +236,15 @@ impl HotVectors {
                 if blob.len() != expected {
                     continue;
                 }
-                let mut vecf = Vec::with_capacity(dim);
-                for chunk in blob.chunks_exact(4) {
-                    let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-                    vecf.push(f32::from_le_bytes(arr));
-                }
-                if vecf.len() != fingerprint.dimension {
+                if dim != fingerprint.dimension {
                     continue;
                 }
-                vectors.push((hash, vecf));
+                // decode directly into flat
+                for chunk in blob.chunks_exact(4) {
+                    let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
+                    flat.push(f32::from_le_bytes(arr));
+                }
+                hashes.push(hash);
             }
         }
         // Load chunk mapping: hash -> chunks via semantic_chunk_refs JOIN chunks
@@ -281,47 +286,102 @@ impl HotVectors {
                     .then_with(|| a.chunk_id.cmp(&b.chunk_id))
             });
         }
+        let count = hashes.len();
+        let expected_flat = count * fingerprint.dimension;
+        // flat should be exactly count*dim, if not, truncate/pad defensively but we built it correctly
+        debug_assert_eq!(flat.len(), expected_flat);
+        let matrix: Box<[f32]> = flat.into_boxed_slice();
         Ok(Arc::new(Self {
             fingerprint: fingerprint.clone(),
-            vectors,
+            dimension: fingerprint.dimension,
+            matrix,
+            hashes,
             chunk_map,
         }))
     }
 
     pub fn count(&self) -> usize {
-        self.vectors.len()
+        self.hashes.len()
     }
 
     pub fn fingerprint(&self) -> &ModelFingerprint {
         &self.fingerprint
     }
 
-    /// In-memory brute search — same logic as vector::search_brute but without SQLite.
+    pub fn estimated_bytes(&self) -> usize {
+        self.matrix.len() * 4
+            + self.hashes.iter().map(|h| h.len()).sum::<usize>()
+            + self.chunk_map.len() * 64
+    }
+
+    /// In-memory brute search — same ranking as vector::search_brute, O(K) heap, no per-vector String clone.
     pub fn search_brute(
         &self,
         query_vec: &[f32],
         limit: usize,
     ) -> anyhow::Result<Vec<VectorCandidate>> {
-        if query_vec.len() != self.fingerprint.dimension {
+        if query_vec.len() != self.dimension {
             anyhow::bail!("dimension mismatch");
         }
-        let mut scored: Vec<(String, f32)> = Vec::with_capacity(self.vectors.len());
-        for (hash, vec) in &self.vectors {
-            if vec.len() != query_vec.len() {
-                continue;
-            }
-            let dot: f32 = vec.iter().zip(query_vec.iter()).map(|(a, b)| a * b).sum();
-            scored.push((hash.clone(), dot));
+        if self.hashes.is_empty() || limit == 0 {
+            return Ok(Vec::new());
         }
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        scored.truncate(limit * 2);
+        let cap = (limit * 2).min(self.hashes.len());
+        // heap item: better = higher score, smaller hash; min-heap via Reverse keeps worst at top
+        #[derive(Clone, Debug)]
+        struct HeapItem {
+            score: f32,
+            hash: String,
+            idx: usize,
+        }
+        impl PartialEq for HeapItem {
+            fn eq(&self, other: &Self) -> bool {
+                self.score.to_bits() == other.score.to_bits() && self.hash == other.hash
+            }
+        }
+        impl Eq for HeapItem {}
+        impl PartialOrd for HeapItem {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for HeapItem {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.score
+                    .total_cmp(&other.score)
+                    .then_with(|| other.hash.cmp(&self.hash))
+            }
+        }
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<HeapItem>> =
+            std::collections::BinaryHeap::with_capacity(cap + 1);
+        let dim = self.dimension;
+        for (idx, hash) in self.hashes.iter().enumerate() {
+            let base = idx * dim;
+            let slice = &self.matrix[base..base + dim];
+            let mut dot: f32 = 0.0;
+            for (a, b) in slice.iter().zip(query_vec.iter()) {
+                dot += a * b;
+            }
+            let item = HeapItem {
+                score: dot,
+                hash: hash.clone(),
+                idx,
+            };
+            if heap.len() < cap {
+                heap.push(std::cmp::Reverse(item));
+            } else if let Some(std::cmp::Reverse(worst)) = heap.peek() {
+                if item > *worst {
+                    heap.pop();
+                    heap.push(std::cmp::Reverse(item));
+                }
+            }
+        }
+        // drain heap into vec sorted best-first (score desc, hash asc)
+        let mut scored: Vec<HeapItem> = heap.into_iter().map(|r| r.0).collect();
+        scored.sort_by(|a, b| b.cmp(a));
         let mut out = Vec::new();
-        for (hash, score) in scored {
-            if let Some(chunks) = self.chunk_map.get(&hash) {
+        for item in scored {
+            if let Some(chunks) = self.chunk_map.get(&item.hash) {
                 for ci in chunks.iter().take(5) {
                     out.push(VectorCandidate {
                         file: ci.file.clone(),
@@ -330,7 +390,7 @@ impl HotVectors {
                         end_line: ci.end_line,
                         symbol: ci.parent_symbol.clone(),
                         content_hash: ci.content_hash.clone(),
-                        score: score as f64,
+                        score: item.score as f64,
                     });
                     if out.len() >= limit {
                         break;
@@ -369,6 +429,15 @@ impl HotState {
         requested_generation: u64,
         fingerprint: ModelFingerprint,
     ) -> anyhow::Result<Self> {
+        Self::load_blocking_with_options(root, requested_generation, fingerprint, true)
+    }
+
+    pub fn load_blocking_with_options(
+        root: &Path,
+        requested_generation: u64,
+        fingerprint: ModelFingerprint,
+        need_vectors: bool,
+    ) -> anyhow::Result<Self> {
         let conn = structural_store::open_db(root)?;
         // Use a read transaction for a consistent snapshot across all loads.
         conn.execute("BEGIN", [])?;
@@ -382,9 +451,27 @@ impl HotState {
             );
         }
         let bm25 = HotBm25::load(&conn)?;
-        let vectors = match HotVectors::load(&conn, &fingerprint) {
-            Ok(v) if v.count() > 0 => Some(v),
-            _ => None,
+        let vectors = if !need_vectors {
+            None
+        } else {
+            // budget check before allocating contiguous matrix
+            let budget = crate::config::memory_budget_bytes();
+            let est_bytes = context_index::vector::count_vectors(&conn, &fingerprint)
+                .map(|c| (c as usize) * fingerprint.dimension * 4)
+                .unwrap_or(0);
+            if est_bytes > budget {
+                tracing::info!(
+                    estimated_bytes = est_bytes,
+                    budget_bytes = budget,
+                    "hot vectors exceed memory budget, using cold fallback"
+                );
+                None
+            } else {
+                match HotVectors::load(&conn, &fingerprint) {
+                    Ok(v) if v.count() > 0 => Some(v),
+                    _ => None,
+                }
+            }
         };
         let db_generation2 = structural_store::get_generation(&conn).unwrap_or(0);
         if db_generation2 != requested_generation {

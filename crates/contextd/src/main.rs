@@ -4,6 +4,7 @@ mod bridge;
 mod candidate;
 mod cli;
 mod config;
+mod daemon;
 mod hot;
 mod mcp;
 mod pipeline;

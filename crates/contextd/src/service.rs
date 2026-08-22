@@ -123,6 +123,25 @@ pub struct StatusReport {
     pub stale_vector_count: usize,
     pub watcher_state: String,
     pub store_schema_version: Option<u32>,
+    // R1 resource hardening fields
+    #[serde(default)]
+    pub daemon_pid: Option<u32>,
+    #[serde(default)]
+    pub client_count: Option<usize>,
+    #[serde(default)]
+    pub shared_runtime: bool,
+    #[serde(default)]
+    pub memory_budget_mb: usize,
+    #[serde(default)]
+    pub hot_bm25_loaded: bool,
+    #[serde(default)]
+    pub hot_vectors_loaded: bool,
+    #[serde(default)]
+    pub hot_vector_count: usize,
+    #[serde(default)]
+    pub estimated_hot_vector_bytes: usize,
+    #[serde(default)]
+    pub generation: Option<u64>,
 }
 
 /// Native service — single core for CLI and MCP.
@@ -707,11 +726,25 @@ impl ContextService {
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
         let runtime_access_ms = t_access.elapsed().as_millis();
         // Hot retrieval state — generation+fingerprint bound, lazy loaded, read-only
+        // ponytail: split hot — BM25 always, vectors only when semantic needed and budget allows
         let hot = if !is_override {
             let fp = self.runtime.semantic_fingerprint();
-            // get_or_load_hot is async and may block on first load per generation (1-2s for large repos)
-            // but subsequent clean queries reuse in-memory hot without DB or filesystem.
-            self.runtime.get_or_load_hot(access.generation, fp).await
+            let semantic_disabled = std::env::var("CONTEXTD_SEMANTIC_ENABLED")
+                .map(|v| v == "0" || v.to_lowercase() == "false")
+                .unwrap_or(false);
+            let need_vectors = if semantic_disabled {
+                false
+            } else {
+                let qt = context_rank::classify_query(query).query_type;
+                matches!(
+                    qt,
+                    context_rank::types::QueryType::Conceptual
+                        | context_rank::types::QueryType::Mixed
+                )
+            };
+            self.runtime
+                .get_or_load_hot_with_vectors(access.generation, fp, need_vectors)
+                .await
         } else {
             None
         };
@@ -1196,6 +1229,25 @@ impl ContextService {
             stale_vector_count: stale,
             watcher_state,
             store_schema_version: store_version,
+            // R1
+            daemon_pid: Some(std::process::id()),
+            client_count: None,
+            shared_runtime: false,
+            memory_budget_mb: crate::config::memory_budget_bytes() / (1024 * 1024),
+            hot_bm25_loaded: self
+                .runtime
+                .peek_hot(generation.unwrap_or(0), &fingerprint)
+                .await
+                .is_some(),
+            hot_vectors_loaded: self
+                .runtime
+                .peek_hot(generation.unwrap_or(0), &fingerprint)
+                .await
+                .and_then(|h| h.vectors.clone())
+                .is_some(),
+            hot_vector_count: vector_count,
+            estimated_hot_vector_bytes: vector_count * dim * 4,
+            generation,
         })
     }
 }
