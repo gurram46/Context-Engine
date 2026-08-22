@@ -63,6 +63,8 @@ pub enum Command {
         #[arg(long)]
         semantic: bool,
     },
+    /// Run global daemon (internal, spawned detached)
+    Daemon,
 }
 
 fn opts(cli: &Cli) -> SearchOptions {
@@ -278,6 +280,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     println!("schema version: {}", v);
                 }
             }
+        }
+        Some(Command::Daemon) => {
+            crate::daemon::run_global_daemon().await?;
         }
         Some(Command::Index { semantic }) => {
             let svc = ContextService::new_for_index(root)?;

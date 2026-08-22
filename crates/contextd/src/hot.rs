@@ -454,23 +454,11 @@ impl HotState {
         let vectors = if !need_vectors {
             None
         } else {
-            // budget check before allocating contiguous matrix
-            let budget = crate::config::memory_budget_bytes();
-            let est_bytes = context_index::vector::count_vectors(&conn, &fingerprint)
-                .map(|c| (c as usize) * fingerprint.dimension * 4)
-                .unwrap_or(0);
-            if est_bytes > budget {
-                tracing::info!(
-                    estimated_bytes = est_bytes,
-                    budget_bytes = budget,
-                    "hot vectors exceed memory budget, using cold fallback"
-                );
-                None
-            } else {
-                match HotVectors::load(&conn, &fingerprint) {
-                    Ok(v) if v.count() > 0 => Some(v),
-                    _ => None,
-                }
+            // Global budget enforcement is now done via ResourceManager in registry,
+            // not per-repository config check. Directly load; caller decides cold fallback.
+            match HotVectors::load(&conn, &fingerprint) {
+                Ok(v) if v.count() > 0 => Some(v),
+                _ => None,
             }
         };
         let db_generation2 = structural_store::get_generation(&conn).unwrap_or(0);

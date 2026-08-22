@@ -30,6 +30,18 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing early but allow cli.rs to handle debug flag; init here with env filter
     // We defer init to cli.rs for search paths, but for MCP we need it now
     match &cli.command {
+        Some(Command::Daemon) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .with_writer(std::io::stderr)
+                .try_init();
+            info!(version = %VERSION, pid = %std::process::id(), "starting contextd global daemon");
+            daemon::run_global_daemon().await?;
+            return Ok(());
+        }
         Some(Command::Mcp) | None => {
             // MCP mode: init tracing to stderr
             let _ = tracing_subscriber::fmt()

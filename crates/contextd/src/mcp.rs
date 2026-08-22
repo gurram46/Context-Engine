@@ -11,7 +11,7 @@ use rmcp::{
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::service::{ContextService, Direction, SearchOptions};
 
@@ -26,6 +26,36 @@ pub struct McpAdapter {
     service: ServiceKind,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+    // real client tracking
+    client_id: Option<String>,
+    client_root: Option<PathBuf>,
+}
+
+fn is_global_daemon_disabled() -> bool {
+    std::env::var("CONTEXTD_GLOBAL_DAEMON_DISABLE")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+fn spawn_detached_daemon() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon");
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        cmd.creation_flags(0x00000008 | 0x00000200 | 0x08000000);
+    }
+    #[cfg(unix)]
+    {
+        // nothing extra, spawn detached via setsid is not needed; just spawn
+    }
+    let _ = cmd.spawn()?;
+    Ok(())
 }
 
 impl McpAdapter {
@@ -34,72 +64,126 @@ impl McpAdapter {
             root.clone()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         });
-        // Try global daemon first
+        // If explicitly disabled, fallback to local
+        if is_global_daemon_disabled() {
+            warn!("global daemon disabled via CONTEXTD_GLOBAL_DAEMON_DISABLE, using local");
+            let svc = ContextService::new(root.clone()).await?;
+            return Ok(Self {
+                service: ServiceKind::Local(Arc::new(svc)),
+                tool_router: Self::tool_router(),
+                client_id: None,
+                client_root: None,
+            });
+        }
+
+        // Bounded retry/backoff for daemon startup
+        // Try attach first
         if let Some(client) = crate::daemon::try_attach_global().await {
-            // Create a client for this root that talks to global daemon
             let remote = crate::daemon::RemoteClient {
                 addr: client.addr.clone(),
                 root: canon.clone(),
                 pid: client.pid,
             };
-            info!(addr=%remote.addr, root=%canon.display(), "attaching to global daemon");
+            // register real client
+            let client_id = Self::register_with_daemon(&remote, &canon).await;
+            info!(addr=%remote.addr, root=%canon.display(), client_id=?client_id, "attached to global daemon");
             return Ok(Self {
                 service: ServiceKind::Remote(remote),
                 tool_router: Self::tool_router(),
+                client_id,
+                client_root: Some(canon),
             });
         }
-        // No global daemon, try to become it
-        match crate::daemon::try_become_global_daemon().await {
-            Ok((listener, meta)) => {
-                info!(port=%meta.port, pid=%meta.pid, "became global daemon");
-                let registry = Arc::new(crate::registry::RepositoryRegistry::new(
-                    crate::config::memory_budget_bytes(),
-                ));
-                let global = crate::daemon::GlobalDaemon {
-                    registry: registry.clone(),
-                    listener,
-                    meta: meta.clone(),
-                };
-                tokio::spawn(global.run());
-                // This process also becomes a thin client to its own global daemon
-                let remote = crate::daemon::RemoteClient {
-                    addr: format!("127.0.0.1:{}", meta.port),
-                    root: canon.clone(),
-                    pid: meta.pid,
-                };
-                // Ensure registry has entry for this root (lazy, but pre-warm)
-                let _ = registry.get_or_create(canon.clone()).await;
-                return Ok(Self {
-                    service: ServiceKind::Remote(remote),
-                    tool_router: Self::tool_router(),
-                });
-            }
-            Err(_) => {
-                // Someone else won, try attach again
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if let Some(client) = crate::daemon::try_attach_global().await {
-                    let remote = crate::daemon::RemoteClient {
-                        addr: client.addr.clone(),
-                        root: canon.clone(),
-                        pid: client.pid,
-                    };
-                    return Ok(Self {
-                        service: ServiceKind::Remote(remote),
-                        tool_router: Self::tool_router(),
-                    });
-                }
-                // Fallback to stale cleanup and local
+
+        // No daemon, try to spawn detached with startup singleflight
+        // Use global lock file as startup guard: try to create startup lock
+        // But we use spawn_detached and retry, avoiding many heavy fallbacks
+        let mut spawned = false;
+        for attempt in 0..30 {
+            if attempt == 0 {
+                // First attempt: try spawn if no daemon
                 if crate::daemon::is_global_stale().await {
                     crate::daemon::cleanup_global_stale().await;
                 }
+                // Only spawn if still no daemon
+                if crate::daemon::try_attach_global().await.is_none() {
+                    if let Err(e) = spawn_detached_daemon() {
+                        warn!(error=%e, "failed to spawn detached daemon");
+                    } else {
+                        spawned = true;
+                        info!("spawned detached daemon");
+                    }
+                }
+            }
+            // wait backoff 100ms * attempt factor
+            let backoff = std::time::Duration::from_millis(100 * (attempt as u64 / 5 + 1));
+            tokio::time::sleep(backoff).await;
+            if let Some(client) = crate::daemon::try_attach_global().await {
+                let remote = crate::daemon::RemoteClient {
+                    addr: client.addr.clone(),
+                    root: canon.clone(),
+                    pid: client.pid,
+                };
+                let client_id = Self::register_with_daemon(&remote, &canon).await;
+                info!(addr=%remote.addr, root=%canon.display(), client_id=?client_id, attempt=%attempt, "attached after spawn");
+                return Ok(Self {
+                    service: ServiceKind::Remote(remote),
+                    tool_router: Self::tool_router(),
+                    client_id,
+                    client_root: Some(canon),
+                });
+            }
+            if attempt == 15 && !spawned {
+                // mid-retry: try spawn again if still not up
+                if crate::daemon::try_attach_global().await.is_none() {
+                    let _ = spawn_detached_daemon();
+                }
             }
         }
-        // Fallback: local heavy service (should rarely happen)
+
+        // Bounded retry exhausted: check if fatal
+        if crate::daemon::is_global_stale().await {
+            crate::daemon::cleanup_global_stale().await;
+        }
+        // Only fallback to local if daemon truly not available after bounded retry
+        // This must be observable
+        warn!("global daemon not available after bounded retry, falling back to local heavy (observable)");
         let svc = ContextService::new(root.clone()).await?;
         Ok(Self {
             service: ServiceKind::Local(Arc::new(svc)),
             tool_router: Self::tool_router(),
+            client_id: None,
+            client_root: None,
         })
+    }
+
+    async fn register_with_daemon(
+        remote: &crate::daemon::RemoteClient,
+        root: &std::path::Path,
+    ) -> Option<String> {
+        // Generate stable client id
+        let id = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                % 1_000_000,
+            rand_u32()
+        );
+        let params = serde_json::json!({"client_id": id, "root": root.display().to_string()});
+        match remote.call("register_client", params).await {
+            Ok(v) => {
+                // daemon may return client_id echo
+                if let Some(cid) = v.get("client_id").and_then(|x| x.as_str()) {
+                    Some(cid.to_string())
+                } else {
+                    Some(id)
+                }
+            }
+            Err(_) => Some(id), // still track locally
+        }
     }
 
     fn opts(params_budget: Option<u32>, params_max: Option<u32>) -> SearchOptions {
@@ -107,6 +191,37 @@ impl McpAdapter {
             budget_tokens: params_budget.unwrap_or(10000) as usize,
             max_results: params_max.unwrap_or(10) as usize,
             debug: false,
+        }
+    }
+}
+
+fn rand_u32() -> u32 {
+    // simple xorshift based on time and pid
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    let mut x = t ^ (pid << 32);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    (x & 0xFFFFFFFF) as u32
+}
+
+impl Drop for McpAdapter {
+    fn drop(&mut self) {
+        if let (Some(client_id), Some(root), ServiceKind::Remote(remote)) = (
+            self.client_id.clone(),
+            self.client_root.clone(),
+            self.service.clone(),
+        ) {
+            let remote_clone = remote.clone();
+            tokio::task::spawn(async move {
+                let params =
+                    serde_json::json!({"client_id": client_id, "root": root.display().to_string()});
+                let _ = remote_clone.call("unregister_client", params).await;
+            });
         }
     }
 }

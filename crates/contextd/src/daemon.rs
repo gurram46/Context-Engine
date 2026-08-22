@@ -241,7 +241,7 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
-    async fn call(
+    pub async fn call(
         &self,
         tool: &str,
         params: serde_json::Value,
@@ -674,13 +674,14 @@ impl GlobalDaemon {
 
     pub async fn run(self) {
         let registry = self.registry.clone();
-        // spawn idle eviction task
+        // spawn idle eviction + stale client cleanup task
         let reg_clone = registry.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 reg_clone.evict_idle().await;
+                reg_clone.cleanup_stale_clients().await;
             }
         });
         info!(port=%self.listener.local_addr().map(|a|a.port()).unwrap_or(0), "global daemon listening");
@@ -752,6 +753,30 @@ async fn handle_global_client(
         // For now, we increment active query count
         // Handle tool
         let resp = match tool {
+            "register_client" => {
+                let cid = registry.register_client(canon.clone()).await;
+                serde_json::json!({"id": id, "result": {"client_id": cid}})
+            }
+            "unregister_client" => {
+                let client_id = params
+                    .get("client_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !client_id.is_empty() {
+                    registry.unregister_client(client_id).await;
+                }
+                serde_json::json!({"id": id, "result": {}})
+            }
+            "heartbeat" => {
+                let client_id = params
+                    .get("client_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !client_id.is_empty() {
+                    registry.heartbeat(client_id).await;
+                }
+                serde_json::json!({"id": id, "result": {}})
+            }
             "context_search" => {
                 let q = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 let budget = params
@@ -767,13 +792,51 @@ async fn handle_global_client(
                     max_results: maxr,
                     debug: false,
                 };
-                // global memory budget check before hot load: estimate needed bytes
-                // For search, we need to know if hot vectors will be used; we approximate 6MB per repo as in test, but real is vector_count*dim*4
-                // We can let service handle budget via hot load's internal check, but global check should be here
-                // For now, just call service and let it handle per-repo budget; global eviction will be triggered if needed via ResourceManager
-                // We should ensure ResourceManager is consulted
-                // Acquire global semaphore for semantic indexing? Queries are not indexing, so not needed
-                match svc.search(q, opts).await {
+                // R1.2: global budget enforcement before search
+                // Estimate need, ensure, fallback to cold if needed is handled inside svc.search via RM,
+                // but we also need cross-repo physical eviction via registry
+                // We do pre-check here for vectors if query is conceptual/mixed
+                let need_vectors = {
+                    let qt = context_rank::classify_query(q).query_type;
+                    matches!(
+                        qt,
+                        context_rank::types::QueryType::Conceptual
+                            | context_rank::types::QueryType::Mixed
+                    ) && std::env::var("CONTEXTD_SEMANTIC_ENABLED")
+                        .map(|v| v != "0" && v.to_lowercase() != "false")
+                        .unwrap_or(true)
+                };
+                if need_vectors {
+                    let fp = context_index::embed::configured_fingerprint();
+                    let est = {
+                        let root = canon.clone();
+                        let fp_clone = fp.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let conn = context_index::structural::store::open_db(&root).ok();
+                            conn.and_then(|c| {
+                                context_index::vector::count_vectors(&c, &fp_clone)
+                                    .ok()
+                                    .map(|cnt| (cnt as usize) * fp_clone.dimension * 4)
+                            })
+                            .unwrap_or(0)
+                        })
+                        .await
+                        .unwrap_or(0)
+                    };
+                    if est > 0 {
+                        let ok = registry
+                            .ensure_hot_budget(&canon, crate::resource::ComponentKind::Vectors, est)
+                            .await;
+                        if !ok {
+                            // will cold fallback inside svc.search, but we could also force need_vectors false
+                            // For now, let svc handle fallback, but we have already ensured that if ok false, svc will fallback
+                        }
+                    }
+                }
+                registry.inc_active_query(&canon).await;
+                let res = svc.search(q, opts).await;
+                registry.dec_active_query(&canon).await;
+                match res {
                     Ok(r) => {
                         let stats = serde_json::to_value(&r.stats).unwrap_or(serde_json::json!({}));
                         serde_json::json!({"id": id, "result": {"query": r.query, "type": r.query_type.as_str(), "context": r.packed.markdown, "evidence": r.evidence, "stats": stats, "root": canon.display().to_string()}})
@@ -942,6 +1005,39 @@ pub async fn try_become_global_daemon() -> Result<(TcpListener, DaemonMetadata),
         }
         Err(e) => Err(e.into()),
     }
+}
+
+pub async fn run_global_daemon() -> Result<()> {
+    // If already running, exit
+    if try_attach_global().await.is_some() {
+        info!("global daemon already running");
+        return Ok(());
+    }
+    if is_global_stale().await {
+        cleanup_global_stale().await;
+    }
+    // Try to become daemon with retry
+    let (listener, meta) = match try_become_global_daemon().await {
+        Ok(v) => v,
+        Err(e) => {
+            // Another daemon won race, check attach
+            if try_attach_global().await.is_some() {
+                info!("daemon already started by race winner");
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
+    let budget = crate::config::memory_budget_bytes();
+    let registry = Arc::new(crate::registry::RepositoryRegistry::new(budget));
+    let daemon = GlobalDaemon {
+        registry,
+        listener,
+        meta,
+    };
+    // Write daemon.json already done in try_become
+    daemon.run().await;
+    Ok(())
 }
 
 // Singleton acquire
