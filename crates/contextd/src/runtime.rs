@@ -59,7 +59,7 @@ pub(crate) struct RuntimeData {
     reconcile_total: u64,
 }
 
-pub(crate) struct RepositoryRuntime {
+pub struct RepositoryRuntime {
     #[allow(dead_code)]
     root: PathBuf,
     pub(crate) tracker: DirtyTracker,
@@ -231,12 +231,23 @@ impl RepositoryRuntime {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn get_or_load_hot(
         &self,
         generation: u64,
         fingerprint: ModelFingerprint,
     ) -> Option<Arc<crate::hot::HotState>> {
-        // Fast read path (no locks held)
+        self.get_or_load_hot_with_vectors(generation, fingerprint, true)
+            .await
+    }
+
+    pub async fn get_or_load_hot_with_vectors(
+        &self,
+        generation: u64,
+        fingerprint: ModelFingerprint,
+        need_vectors: bool,
+    ) -> Option<Arc<crate::hot::HotState>> {
+        // Fast read path
         if let Ok(guard) = self.hot.read() {
             if let Some(hot) = guard.clone() {
                 if hot.generation == generation && hot.fingerprint == fingerprint {
@@ -270,7 +281,12 @@ impl RepositoryRuntime {
         let root = self.root.clone();
         let fp_clone = fingerprint.clone();
         let loaded = tokio::task::spawn_blocking(move || {
-            crate::hot::HotState::load_blocking(&root, generation, fp_clone)
+            crate::hot::HotState::load_blocking_with_options(
+                &root,
+                generation,
+                fp_clone,
+                need_vectors,
+            )
         })
         .await
         .ok()
@@ -350,6 +366,29 @@ impl RepositoryRuntime {
             }
         }
         None
+    }
+
+    pub(crate) async fn evict_hot(&self, kind: crate::resource::ComponentKind) {
+        let mut guard = self.hot.write().expect("hot poisoned");
+        if let Some(hot) = guard.clone() {
+            match kind {
+                crate::resource::ComponentKind::Vectors => {
+                    if hot.vectors.is_some() {
+                        let new_hot = std::sync::Arc::new(crate::hot::HotState {
+                            generation: hot.generation,
+                            fingerprint: hot.fingerprint.clone(),
+                            bm25: hot.bm25.clone(),
+                            vectors: None,
+                            created_at: std::time::Instant::now(),
+                        });
+                        *guard = Some(new_hot);
+                    }
+                }
+                crate::resource::ComponentKind::Bm25 => {
+                    *guard = None;
+                }
+            }
+        }
     }
 
     #[cfg(test)]

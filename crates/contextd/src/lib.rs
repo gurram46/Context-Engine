@@ -3,8 +3,11 @@ pub mod bridge;
 #[cfg(feature = "legacy-v2")]
 pub mod candidate;
 pub mod config;
+pub mod daemon;
 pub mod hot;
 pub mod pipeline;
 pub mod project;
+pub mod registry;
+pub mod resource;
 pub mod runtime;
 pub mod service;

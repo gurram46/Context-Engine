@@ -11,7 +11,9 @@ use context_index::structural::{detect_language, Language};
 use context_index::{ProjectIndex, ProjectRoot};
 
 use crate::pipeline::{retrieve_context, ContextResult, Providers};
+use crate::resource::{ComponentKind, ResourceManager};
 use crate::runtime::{RepositoryRuntime, RuntimeState};
+use tokio::sync::Semaphore;
 
 /// Options for search-like calls.
 #[derive(Debug, Clone)]
@@ -123,6 +125,38 @@ pub struct StatusReport {
     pub stale_vector_count: usize,
     pub watcher_state: String,
     pub store_schema_version: Option<u32>,
+    // R1 resource hardening fields
+    #[serde(default)]
+    pub daemon_pid: Option<u32>,
+    #[serde(default)]
+    pub client_count: Option<usize>,
+    #[serde(default)]
+    pub shared_runtime: bool,
+    #[serde(default)]
+    pub memory_budget_mb: usize,
+    #[serde(default)]
+    pub hot_bm25_loaded: bool,
+    #[serde(default)]
+    pub hot_vectors_loaded: bool,
+    #[serde(default)]
+    pub hot_vector_count: usize,
+    #[serde(default)]
+    pub estimated_hot_vector_bytes: usize,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    // R1.1 global
+    #[serde(default)]
+    pub global_client_count: Option<usize>,
+    #[serde(default)]
+    pub repository_client_count: Option<usize>,
+    #[serde(default)]
+    pub repository_runtime_count: Option<usize>,
+    #[serde(default)]
+    pub global_memory_budget_mb: Option<usize>,
+    #[serde(default)]
+    pub estimated_hot_memory_bytes: Option<usize>,
+    #[serde(default)]
+    pub repository_estimated_hot_memory_bytes: Option<usize>,
 }
 
 /// Native service — single core for CLI and MCP.
@@ -130,12 +164,24 @@ pub struct ContextService {
     root: PathBuf,
     explicit_root: Option<PathBuf>,
     runtime: Arc<RepositoryRuntime>,
+    resource_manager: Option<Arc<ResourceManager>>,
+    global_semaphore: Option<Arc<Semaphore>>,
+    registry: Option<std::sync::Weak<crate::registry::RepositoryRegistry>>,
 }
 
 impl ContextService {
+    fn canon(p: &std::path::Path) -> PathBuf {
+        let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let s = c.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            PathBuf::from(stripped)
+        } else {
+            c
+        }
+    }
     fn build(root: Option<PathBuf>) -> Result<Self, ContextError> {
         let root_path = if let Some(p) = root.clone() {
-            p.canonicalize().unwrap_or(p)
+            Self::canon(&p)
         } else {
             ProjectRoot::resolve(None)
                 .map(|r| r.path().to_path_buf())
@@ -148,7 +194,30 @@ impl ContextService {
             root: root_path,
             explicit_root: root,
             runtime,
+            resource_manager: None,
+            global_semaphore: None,
+            registry: None,
         })
+    }
+
+    pub(crate) async fn new_with_resources(
+        root: Option<PathBuf>,
+        rm: Arc<ResourceManager>,
+        sem: Arc<Semaphore>,
+    ) -> Result<Self, ContextError> {
+        let mut svc = Self::build(root)?;
+        svc.resource_manager = Some(rm);
+        svc.global_semaphore = Some(sem);
+        // initialize (reconcile)
+        svc.initialize().await?;
+        Ok(svc)
+    }
+
+    pub(crate) fn set_registry(
+        &mut self,
+        reg: std::sync::Weak<crate::registry::RepositoryRegistry>,
+    ) {
+        self.registry = Some(reg);
     }
 
     /// Create service for given root (or auto-resolve via ProjectRoot::resolve).
@@ -228,6 +297,11 @@ impl ContextService {
         let mut embedding_calls = 0usize;
 
         if backend_available {
+            let _heavy_permit = if let Some(sem) = self.global_semaphore.clone() {
+                Some(sem.acquire_owned().await.unwrap())
+            } else {
+                None
+            };
             let embedder: Arc<dyn Embedder> = if let Some(e) = override_embedder.clone() {
                 e
             } else {
@@ -342,6 +416,12 @@ impl ContextService {
             context_index::embed::is_configured_model_available().await
         };
         if backend_available {
+            // R1.2: global semaphore limits heavy semantic to 1 concurrent
+            let _heavy_permit = if let Some(sem) = self.global_semaphore.clone() {
+                Some(sem.acquire_owned().await.unwrap())
+            } else {
+                None
+            };
             let embedder: Arc<dyn Embedder> = override_embedder
                 .unwrap_or_else(|| Arc::new(context_index::embed::configured_embedder()));
             match structural_store::open_db(&full.project.root) {
@@ -565,6 +645,12 @@ impl ContextService {
         let mut embedding_calls = 0usize;
 
         if backend_available {
+            // R1.2: heavy semantic serialized globally
+            let _heavy_permit = if let Some(sem) = self.global_semaphore.clone() {
+                Some(sem.acquire_owned().await.unwrap())
+            } else {
+                None
+            };
             let embedder: Arc<dyn Embedder> = override_embedder
                 .clone()
                 .unwrap_or_else(|| Arc::new(context_index::embed::configured_embedder()));
@@ -707,14 +793,94 @@ impl ContextService {
             .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
         let runtime_access_ms = t_access.elapsed().as_millis();
         // Hot retrieval state — generation+fingerprint bound, lazy loaded, read-only
+        // ponytail: split hot — BM25 always, vectors only when semantic needed and budget allows
+        // R1.2: global budget and pinning (RAII guard)
+        let mut _pin_vectors: Option<crate::resource::PinGuard> = None;
+        let mut _pin_bm25: Option<crate::resource::PinGuard> = None;
         let hot = if !is_override {
             let fp = self.runtime.semantic_fingerprint();
-            // get_or_load_hot is async and may block on first load per generation (1-2s for large repos)
-            // but subsequent clean queries reuse in-memory hot without DB or filesystem.
-            self.runtime.get_or_load_hot(access.generation, fp).await
+            let semantic_disabled = std::env::var("CONTEXTD_SEMANTIC_ENABLED")
+                .map(|v| v == "0" || v.to_lowercase() == "false")
+                .unwrap_or(false);
+            let mut need_vectors = if semantic_disabled {
+                false
+            } else {
+                let qt = context_rank::classify_query(query).query_type;
+                matches!(
+                    qt,
+                    context_rank::types::QueryType::Conceptual
+                        | context_rank::types::QueryType::Mixed
+                )
+            };
+            // Global budget enforcement before hot load
+            if need_vectors {
+                if let Some(rm) = self.resource_manager.clone() {
+                    let est = {
+                        let root = self.root.clone();
+                        let fp_clone = fp.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let conn = context_index::structural::store::open_db(&root).ok();
+                            conn.and_then(|c| {
+                                context_index::vector::count_vectors(&c, &fp_clone)
+                                    .ok()
+                                    .map(|cnt| (cnt as usize) * fp_clone.dimension * 4)
+                            })
+                            .unwrap_or(0)
+                        })
+                        .await
+                        .unwrap_or(0)
+                    };
+                    if est > 0 && est > rm.budget_bytes() {
+                        need_vectors = false;
+                    } else if est > 0 {
+                        let ok = rm.ensure_budget(est, |_r, _k| {}).await;
+                        if !ok {
+                            need_vectors = false;
+                        }
+                    }
+                }
+            }
+            let hot_opt = self
+                .runtime
+                .get_or_load_hot_with_vectors(access.generation, fp.clone(), need_vectors)
+                .await;
+            if let Some(hot_ref) = hot_opt.clone() {
+                if let Some(rm) = self.resource_manager.clone() {
+                    let vec_bytes = hot_ref
+                        .vectors
+                        .as_ref()
+                        .map(|v| v.estimated_bytes())
+                        .unwrap_or(0);
+                    if vec_bytes > 0 {
+                        rm.register(&self.root, ComponentKind::Vectors, vec_bytes)
+                            .await;
+                    }
+                    if hot_ref.bm25.doc_count() > 0 {
+                        let bm25_est = hot_ref.bm25.doc_count() * 256;
+                        rm.register(&self.root, ComponentKind::Bm25, bm25_est).await;
+                    }
+                    // Create RAII pins that live across retrieve_context
+                    if hot_ref.vectors.is_some() {
+                        _pin_vectors = Some(
+                            crate::resource::PinGuard::new(
+                                rm.clone(),
+                                self.root.clone(),
+                                ComponentKind::Vectors,
+                            )
+                            .await,
+                        );
+                    }
+                    _pin_bm25 = Some(
+                        crate::resource::PinGuard::new(rm, self.root.clone(), ComponentKind::Bm25)
+                            .await,
+                    );
+                }
+            }
+            hot_opt
         } else {
             None
         };
+        // _pin_* guards live until after retrieve_context
         let providers = Providers {};
         let mut res = retrieve_context(
             query,
@@ -1166,6 +1332,26 @@ impl ContextService {
         } else {
             rust_version
         };
+        // R1.2: truthful hot memory from ResourceManager
+        let (mem_budget_mb, est_hot_bytes, repo_est_hot_bytes) =
+            if let Some(rm) = self.resource_manager.clone() {
+                let total = rm.total_bytes().await;
+                let repo_bytes = rm
+                    .estimated_bytes_for(&self.root, ComponentKind::Vectors)
+                    .await
+                    .unwrap_or(0)
+                    + rm.estimated_bytes_for(&self.root, ComponentKind::Bm25)
+                        .await
+                        .unwrap_or(0);
+                (rm.budget_bytes() / (1024 * 1024), total, repo_bytes)
+            } else {
+                let est = vector_count * dim * 4;
+                (
+                    crate::config::memory_budget_bytes() / (1024 * 1024),
+                    est,
+                    est,
+                )
+            };
         Ok(StatusReport {
             version: version.clone(),
             contextd_version: version,
@@ -1196,7 +1382,41 @@ impl ContextService {
             stale_vector_count: stale,
             watcher_state,
             store_schema_version: store_version,
+            // R1
+            daemon_pid: Some(std::process::id()),
+            client_count: None,
+            shared_runtime: self.resource_manager.is_some(),
+            memory_budget_mb: mem_budget_mb,
+            hot_bm25_loaded: self
+                .runtime
+                .peek_hot(generation.unwrap_or(0), &fingerprint)
+                .await
+                .is_some(),
+            hot_vectors_loaded: self
+                .runtime
+                .peek_hot(generation.unwrap_or(0), &fingerprint)
+                .await
+                .and_then(|h| h.vectors.clone())
+                .is_some(),
+            hot_vector_count: vector_count,
+            estimated_hot_vector_bytes: vector_count * dim * 4,
+            generation,
+            global_client_count: None,
+            repository_client_count: None,
+            repository_runtime_count: None,
+            global_memory_budget_mb: Some(mem_budget_mb),
+            estimated_hot_memory_bytes: Some(est_hot_bytes),
+            repository_estimated_hot_memory_bytes: Some(repo_est_hot_bytes),
         })
+    }
+
+    pub async fn evict_hot(&self, kind: crate::resource::ComponentKind) -> anyhow::Result<()> {
+        self.runtime.evict_hot(kind).await;
+        Ok(())
+    }
+
+    pub fn runtime_arc(&self) -> std::sync::Arc<crate::runtime::RepositoryRuntime> {
+        self.runtime.clone()
     }
 }
 
