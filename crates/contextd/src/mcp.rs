@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use context_core::{
@@ -10,7 +11,6 @@ use rmcp::{
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use std::path::PathBuf;
 use tracing::info;
 
 use crate::service::{ContextService, Direction, SearchOptions};
@@ -30,60 +30,74 @@ pub struct McpAdapter {
 
 impl McpAdapter {
     pub async fn new(root: Option<PathBuf>) -> Result<Self, anyhow::Error> {
-        // Resolve canonical root for daemon identity
         let canon = crate::daemon::resolve_canonical_root(root.clone()).unwrap_or_else(|_| {
             root.clone()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         });
-        // Try attach to existing daemon first (thin client)
-        if let Some(client) = crate::daemon::try_attach(&canon).await {
-            info!(addr=%client.addr, root=%canon.display(), "attaching to shared daemon");
+        // Try global daemon first
+        if let Some(client) = crate::daemon::try_attach_global().await {
+            // Create a client for this root that talks to global daemon
+            let remote = crate::daemon::RemoteClient {
+                addr: client.addr.clone(),
+                root: canon.clone(),
+                pid: client.pid,
+            };
+            info!(addr=%remote.addr, root=%canon.display(), "attaching to global daemon");
             return Ok(Self {
-                service: ServiceKind::Remote(client),
+                service: ServiceKind::Remote(remote),
                 tool_router: Self::tool_router(),
             });
         }
-        // No daemon, create local service (heavy) and try to become daemon
-        let svc = ContextService::new(root.clone()).await?;
-        let svc_arc = Arc::new(svc);
-        let canon_clone = canon.clone();
-        let svc_clone = svc_arc.clone();
-        // Try to become daemon in background (non-blocking)
-        tokio::spawn(async move {
-            // small delay to reduce race
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            match crate::daemon::try_become_daemon(&canon_clone, svc_clone.clone()).await {
-                Ok((listener, meta)) => {
-                    info!(port=%meta.port, pid=%meta.pid, root=%canon_clone.display(), "became shared daemon");
-                    let server = crate::daemon::DaemonServer {
-                        // we need to construct via public fields; for now we use try_become_daemon that returns listener and then run
-                        // Instead we handle here: create DaemonServer and run
-                        // This path is simplified: we already have listener, need to run
-                        // We'll create a new DaemonServer via struct literal if fields are pub, but they are private.
-                        // So we re-implement: just use daemon to serve
-                        // For minimal, we leak and spawn handle via daemon module's helper
-                        // We'll call a helper that takes listener and service
-                        listener,
-                        service: svc_clone,
-                        root: canon_clone,
-                        client_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        // No global daemon, try to become it
+        match crate::daemon::try_become_global_daemon().await {
+            Ok((listener, meta)) => {
+                info!(port=%meta.port, pid=%meta.pid, "became global daemon");
+                let registry = Arc::new(crate::registry::RepositoryRegistry::new(
+                    crate::config::memory_budget_bytes(),
+                ));
+                let global = crate::daemon::GlobalDaemon {
+                    registry: registry.clone(),
+                    listener,
+                    meta: meta.clone(),
+                };
+                tokio::spawn(global.run());
+                // This process also becomes a thin client to its own global daemon
+                let remote = crate::daemon::RemoteClient {
+                    addr: format!("127.0.0.1:{}", meta.port),
+                    root: canon.clone(),
+                    pid: meta.pid,
+                };
+                // Ensure registry has entry for this root (lazy, but pre-warm)
+                let _ = registry.get_or_create(canon.clone()).await;
+                return Ok(Self {
+                    service: ServiceKind::Remote(remote),
+                    tool_router: Self::tool_router(),
+                });
+            }
+            Err(_) => {
+                // Someone else won, try attach again
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if let Some(client) = crate::daemon::try_attach_global().await {
+                    let remote = crate::daemon::RemoteClient {
+                        addr: client.addr.clone(),
+                        root: canon.clone(),
+                        pid: client.pid,
                     };
-                    // This requires DaemonServer fields to be pub; if not, we fallback to simple serve loop
-                    // For now, just run via daemon::handle
-                    server.run().await;
+                    return Ok(Self {
+                        service: ServiceKind::Remote(remote),
+                        tool_router: Self::tool_router(),
+                    });
                 }
-                Err(e) => {
-                    // Check if someone else became daemon, try attach cleanup not needed
-                    tracing::debug!(error=%e, "not daemon, will remain local");
-                    // If stale lock, cleanup
-                    if crate::daemon::is_stale(&canon_clone).await {
-                        crate::daemon::cleanup_stale(&canon_clone).await;
-                    }
+                // Fallback to stale cleanup and local
+                if crate::daemon::is_global_stale().await {
+                    crate::daemon::cleanup_global_stale().await;
                 }
             }
-        });
+        }
+        // Fallback: local heavy service (should rarely happen)
+        let svc = ContextService::new(root.clone()).await?;
         Ok(Self {
-            service: ServiceKind::Local(svc_arc),
+            service: ServiceKind::Local(Arc::new(svc)),
             tool_router: Self::tool_router(),
         })
     }

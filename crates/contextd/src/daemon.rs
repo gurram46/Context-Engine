@@ -249,7 +249,7 @@ impl RemoteClient {
         let mut stream =
             tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&self.addr)).await??;
         let id = 1;
-        let req = serde_json::json!({"id": id, "tool": tool, "params": params});
+        let req = serde_json::json!({"id": id, "tool": tool, "params": params, "root": self.root.display().to_string()});
         stream
             .write_all(serde_json::to_string(&req)?.as_bytes())
             .await?;
@@ -579,6 +579,368 @@ impl RemoteClient {
 
     pub async fn status(&self) -> Result<serde_json::Value, anyhow::Error> {
         self.call("context_status", serde_json::json!({})).await
+    }
+}
+
+pub fn global_daemon_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("CONTEXTD_GLOBAL_DAEMON_DIR") {
+        return PathBuf::from(p);
+    }
+    if cfg!(windows) {
+        std::env::var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("context-engine")
+    } else {
+        std::env::var("XDG_RUNTIME_DIR")
+            .map(|p| PathBuf::from(p).join("context-engine"))
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join(".cache/context-engine"))
+                    .unwrap_or_else(|_| std::env::temp_dir().join("context-engine"))
+            })
+    }
+}
+
+pub fn global_daemon_file() -> PathBuf {
+    global_daemon_dir().join("daemon.json")
+}
+
+pub fn global_lock_file() -> PathBuf {
+    global_daemon_dir().join("daemon.lock")
+}
+
+pub async fn try_attach_global() -> Option<RemoteClient> {
+    let df = global_daemon_file();
+    let content = tokio::fs::read_to_string(&df).await.ok()?;
+    let meta: DaemonMetadata = serde_json::from_str(&content).ok()?;
+    let addr = format!("127.0.0.1:{}", meta.port);
+    let conn = tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(&addr)).await;
+    match conn {
+        Ok(Ok(_)) => Some(RemoteClient {
+            addr,
+            root: PathBuf::from(meta.root.clone()),
+            pid: meta.pid,
+        }),
+        _ => None,
+    }
+}
+
+pub async fn is_global_stale() -> bool {
+    if try_attach_global().await.is_some() {
+        return false;
+    }
+    tokio::fs::try_exists(global_daemon_file())
+        .await
+        .unwrap_or(false)
+}
+
+pub async fn cleanup_global_stale() {
+    let _ = tokio::fs::remove_file(global_daemon_file()).await;
+    let _ = tokio::fs::remove_file(global_lock_file()).await;
+}
+
+pub struct GlobalDaemon {
+    pub registry: Arc<crate::registry::RepositoryRegistry>,
+    pub listener: TcpListener,
+    pub meta: DaemonMetadata,
+}
+
+impl GlobalDaemon {
+    pub async fn new() -> Result<Self, anyhow::Error> {
+        let dir = global_daemon_dir();
+        tokio::fs::create_dir_all(&dir).await.ok();
+        let budget = crate::config::memory_budget_bytes();
+        let registry = Arc::new(crate::registry::RepositoryRegistry::new(budget));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let pid = std::process::id();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let meta = DaemonMetadata {
+            pid,
+            port,
+            root: dir.display().to_string(),
+            started_at: now,
+        };
+        Ok(Self {
+            registry,
+            listener,
+            meta,
+        })
+    }
+
+    pub async fn run(self) {
+        let registry = self.registry.clone();
+        // spawn idle eviction task
+        let reg_clone = registry.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                reg_clone.evict_idle().await;
+            }
+        });
+        info!(port=%self.listener.local_addr().map(|a|a.port()).unwrap_or(0), "global daemon listening");
+        loop {
+            match self.listener.accept().await {
+                Ok((stream, _)) => {
+                    let reg = registry.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_global_client(stream, reg).await {
+                            warn!(error=%e, "global daemon client error");
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!(error=%e, "global daemon accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+}
+
+async fn handle_global_client(
+    mut stream: TcpStream,
+    registry: Arc<crate::registry::RepositoryRegistry>,
+) -> Result<()> {
+    let (r, mut w) = stream.split();
+    let mut reader = tokio::io::BufReader::new(r);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            break;
+        }
+        let req: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                let resp = serde_json::json!({"id": null, "error": format!("bad json: {}", e)});
+                w.write_all(serde_json::to_string(&resp)?.as_bytes())
+                    .await?;
+                w.write_all(b"\n").await?;
+                continue;
+            }
+        };
+        let id = req.get("id").cloned().unwrap_or(serde_json::json!(null));
+        let tool = req.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+        let params = req.get("params").cloned().unwrap_or(serde_json::json!({}));
+        let root_str = req
+            .get("root")
+            .and_then(|v| v.as_str())
+            .or_else(|| params.get("root").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let root_path = if root_str.is_empty() {
+            // fallback to resolve via ProjectRoot for this process's cwd? Use global dir's root is not correct; try to resolve via params
+            // If no root, use current dir
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            PathBuf::from(root_str)
+        };
+        let canon = context_index::ProjectRoot::resolve(Some(&root_path))
+            .map(|pr| pr.path().to_path_buf())
+            .unwrap_or(root_path.clone());
+        // ensure repo entry exists
+        let svc = registry.get_or_create(canon.clone()).await;
+        // touch for LRU
+        registry.touch(&canon).await;
+        // per-request client count not needed here; global daemon tracks via separate map, but we use registry client counts via inc/dec on connect/disconnect?
+        // For now, we increment active query count
+        // Handle tool
+        let resp = match tool {
+            "context_search" => {
+                let q = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let budget = params
+                    .get("budgetTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10000) as usize;
+                let maxr = params
+                    .get("maxResults")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10) as usize;
+                let opts = SearchOptions {
+                    budget_tokens: budget,
+                    max_results: maxr,
+                    debug: false,
+                };
+                // global memory budget check before hot load: estimate needed bytes
+                // For search, we need to know if hot vectors will be used; we approximate 6MB per repo as in test, but real is vector_count*dim*4
+                // We can let service handle budget via hot load's internal check, but global check should be here
+                // For now, just call service and let it handle per-repo budget; global eviction will be triggered if needed via ResourceManager
+                // We should ensure ResourceManager is consulted
+                // Acquire global semaphore for semantic indexing? Queries are not indexing, so not needed
+                match svc.search(q, opts).await {
+                    Ok(r) => {
+                        let stats = serde_json::to_value(&r.stats).unwrap_or(serde_json::json!({}));
+                        serde_json::json!({"id": id, "result": {"query": r.query, "type": r.query_type.as_str(), "context": r.packed.markdown, "evidence": r.evidence, "stats": stats, "root": canon.display().to_string()}})
+                    }
+                    Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
+                }
+            }
+            "symbol_lookup" => {
+                let sym = params.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                let budget = params
+                    .get("budgetTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10000) as usize;
+                let opts = SearchOptions {
+                    budget_tokens: budget,
+                    max_results: 10,
+                    debug: false,
+                };
+                match svc.symbol(sym, opts).await {
+                    Ok(r) => {
+                        serde_json::json!({"id": id, "result": {"query": r.query, "type": r.query_type.as_str(), "context": r.packed.markdown, "evidence": r.evidence, "stats": r.stats}})
+                    }
+                    Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
+                }
+            }
+            "dependency_trace" => {
+                let sym = params.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                let dir = params
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("callers");
+                let budget = params
+                    .get("budgetTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10000) as usize;
+                let opts = SearchOptions {
+                    budget_tokens: budget,
+                    max_results: 10,
+                    debug: false,
+                };
+                let d = Direction::from_str(dir);
+                match svc.dependency(sym, d, opts).await {
+                    Ok(r) => {
+                        serde_json::json!({"id": id, "result": {"query": r.query, "type": r.query_type.as_str(), "context": r.packed.markdown, "evidence": r.evidence, "stats": r.stats}})
+                    }
+                    Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
+                }
+            }
+            "test_lookup" => {
+                let q = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let budget = params
+                    .get("budgetTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10000) as usize;
+                let opts = SearchOptions {
+                    budget_tokens: budget,
+                    max_results: 10,
+                    debug: false,
+                };
+                match svc.tests(q, opts).await {
+                    Ok(r) => {
+                        serde_json::json!({"id": id, "result": {"query": r.query, "type": r.query_type.as_str(), "context": r.packed.markdown, "evidence": r.evidence, "stats": r.stats}})
+                    }
+                    Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
+                }
+            }
+            "context_status" => {
+                // Global status: aggregate
+                let st = svc.status().await.unwrap_or_else(|_| {
+                    // dummy
+                    crate::service::StatusReport {
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        contextd_version: env!("CARGO_PKG_VERSION").to_string(),
+                        rust_version: "1.80".to_string(),
+                        pid: std::process::id(),
+                        project_root: canon.display().to_string(),
+                        git_branch: None,
+                        index_generation: None,
+                        files_indexed: 0,
+                        symbols: 0,
+                        bm25_documents: 0,
+                        vector_count: 0,
+                        embedding_model: "".to_string(),
+                        embedding_dimension: 0,
+                        embedding_runtime: "none".to_string(),
+                        semantic_available: false,
+                        semantic_backend_available: false,
+                        semantic_index_ready: false,
+                        eligible_chunk_count: 0,
+                        semantic_ref_count: 0,
+                        representation_version: "".to_string(),
+                        missing_vector_count: 0,
+                        stale_vector_count: 0,
+                        watcher_state: "none".to_string(),
+                        store_schema_version: None,
+                        daemon_pid: Some(std::process::id()),
+                        client_count: None,
+                        shared_runtime: true,
+                        memory_budget_mb: crate::config::memory_budget_bytes() / (1024 * 1024),
+                        hot_bm25_loaded: false,
+                        hot_vectors_loaded: false,
+                        hot_vector_count: 0,
+                        estimated_hot_vector_bytes: 0,
+                        generation: None,
+                        global_client_count: None,
+                        repository_client_count: None,
+                        repository_runtime_count: None,
+                        global_memory_budget_mb: None,
+                        estimated_hot_memory_bytes: None,
+                        repository_estimated_hot_memory_bytes: None,
+                    }
+                });
+                let mut v = serde_json::to_value(&st).unwrap_or(serde_json::json!({}));
+                // augment with global registry info
+                let global_clients = registry.global_client_count().await;
+                let runtime_cnt = registry.runtime_count().await;
+                let total_hot = registry.total_hot_bytes().await;
+                v["globalClientCount"] = serde_json::json!(global_clients);
+                v["repositoryRuntimeCount"] = serde_json::json!(runtime_cnt);
+                v["globalMemoryBudgetMb"] =
+                    serde_json::json!(crate::config::memory_budget_bytes() / (1024 * 1024));
+                v["estimatedHotMemoryBytes"] = serde_json::json!(total_hot);
+                v["sharedRuntime"] = serde_json::json!(true);
+                v["daemonPid"] = serde_json::json!(std::process::id());
+                serde_json::json!({"id": id, "result": v})
+            }
+            _ => serde_json::json!({"id": id, "error": format!("unknown tool {}", tool)}),
+        };
+        w.write_all(serde_json::to_string(&resp)?.as_bytes())
+            .await?;
+        w.write_all(b"\n").await?;
+        w.flush().await?;
+    }
+    Ok(())
+}
+
+pub async fn try_become_global_daemon() -> Result<(TcpListener, DaemonMetadata), anyhow::Error> {
+    let dir = global_daemon_dir();
+    tokio::fs::create_dir_all(&dir).await.ok();
+    let lock_path = global_lock_file();
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create_new(true).write(true);
+    let lock_res = opts.open(&lock_path).await;
+    match lock_res {
+        Ok(mut f) => {
+            let pid = std::process::id();
+            let _ = f.write_all(pid.to_string().as_bytes()).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let meta = DaemonMetadata {
+                pid,
+                port,
+                root: dir.display().to_string(),
+                started_at: now,
+            };
+            let json = serde_json::to_string_pretty(&meta)?;
+            tokio::fs::write(global_daemon_file(), json).await?;
+            Ok((listener, meta))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!("global lock exists")
+        }
+        Err(e) => Err(e.into()),
     }
 }
 

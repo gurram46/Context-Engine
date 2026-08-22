@@ -142,6 +142,19 @@ pub struct StatusReport {
     pub estimated_hot_vector_bytes: usize,
     #[serde(default)]
     pub generation: Option<u64>,
+    // R1.1 global
+    #[serde(default)]
+    pub global_client_count: Option<usize>,
+    #[serde(default)]
+    pub repository_client_count: Option<usize>,
+    #[serde(default)]
+    pub repository_runtime_count: Option<usize>,
+    #[serde(default)]
+    pub global_memory_budget_mb: Option<usize>,
+    #[serde(default)]
+    pub estimated_hot_memory_bytes: Option<usize>,
+    #[serde(default)]
+    pub repository_estimated_hot_memory_bytes: Option<usize>,
 }
 
 /// Native service — single core for CLI and MCP.
@@ -1248,7 +1261,22 @@ impl ContextService {
             hot_vector_count: vector_count,
             estimated_hot_vector_bytes: vector_count * dim * 4,
             generation,
+            global_client_count: None,
+            repository_client_count: None,
+            repository_runtime_count: None,
+            global_memory_budget_mb: Some(crate::config::memory_budget_bytes() / (1024 * 1024)),
+            estimated_hot_memory_bytes: Some(vector_count * dim * 4),
+            repository_estimated_hot_memory_bytes: Some(vector_count * dim * 4),
         })
+    }
+
+    pub async fn evict_hot(&self, kind: crate::resource::ComponentKind) -> anyhow::Result<()> {
+        self.runtime.evict_hot(kind).await;
+        Ok(())
+    }
+
+    pub fn runtime_arc(&self) -> std::sync::Arc<crate::runtime::RepositoryRuntime> {
+        self.runtime.clone()
     }
 }
 

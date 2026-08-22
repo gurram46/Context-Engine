@@ -59,7 +59,7 @@ pub(crate) struct RuntimeData {
     reconcile_total: u64,
 }
 
-pub(crate) struct RepositoryRuntime {
+pub struct RepositoryRuntime {
     #[allow(dead_code)]
     root: PathBuf,
     pub(crate) tracker: DirtyTracker,
@@ -237,10 +237,11 @@ impl RepositoryRuntime {
         generation: u64,
         fingerprint: ModelFingerprint,
     ) -> Option<Arc<crate::hot::HotState>> {
-        self.get_or_load_hot_with_vectors(generation, fingerprint, true).await
+        self.get_or_load_hot_with_vectors(generation, fingerprint, true)
+            .await
     }
 
-    pub(crate) async fn get_or_load_hot_with_vectors(
+    pub async fn get_or_load_hot_with_vectors(
         &self,
         generation: u64,
         fingerprint: ModelFingerprint,
@@ -365,6 +366,29 @@ impl RepositoryRuntime {
             }
         }
         None
+    }
+
+    pub(crate) async fn evict_hot(&self, kind: crate::resource::ComponentKind) {
+        let mut guard = self.hot.write().expect("hot poisoned");
+        if let Some(hot) = guard.clone() {
+            match kind {
+                crate::resource::ComponentKind::Vectors => {
+                    if hot.vectors.is_some() {
+                        let new_hot = std::sync::Arc::new(crate::hot::HotState {
+                            generation: hot.generation,
+                            fingerprint: hot.fingerprint.clone(),
+                            bm25: hot.bm25.clone(),
+                            vectors: None,
+                            created_at: std::time::Instant::now(),
+                        });
+                        *guard = Some(new_hot);
+                    }
+                }
+                crate::resource::ComponentKind::Bm25 => {
+                    *guard = None;
+                }
+            }
+        }
     }
 
     #[cfg(test)]

@@ -9,6 +9,8 @@ mod hot;
 mod mcp;
 mod pipeline;
 mod project;
+mod registry;
+mod resource;
 mod runtime;
 mod service;
 
