@@ -69,7 +69,12 @@ def _fast_copy(src: Path, dest: Path):
     if os.name == "nt":
         xd = [".git", ".context", ".serena", ".opencode", "target", "node_modules", ".venv", "__pycache__"]
         cmd = ["robocopy", str(src), str(dest), "/E", "/XD"] + xd + ["/NFL", "/NDL", "/NJH", "/NJS", "/R:0", "/W:0"]
-        subprocess.run(cmd, capture_output=True)
+        res = subprocess.run(cmd, capture_output=True)
+        # robocopy 0-7 success, >=8 failure
+        if res.returncode >= 8:
+            raise RuntimeError(f"robocopy failed rc={res.returncode} src={src} dest={dest}")
+        # verify mutation target exists after copy (if src had it)
+        # caller will verify specific file
     else:
         for item in src.iterdir():
             if item.name in [".git",".context",".serena",".opencode","target","node_modules",".venv","__pycache__"]:
@@ -78,6 +83,18 @@ def _fast_copy(src: Path, dest: Path):
                 shutil.copytree(item, dest/item.name, dirs_exist_ok=True)
             else:
                 shutil.copy2(item, dest/item.name)
+    # verify at least one file copied
+    if not any(dest.iterdir()):
+        raise RuntimeError(f"fast_copy produced empty dest {dest} from {src}")
+
+def _normalize_tool(name: str) -> str:
+    # deterministic normalization for contextd MCP prefix
+    # e.g., contextd_context_search -> context_search, contextd_symbol_lookup -> symbol_lookup
+    if name.startswith("contextd_"):
+        base = name[len("contextd_"):]
+        if base in ["context_search", "symbol_lookup", "dependency_trace", "test_lookup", "context_status"]:
+            return base
+    return name
 
 def _leakage_scan(text: str):
     forbidden = ["MUTATED", "BENCHMARK", "reference patch", "hidden evaluator", "private", "D0", "BUG HERE", "FIX ME"]
@@ -178,14 +195,44 @@ def ce_prepare(workdir: Path, task: dict):
         status=json.loads(proc2.stdout or "{}")
     except:
         status={"raw": proc2.stdout[:2000], "stderr": proc2.stderr[:2000]}
-    # WITH precondition
+    # WITH precondition - hard-fail
     ready = status.get("semanticIndexReady")
     missing = status.get("missingVectorCount")
-    if ready is not True or missing != 0:
-        # do not silently continue lexical-only
+    if proc.returncode != 0:
         status["_precondition"] = "BLOCKED"
-    else:
-        status["_precondition"] = "READY"
+        prep={
+            "index_wall_ms": idx_wall,
+            "index_stdout": idx_out[:8000] if idx_out else "",
+            "index_stderr": proc.stderr[:4000] if proc.stderr else "",
+            "index_returncode": proc.returncode,
+            "status": status,
+            "generation": status.get("indexGeneration"),
+            "semanticAvailable": status.get("semanticAvailable"),
+            "semanticIndexReady": ready,
+            "missingVectorCount": missing,
+            "embeddingModel": status.get("embeddingModel"),
+            "pid": status.get("pid"),
+        }
+        (workdir / ".ce_prep.json").write_text(json.dumps(prep, indent=2), encoding="utf-8")
+        raise RuntimeError(f"CE index failed rc={proc.returncode} for {workdir}")
+    if ready is not True or missing != 0:
+        status["_precondition"] = "BLOCKED"
+        prep={
+            "index_wall_ms": idx_wall,
+            "index_stdout": idx_out[:8000] if idx_out else "",
+            "index_stderr": proc.stderr[:4000] if proc.stderr else "",
+            "index_returncode": proc.returncode,
+            "status": status,
+            "generation": status.get("indexGeneration"),
+            "semanticAvailable": status.get("semanticAvailable"),
+            "semanticIndexReady": ready,
+            "missingVectorCount": missing,
+            "embeddingModel": status.get("embeddingModel"),
+            "pid": status.get("pid"),
+        }
+        (workdir / ".ce_prep.json").write_text(json.dumps(prep, indent=2), encoding="utf-8")
+        raise RuntimeError(f"CE semantic precondition BLOCKED: ready={ready} missing={missing} for {workdir}")
+    status["_precondition"] = "READY"
     prep={
         "index_wall_ms": idx_wall,
         "index_stdout": idx_out[:8000] if idx_out else "",
@@ -203,13 +250,14 @@ def ce_prepare(workdir: Path, task: dict):
     return prep
 
 def parse_metrics_exact(workdir: Path, stdout: str):
-    # exact parse of OpenCode JSON events
+    # exact parse of OpenCode JSON events - uses _normalize_tool and sums tokens
     tool_counts = {"read":0,"grep":0,"glob":0,"bash":0,"edit":0,"context_search":0,"symbol_lookup":0,"dependency_trace":0,"test_lookup":0,"context_status":0}
     ce_details=[]
-    input_tokens=None
-    output_tokens=None
-    cache_read=None
-    cache_write=None
+    input_tokens=0
+    output_tokens=0
+    cache_read=0
+    cache_write=0
+    has_tokens=False
     # for tool-output tokens via tiktoken
     tool_output_text=""
     for line in (stdout or "").splitlines():
@@ -219,52 +267,50 @@ def parse_metrics_exact(workdir: Path, stdout: str):
         try:
             j=json.loads(line)
         except: continue
-        # exact tool name from j["part"]["tool"] or j["type"]=="tool_use"
+        # exact tool name from j["part"]["tool"] when type=="tool_use"
         tool_name=None
         part = j.get("part") if isinstance(j.get("part"), dict) else {}
-        if isinstance(part, dict) and "tool" in part:
-            tool_name = part.get("tool")
-        elif j.get("type")=="tool_use" and "tool" in j:
-            tool_name=j.get("tool")
+        if j.get("type")=="tool_use" and isinstance(part, dict) and "tool" in part:
+            raw = part.get("tool")
+            tool_name = _normalize_tool(raw) if isinstance(raw, str) else None
         if tool_name in tool_counts:
             tool_counts[tool_name]+=1
             if tool_name in ["context_search","symbol_lookup","dependency_trace","test_lookup","context_status"]:
                 ce_details.append({"tool": tool_name, "event": j})
-        # tokens in part.tokens
+        # tokens only from step_finish (provider usage)
         toks=None
-        if isinstance(part, dict) and "tokens" in part and isinstance(part["tokens"], dict):
-            toks=part["tokens"]
-        elif "tokens" in j and isinstance(j["tokens"], dict):
-            toks=j["tokens"]
+        if j.get("type")=="step_finish":
+            if isinstance(part, dict) and "tokens" in part and isinstance(part["tokens"], dict):
+                toks=part["tokens"]
+            elif "tokens" in j and isinstance(j["tokens"], dict):
+                toks=j["tokens"]
         if toks:
-            if toks.get("input") is not None:
-                # sum across steps? Keep last for now, but also sum for total
-                # we store last, but aggregate will sum
-                input_tokens = toks.get("input") if input_tokens is None else input_tokens
-                # actually sum
-                if input_tokens is not None:
-                    input_tokens = (input_tokens or 0) + toks.get("input",0) if isinstance(input_tokens,int) and toks.get("input") else toks.get("input")
-                # fallback: keep last
-            if toks.get("output") is not None:
-                output_tokens = toks.get("output")
+            has_tokens=True
+            if isinstance(toks.get("input"), int):
+                input_tokens += toks.get("input",0)
+            if isinstance(toks.get("output"), int):
+                output_tokens += toks.get("output",0)
             if isinstance(toks.get("cache"), dict):
-                cache_read = toks["cache"].get("read")
-                cache_write = toks["cache"].get("write")
-        # collect tool output text for tiktoken
-        if isinstance(part, dict) and "state" in part and isinstance(part["state"], dict):
-            out = part["state"].get("output") or part["state"].get("stdout") or ""
-            if isinstance(out, str):
-                tool_output_text += out + "\n"
-        if "output" in j and isinstance(j["output"], str):
-            tool_output_text += j["output"] + "\n"
+                if isinstance(toks["cache"].get("read"), int):
+                    cache_read += toks["cache"].get("read",0)
+                if isinstance(toks["cache"].get("write"), int):
+                    cache_write += toks["cache"].get("write",0)
+        # collect tool output text for tiktoken - only from tool_use completed state
+        if j.get("type")=="tool_use" and isinstance(part, dict) and "state" in part and isinstance(part["state"], dict):
+            st = part["state"]
+            if st.get("status")=="completed":
+                out = st.get("output") or st.get("stdout") or ""
+                if isinstance(out, str) and out:
+                    tool_output_text += out + "\n"
     # tiktoken for tool-output
     try:
         tool_output_tokens = _tiktoken_cl100k(tool_output_text) if tool_output_text else 0
     except Exception as e:
         raise
+    # leak hits via exact normalized tool names, not substring
     leak_hits=[]
-    for ce in ["context_search","symbol_lookup","dependency_trace","test_lookup","context_status","contextd"]:
-        if ce in (stdout or ""):
+    for ce in ["context_search","symbol_lookup","dependency_trace","test_lookup","context_status"]:
+        if tool_counts.get(ce,0) > 0:
             leak_hits.append(ce)
     # define native_repository_lookup = read+grep+glob
     native_lookup = tool_counts["read"] + tool_counts["grep"] + tool_counts["glob"]
@@ -273,10 +319,10 @@ def parse_metrics_exact(workdir: Path, stdout: str):
         "native_lookup": native_lookup,
         "ce_calls": sum(tool_counts[k] for k in ["context_search","symbol_lookup","dependency_trace","test_lookup","context_status"]),
         "ce_details": ce_details[:100],
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "cache_read": cache_read,
-        "cache_write": cache_write,
+        "input_tokens": input_tokens if has_tokens else None,
+        "output_tokens": output_tokens if has_tokens else None,
+        "cache_read": cache_read if has_tokens and cache_read!=0 else (cache_read if has_tokens else None),
+        "cache_write": cache_write if has_tokens and cache_write!=0 else (cache_write if has_tokens else None),
         "tool_output_tokens_cl100k": tool_output_tokens,
         "leak_hits": leak_hits,
     }
@@ -386,24 +432,51 @@ def leakage_audit():
     for task in manifest["tasks"]:
         tid=task["task_id"]
         prompt=task["public_task_prompt"]
-        # check prompt for forbidden leaks
-        hits=_leakage_scan(prompt)
-        # also check mutation patch not leaked? patch is not in prompt, but ensure prompt doesn't contain file/function exact
-        # For now, check for exact mutation file name in prompt (should not)
+        hits=[]
+        # forbidden markers in prompt
+        for term in ["MUTATED", "BENCHMARK", "D0", "BUG HERE", "FIX ME"]:
+            if term in prompt:
+                hits.append(f"marker {term} in prompt")
+        # mutation file path/basename must not be in prompt
         mut_file = task.get("mutation_file","")
-        if mut_file and mut_file.split("/")[-1] in prompt:
-            # allow repo name but not exact file
-            pass
-        # check for forbidden terms
-        if "MUTATED" in prompt or "BENCHMARK" in prompt:
-            hits.append("MUTATED/BENCHMARK in prompt")
-        # check for hidden evaluator leakage
+        if mut_file:
+            base = mut_file.split("/")[-1]
+            if base in prompt or mut_file in prompt:
+                hits.append(f"mutation_file {mut_file} leaked in prompt")
+            # also check directory part
+            if mut_file.split("/")[0] in prompt and mut_file in prompt:
+                hits.append("mutation path leaked")
+        # private evaluator names must not be in prompt
         hidden = task.get("hidden_evaluator","")
-        if hidden.split("/")[-1] in prompt:
-            hits.append("hidden evaluator leaked")
+        # extract evaluator script name if any
+        for part in hidden.split():
+            if "evaluator" in part.lower() or "private" in part.lower():
+                if part in prompt:
+                    hits.append("private evaluator leaked")
+        # reference patch content must not be in prompt (check for exact replacement expression)
+        # For now, ensure prompt does not contain exact condition from patch
+        # e.g., for django, check for "path.replace" exact
+        # We do a manual review: check for leaked phrases that were removed
+        leaked_phrases = [
+            "deconstruct through the public import path",
+            "first defined regardless of truthiness",
+            "The fast line-by-line path ignores the flag",
+            "The bug is in the shared helper",
+            "looking for the wrong tag name",
+        ]
+        for phrase in leaked_phrases:
+            if phrase in prompt:
+                hits.append(f"leaked phrase: {phrase[:30]}")
+        # also run generic scan
+        hits.extend(_leakage_scan(prompt))
+        # deduplicate
+        hits = list(set(hits))
         status="VALID" if not hits else "INVALID"
         if hits:
             ok=False
+        else:
+            # manual review - mark VALID (would be QUESTIONABLE if borderline)
+            pass
         print(f"  {tid}: {status} hits={hits}")
     # also scan tasks directory files for markers
     for p in TASKS_DIR.glob("*.patch"):
@@ -411,8 +484,65 @@ def leakage_audit():
         if "MUTATED" in content:
             print(f"  LEAK: {p.name} contains MUTATED marker (must be removed)")
             ok=False
-    print("LEAKAGE", "PASS 0" if ok else "FAIL")
+    # scan private reference patch content not leaked in prompts (ensure no prompt contains reference patch diff)
+    for task in manifest["tasks"]:
+        ref = PRIVATE_DIR / f"reference_{task['task_id']}.patch"
+        if ref.exists():
+            ref_content = ref.read_text(encoding="utf-8", errors="ignore")
+            # check if any large chunk of reference patch is in prompt (should not)
+            prompt = task["public_task_prompt"]
+            # take first added line from reference patch
+            for line in ref_content.splitlines():
+                if line.startswith("+") and len(line) > 10 and not line.startswith("+++"):
+                    snippet = line[1:30].strip()
+                    if snippet and snippet in prompt:
+                        print(f"  LEAK: reference patch snippet leaked in {task['task_id']}: {snippet[:30]}")
+                        ok=False
+    print("LEAKAGE", "PASS 5/5 VALID" if ok else "FAIL")
     return ok
+
+def _verify_patch_sha(task: dict):
+    patch_file = TASKS_DIR / task["mutation_patch"]
+    expected = task.get("mutation_patch_sha256","")
+    if not expected:
+        return True
+    actual = hashlib.sha256(patch_file.read_bytes()).hexdigest().upper()
+    # manifest stores without 0x, may be upper/lower
+    if actual != expected.upper():
+        # also try lower
+        if actual.lower() != expected.lower():
+            raise RuntimeError(f"patch SHA mismatch for {task['task_id']}: expected {expected} got {actual}")
+    return True
+
+def _assert_pair_identity(task: dict):
+    # prepare both arms from same pinned repo + mutation, before .context
+    # use deterministic hash excluding harness files
+    task_id = task["task_id"]
+    # prepare without and with source trees (without actually creating .context yet)
+    # we use prepare_worktree but capture hash before ce_prepare
+    # For check, we prepare both and compare
+    dest_without, hash_without = prepare_worktree(task, "without")
+    dest_with, hash_with = prepare_worktree(task, "with")
+    # hashes already computed before .context (since .context not yet created)
+    match = (hash_without == hash_with)
+    # write pair_identity.json
+    pair_path = RUNS_DIR / task_id / "pair_identity.json"
+    pair_path.parent.mkdir(parents=True, exist_ok=True)
+    pair_path.write_text(json.dumps({
+        "task_id": task_id,
+        "without_hash": hash_without,
+        "with_hash": hash_with,
+        "match": match,
+        "mutation_patch_sha256": task.get("mutation_patch_sha256",""),
+        "pinned_sha": task.get("pinned_sha","")
+    }, indent=2), encoding="utf-8")
+    if not match:
+        raise RuntimeError(f"pair identity mismatch for {task_id}: {hash_without} != {hash_with}")
+    # verify patch SHA
+    _verify_patch_sha(task)
+    # cleanup the temp pair (will be recreated for real run)
+    # keep them for now, real run will overwrite
+    return match
 
 def smoke_ce():
     print("=== CE NON-SCORED SMOKE (disposable repo) ===")
@@ -449,17 +579,72 @@ def smoke_ce():
     res = run_opencode_real(prompt, dest, timeout_s=600, arm="with")
     (SMOKE_DIR / "raw_opencode_stdout.jsonl").write_text(res["stdout"] or "", encoding="utf-8")
     (SMOKE_DIR / "raw_opencode_stderr.txt").write_text(res["stderr"] or "", encoding="utf-8")
-    # check each tool seen
-    tools = ["context_search","symbol_lookup","dependency_trace","test_lookup","context_status"]
+    # check each tool seen via exact normalized parser, not substring
+    parsed = parse_metrics_exact(dest, res["stdout"] or "")
     hits={}
-    for t in tools:
-        hits[t] = t in (res["stdout"] or "")
-        print(f"  {t}: {'PASS' if hits[t] else 'FAIL'}")
+    for t in ["context_search","symbol_lookup","dependency_trace","test_lookup","context_status"]:
+        hits[t] = parsed["tool_counts"].get(t,0) >= 1
+        print(f"  {t}: {'PASS' if hits[t] else 'FAIL'} (count {parsed['tool_counts'].get(t,0)})")
+    # also prove via normalization: show raw tool names seen
+    raw_tools = set()
+    for line in (res["stdout"] or "").splitlines():
+        try:
+            j=json.loads(line)
+            if j.get("type")=="tool_use":
+                raw = j.get("part",{}).get("tool","")
+                raw_tools.add(raw)
+        except: pass
+    print(f"  raw tools seen: {sorted(raw_tools)}")
     ok = all(hits.values())
     print(f"SMOKE {'PASS' if ok else 'FAIL'} 5/5" if ok else f"SMOKE FAIL {hits}")
     (SMOKE_DIR / "hits.json").write_text(json.dumps(hits, indent=2), encoding="utf-8")
+    # also write parsed metrics for audit
+    (SMOKE_DIR / "parsed_metrics.json").write_text(json.dumps(parsed, indent=2), encoding="utf-8")
     # cleanup disposable .context after? Keep for evidence
     return ok
+
+def _run_single_scored(task_id: str, arm: str):
+    manifest=json.loads(MANIFEST.read_text(encoding="utf-8"))
+    task=next(t for t in manifest["tasks"] if t["task_id"]==task_id)
+    # verify patch SHA before any copy
+    _verify_patch_sha(task)
+    # prepare worktree and verify mutation
+    dest, source_hash = prepare_worktree(task, arm)
+    # for WITH, verify pair identity (both arms from same mutation)
+    # we need to ensure without and with hashes match - prepare both and compare
+    # For single arm, we check against the other arm's hash if exists, else just store
+    # For now, we ensure the current arm's hash is stored and will be compared in run-all
+    # CE prep for WITH with hard-fail
+    ce_prep=None
+    if arm=="with":
+        try:
+            ce_prep=ce_prepare(dest, task)
+        except RuntimeError as e:
+            # capture prep evidence then abort
+            (dest / "infra_blocked.json").write_text(json.dumps({"error": str(e), "task_id": task_id, "arm": arm}, indent=2), encoding="utf-8")
+            print(f"  INFRA_BLOCKED {task_id} {arm}: {e}")
+            raise
+    # run real opencode
+    prompt=task["public_task_prompt"]
+    if task["hidden_evaluator"] in prompt:
+        raise RuntimeError("leakage: hidden evaluator in prompt")
+    print(f"  prompt len {len(prompt)}")
+    res=run_opencode_real(prompt, dest, arm=arm, timeout_s=TIMEOUT_S)
+    (dest / "raw_opencode_stdout.jsonl").write_text(res["stdout"] or "", encoding="utf-8")
+    (dest / "raw_opencode_stderr.txt").write_text(res["stderr"] or "", encoding="utf-8")
+    (dest / "raw_opencode_meta.json").write_text(json.dumps({"wall_ms": res["wall_ms"], "returncode": res["returncode"], "timeout": res.get("timeout"), "pid": res.get("pid"), "model": MODEL, "arm": arm, "task_id": task_id}, indent=2), encoding="utf-8")
+    parsed=parse_metrics_exact(dest, res["stdout"])
+    (dest / "ce_trace.json").write_text(json.dumps({"ce_calls": parsed["ce_calls"], "ce_details": parsed["ce_details"]}, indent=2), encoding="utf-8")
+    (dest / "metrics.json").write_text(json.dumps({"wall_ms": res["wall_ms"], "model": MODEL, "tool_counts": parsed["tool_counts"], "native_lookup": parsed["native_lookup"], "ce_calls": parsed["ce_calls"], "input_tokens": parsed["input_tokens"], "output_tokens": parsed["output_tokens"], "tool_output_tokens_cl100k": parsed["tool_output_tokens_cl100k"]}, indent=2), encoding="utf-8")
+    try:
+        diff=subprocess.check_output(["git","diff","HEAD"], cwd=str(dest), text=True, encoding="utf-8", errors="replace", timeout=10)
+    except:
+        diff=subprocess.run(["git","diff","HEAD"], cwd=str(dest), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10).stdout or ""
+    (dest / "final.diff").write_text(diff or "", encoding="utf-8")
+    eval_res=run_hidden_evaluator(dest, task)
+    (dest / "evaluator.json").write_text(json.dumps(eval_res, indent=2), encoding="utf-8")
+    print(f"  wall {res['wall_ms']} timeout {res.get('timeout')} rc {res['returncode']} ce {parsed['ce_calls']} eval {'PASS' if eval_res['pass'] else 'FAIL'}")
+    return {"dest": str(dest), "ce_prep": ce_prep, "opencode": res, "parsed": parsed, "evaluator": eval_res}
 
 def main():
     ap=argparse.ArgumentParser()
@@ -475,11 +660,52 @@ def main():
         ok=smoke_ce()
         sys.exit(0 if ok else 2)
     if args.run_task:
-        print("run-task not in pre-run phase")
-        sys.exit(1)
+        task_id, arm = args.run_task
+        if arm not in ["with","without"]:
+            print(f"arm must be with/without, got {arm}")
+            sys.exit(2)
+        # verify patch SHA and pair identity before run
+        manifest=json.loads(MANIFEST.read_text(encoding="utf-8"))
+        task=next((t for t in manifest["tasks"] if t["task_id"]==task_id), None)
+        if not task:
+            print(f"unknown task {task_id}")
+            sys.exit(2)
+        _verify_patch_sha(task)
+        # pair identity: prepare both and compare, but for single run we just ensure current hash matches expected
+        # For full check, we prepare both hashes and compare
+        try:
+            _assert_pair_identity(task)
+            print(f"pair identity PASS for {task_id}")
+        except Exception as e:
+            print(f"pair identity FAIL {e}")
+            sys.exit(2)
+        res=_run_single_scored(task_id, arm)
+        print(f"run-task {task_id} {arm} done eval {res['evaluator']['pass']}")
+        sys.exit(0 if res['evaluator']['pass'] else 1)
     if args.run_all:
-        print("run-all not in pre-run phase")
-        sys.exit(1)
+        manifest=json.loads(MANIFEST.read_text(encoding="utf-8"))
+        # frozen order
+        order = [("django_02","A_first"),("nestjs_02","B_first"),("ripgrep_02","B_first"),("lodash_02","A_first"),("gin_02","A_first")]
+        # verify order matches manifest order and seed
+        print(f"frozen order {order}")
+        for (tid, side), task in zip(order, manifest["tasks"]):
+            assert tid==task["task_id"], f"order mismatch {tid} vs {task['task_id']}"
+            _verify_patch_sha(task)
+            _assert_pair_identity(task)
+        # now run 10 sessions one at a time
+        for tid, side in order:
+            first = "without" if side=="A_first" else "with"
+            second = "with" if first=="without" else "without"
+            for arm in [first, second]:
+                print(f"\n=== {tid} {arm} ===")
+                try:
+                    _run_single_scored(tid, arm)
+                except RuntimeError as e:
+                    print(f"INFRA_BLOCKED {tid} {arm}: {e}")
+                    # mark pair blocked, continue
+                time.sleep(1)
+        print("run-all done")
+        sys.exit(0)
     ap.print_help()
 
 if __name__=="__main__":
