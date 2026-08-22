@@ -1,0 +1,11 @@
+{
+  "os": "Windows 10.0.26200",
+  "contextd_version": "0.1.0",
+  "embedding_model": "all-minilm",
+  "dimension": 384,
+  "head": "20cb5cc748b4b0f04aea0180e3f9070c0e6517f6",
+  "base": "d7a38332d5777d1f902ed2bd2e136de83b28e714",
+  "crates_changed": false,
+  "measured_at": "2026-08-21T20:00:00Z",
+  "method": "minimal 15min: gin measured via psutil 0.3s samples, others extrapolated from hot_audit + file sizes to avoid 3GB spike"
+}

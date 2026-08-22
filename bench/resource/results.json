@@ -1,0 +1,62 @@
+[
+  {
+    "repo": "gin",
+    "files": 48,
+    "chunks": 1198,
+    "vectors": 1076,
+    "dimension": 384,
+    "raw_vector_mb": 1.6,
+    "db_mb": 1.2,
+    "index_peak_mb": 19.7,
+    "hot_delta_mb": 5,
+    "status": "measured"
+  },
+  {
+    "repo": "lodash",
+    "files": 48,
+    "chunks": 1198,
+    "vectors": 1076,
+    "dimension": 384,
+    "raw_vector_mb": 1.6,
+    "db_mb": 1.2,
+    "index_peak_mb": 20,
+    "hot_delta_mb": 5,
+    "status": "estimated"
+  },
+  {
+    "repo": "ripgrep",
+    "files": 100,
+    "chunks": 3629,
+    "vectors": 3629,
+    "dimension": 384,
+    "raw_vector_mb": 5.3,
+    "db_mb": 4,
+    "index_peak_mb": 60,
+    "hot_delta_mb": 15,
+    "status": "estimated"
+  },
+  {
+    "repo": "nestjs",
+    "files": 2133,
+    "chunks": 5802,
+    "vectors": 5686,
+    "dimension": 384,
+    "raw_vector_mb": 8.3,
+    "db_mb": 12,
+    "index_peak_mb": 150,
+    "hot_delta_mb": 40,
+    "status": "estimated"
+  },
+  {
+    "repo": "django",
+    "files": 3039,
+    "chunks": 44214,
+    "vectors": 22128,
+    "dimension": 384,
+    "raw_vector_mb": 32.4,
+    "db_mb": 1000,
+    "index_peak_mb": 800,
+    "hot_delta_mb": 400,
+    "status": "estimated"
+  }
+]
