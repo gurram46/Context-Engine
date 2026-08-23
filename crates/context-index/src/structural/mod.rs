@@ -88,6 +88,7 @@ impl StructuralIndex {
     }
 
     /// Build with generic delta (changed/deleted paths). Ollama-free, deterministic.
+    #[allow(unused_assignments)]
     pub fn build_with_delta(&self, project: &ProjectIndex) -> Result<StructuralBuildOutcome> {
         let t0 = Instant::now();
         let mut conn = store::open_db(&self.root)?;
@@ -122,6 +123,7 @@ impl StructuralIndex {
         let mut affected_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut source_verified = true;
+        let mut fence_set = false;
         // For affected detection we need old symbols per file
         let mut old_symbols_map: std::collections::HashMap<String, Vec<Symbol>> =
             std::collections::HashMap::new();
@@ -168,7 +170,7 @@ impl StructuralIndex {
             };
             let actual_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
             let pf = parse_file(rel, &content, &actual_hash);
-            if pf.parse_error.is_some() && previously_indexed.contains(rel) {
+            if pf.parse_error.is_some() {
                 source_verified = false;
             }
             if needs_extraction_upgrade
@@ -201,6 +203,11 @@ impl StructuralIndex {
                 affected_names.insert(n.clone());
             }
             // Also if old symbols existed and new empty -> affected includes old
+            // Verification fence before first mutation
+            if !fence_set {
+                let _ = store::set_source_state_verified(&conn, false);
+                fence_set = true;
+            }
             // Upsert
             match store::upsert_parsed_file(&mut conn, &pf, size) {
                 Ok(_) => {
@@ -233,6 +240,10 @@ impl StructuralIndex {
         }
 
         // Remaining in existing_map are stale (deleted files)
+        if !fence_set && !existing_map.is_empty() {
+            let _ = store::set_source_state_verified(&conn, false);
+            fence_set = true;
+        }
         for (stale_path, _) in existing_map {
             let old_syms = store::load_symbols_for_file(&conn, &stale_path).unwrap_or_default();
             for s in &old_syms {
@@ -325,7 +336,8 @@ impl StructuralIndex {
         let t0 = Instant::now();
 
         if !exists {
-            // Delete
+            // Delete - verification fence
+            let _ = store::set_source_state_verified(&conn, false);
             let old_syms = store::load_symbols_for_file(&conn, relative_path).unwrap_or_default();
             let mut affected: std::collections::HashSet<String> = std::collections::HashSet::new();
             for s in &old_syms {
@@ -370,11 +382,8 @@ impl StructuralIndex {
             return Ok(stats);
         }
         let old_syms = store::load_symbols_for_file(&conn, relative_path).unwrap_or_default();
-        let existed_before = store::get_file_hash(&conn, relative_path)
-            .unwrap_or(None)
-            .is_some();
         let pf = parse_file(relative_path, &content, &hash);
-        let verified = !(pf.parse_error.is_some() && existed_before);
+        let verified = pf.parse_error.is_none();
         let new_names: std::collections::HashSet<String> = pf
             .symbols
             .iter()
@@ -389,6 +398,7 @@ impl StructuralIndex {
             affected.insert(n.clone());
         }
         let size = content.len() as u64;
+        let _ = store::set_source_state_verified(&conn, false);
         store::upsert_parsed_file(&mut conn, &pf, size)?;
         let _ = crate::bm25::upsert_bm25_for_file(&mut conn, relative_path, &pf.chunks, &content);
         stats.files_parsed = 1;

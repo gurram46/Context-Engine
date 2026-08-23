@@ -111,7 +111,7 @@ impl RepositoryRuntime {
                 project: None,
                 generation: 0,
                 source_state_hash: blake3::hash(b"").to_hex().to_string(),
-                source_state_verified: true,
+                source_state_verified: false,
                 semantic_fingerprint: context_index::embed::configured_fingerprint(),
                 last_full_verified: None,
                 discovery_total: 0,

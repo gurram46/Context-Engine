@@ -55,7 +55,8 @@ fn init_proof_schema(conn: &Connection) -> Result<()> {
             query TEXT NOT NULL,
             query_type TEXT,
             tool_name TEXT NOT NULL,
-            created_at TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            packed_context_hash TEXT NOT NULL,
             engine_version TEXT NOT NULL,
             index_schema_version INTEGER,
             extraction_version INTEGER,
@@ -206,7 +207,8 @@ pub struct ProofRecord {
     pub query: String,
     pub query_type: String,
     pub tool_name: String,
-    pub created_at: String,
+    pub created_at: i64,
+    pub packed_context_hash: String,
     pub engine_version: String,
     pub index_schema_version: Option<i32>,
     pub extraction_version: Option<i32>,
@@ -244,17 +246,11 @@ pub fn generate_proof_id() -> String {
     format!("cp_{}", u)
 }
 
-pub fn now_iso() -> String {
-    // Use chrono-like via time crate? Use std time rfc3339
-    let now = std::time::SystemTime::now()
+pub fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    // Simplify: seconds since epoch with ms
-    let secs = now.as_secs();
-    let millis = now.subsec_millis();
-    // Format as RFC3339-like: 2025-01-01T00:00:00.000Z not precise but unique
-    // Use chrono if available? Use simple
-    format!("{}-{:03}Z", secs, millis)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 pub fn insert_proof(
@@ -264,7 +260,7 @@ pub fn insert_proof(
 ) -> Result<()> {
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO proofs (id, schema_version, repo_instance_id, canonical_root, source_generation, source_state_hash, source_state_verified, git_branch, git_commit, git_detached, git_dirty, query, query_type, tool_name, created_at, engine_version, index_schema_version, extraction_version, semantic_representation_version, embedding_model_id, embedding_model_version, embedding_dimension, packed_token_estimate) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+        "INSERT INTO proofs (id, schema_version, repo_instance_id, canonical_root, source_generation, source_state_hash, source_state_verified, git_branch, git_commit, git_detached, git_dirty, query, query_type, tool_name, created_at, packed_context_hash, engine_version, index_schema_version, extraction_version, semantic_representation_version, embedding_model_id, embedding_model_version, embedding_dimension, packed_token_estimate) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
         params![
             proof.id,
             proof.schema_version,
@@ -281,6 +277,7 @@ pub fn insert_proof(
             proof.query_type,
             proof.tool_name,
             proof.created_at,
+            proof.packed_context_hash,
             proof.engine_version,
             proof.index_schema_version,
             proof.extraction_version,
@@ -321,7 +318,7 @@ pub fn insert_proof(
 }
 
 pub fn load_proof(conn: &Connection, id: &str) -> Result<Option<ProofRecord>> {
-    let mut stmt = conn.prepare("SELECT id, schema_version, repo_instance_id, canonical_root, source_generation, source_state_hash, source_state_verified, git_branch, git_commit, git_detached, git_dirty, query, query_type, tool_name, created_at, engine_version, index_schema_version, extraction_version, semantic_representation_version, embedding_model_id, embedding_model_version, embedding_dimension, packed_token_estimate FROM proofs WHERE id=?1")?;
+    let mut stmt = conn.prepare("SELECT id, schema_version, repo_instance_id, canonical_root, source_generation, source_state_hash, source_state_verified, git_branch, git_commit, git_detached, git_dirty, query, query_type, tool_name, created_at, packed_context_hash, engine_version, index_schema_version, extraction_version, semantic_representation_version, embedding_model_id, embedding_model_version, embedding_dimension, packed_token_estimate FROM proofs WHERE id=?1")?;
     let opt = stmt
         .query_row(params![id], |row| {
             Ok(ProofRecord {
@@ -339,15 +336,16 @@ pub fn load_proof(conn: &Connection, id: &str) -> Result<Option<ProofRecord>> {
                 query: row.get(11)?,
                 query_type: row.get(12)?,
                 tool_name: row.get(13)?,
-                created_at: row.get(14)?,
-                engine_version: row.get(15)?,
-                index_schema_version: row.get(16)?,
-                extraction_version: row.get(17)?,
-                semantic_representation_version: row.get(18)?,
-                embedding_model_id: row.get(19)?,
-                embedding_model_version: row.get(20)?,
-                embedding_dimension: row.get(21)?,
-                packed_token_estimate: row.get::<_, i64>(22)? as usize,
+                created_at: row.get::<_, i64>(14)?,
+                packed_context_hash: row.get(15)?,
+                engine_version: row.get(16)?,
+                index_schema_version: row.get(17)?,
+                extraction_version: row.get(18)?,
+                semantic_representation_version: row.get(19)?,
+                embedding_model_id: row.get(20)?,
+                embedding_model_version: row.get(21)?,
+                embedding_dimension: row.get(22)?,
+                packed_token_estimate: row.get::<_, i64>(23)? as usize,
             })
         })
         .optional()?;
@@ -469,8 +467,8 @@ pub fn get_current_source_state(project_root: &Path) -> Result<CurrentState> {
         .ok_or_else(|| anyhow::anyhow!("source_state_hash missing"))?;
     let gen = context_index::structural::store::get_generation(&conn).unwrap_or(0);
     let verified = context_index::structural::store::get_source_state_verified(&conn)
-        .unwrap_or(Some(true))
-        .unwrap_or(true);
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
     Ok(CurrentState {
         hash,
         generation: gen,
@@ -491,6 +489,7 @@ pub fn build_proof_record(
     query: &str,
     query_type: &str,
     packed_token_estimate: usize,
+    packed_context_hash: &str,
 ) -> ProofRecord {
     let fp = context_index::embed::configured_fingerprint();
     ProofRecord {
@@ -508,7 +507,8 @@ pub fn build_proof_record(
         query: query.to_string(),
         query_type: query_type.to_string(),
         tool_name: "context_search".to_string(),
-        created_at: now_iso(),
+        created_at: now_unix_ms(),
+        packed_context_hash: packed_context_hash.to_string(),
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         index_schema_version: Some(context_index::structural::store::SCHEMA_VERSION),
         extraction_version: Some(context_index::structural::STRUCTURAL_EXTRACTION_VERSION as i32),
@@ -549,7 +549,8 @@ mod tests {
             query: "test".into(),
             query_type: "EXACT".into(),
             tool_name: "context_search".into(),
-            created_at: "0".into(),
+            created_at: 0,
+            packed_context_hash: blake3::hash(b"markdown").to_hex().to_string(),
             engine_version: "0.1.0".into(),
             index_schema_version: Some(3),
             extraction_version: Some(2),

@@ -662,14 +662,12 @@ async fn test27_index_unverifiable() {
     store::set_source_state_verified(&structural_conn, true).unwrap();
 }
 
-// 28. BACKFILL - existing DB without hash gets backfilled
+// 28. BACKFILL - existing DB without hash gets backfilled, verified false then true after reconcile
 #[tokio::test]
 async fn test28_backfill() {
     let tmp = TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
     std::fs::write(tmp.path().join("a.py"), "def foo():\n    pass\n").unwrap();
-    // Create legacy DB without source_state_hash: open in_memory then manually create files but not hash?
-    // Simpler: create DB via open_db then delete hash key
     let conn = store::open_db(tmp.path()).unwrap();
     conn.execute(
         "DELETE FROM structural_meta WHERE key='source_state_hash'",
@@ -681,15 +679,26 @@ async fn test28_backfill() {
         [],
     )
     .unwrap();
-    // Verify missing
     assert!(store::get_source_state_hash(&conn).unwrap().is_none());
-    // Re-open should backfill
+    assert!(store::get_source_state_verified(&conn).unwrap().is_none());
+    // Re-open should backfill hash and set verified false (legacy)
     let conn2 = store::open_db(tmp.path()).unwrap();
     assert!(store::get_source_state_hash(&conn2).unwrap().is_some());
-    // New service should work
+    assert_eq!(
+        store::get_source_state_verified(&conn2).unwrap(),
+        Some(false),
+        "legacy backfill must be unverified"
+    );
+    // Successful reconcile should promote to true
     let svc = new_service(tmp.path().to_path_buf()).await;
     let wp = svc.search_external("foo", small_opts()).await.unwrap();
     assert!(wp.proof.source_state_hash.is_some());
+    let conn3 = store::open_db(tmp.path()).unwrap();
+    assert_eq!(
+        store::get_source_state_verified(&conn3).unwrap(),
+        Some(true),
+        "clean reconcile should promote to verified"
+    );
 }
 
 // 29. STRUCTURAL COHERENCE - generation and hash same snapshot
@@ -764,4 +773,199 @@ fn test_source_hash_changes_on_modify() {
         .unwrap();
     let h2 = store::compute_source_state_hash(&conn).unwrap();
     assert_ne!(h1, h2);
+}
+
+// 30. PARSE FAILURE - newly discovered file parse error -> unverified
+#[tokio::test]
+async fn test30_parse_failure_new_file() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    std::fs::write(tmp.path().join("a.py"), "def foo():\n    pass\n").unwrap();
+    let svc = new_service(tmp.path().to_path_buf()).await;
+    // ensure initial verified
+    let conn = store::open_db(tmp.path()).unwrap();
+    assert_eq!(store::get_source_state_verified(&conn).unwrap(), Some(true));
+    // Add new file with invalid syntax that triggers parse_error
+    std::fs::write(tmp.path().join("bad.py"), "def foo(:\n    pass\n").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let _ = svc.search_external("foo", small_opts()).await.unwrap();
+    let conn2 = store::open_db(tmp.path()).unwrap();
+    assert_eq!(
+        store::get_source_state_verified(&conn2).unwrap(),
+        Some(false),
+        "new file parse failure must be unverified"
+    );
+    // Clean fix should recover to verified
+    std::fs::write(tmp.path().join("bad.py"), "def bar():\n    pass\n").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let _ = svc.search_external("foo", small_opts()).await.unwrap();
+    let conn3 = store::open_db(tmp.path()).unwrap();
+    assert_eq!(
+        store::get_source_state_verified(&conn3).unwrap(),
+        Some(true)
+    );
+}
+
+// 31. PARSE FAILURE - existing file parse error -> unverified
+#[tokio::test]
+async fn test31_parse_failure_existing() {
+    let tmp = create_repo_with_files(&[("a.py", "def foo():\n    pass\n")]);
+    let svc = new_service(tmp.path().to_path_buf()).await;
+    let conn = store::open_db(tmp.path()).unwrap();
+    assert_eq!(store::get_source_state_verified(&conn).unwrap(), Some(true));
+    // Corrupt existing file
+    std::fs::write(tmp.path().join("a.py"), "def foo(:\n    pass\n").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let _ = svc.search_external("foo", small_opts()).await.unwrap();
+    let conn2 = store::open_db(tmp.path()).unwrap();
+    assert_eq!(
+        store::get_source_state_verified(&conn2).unwrap(),
+        Some(false)
+    );
+}
+
+// 32. RECONCILE FENCE - mid-reconcile validation UNVERIFIABLE, post STALE
+#[tokio::test]
+async fn test32_fence_mid_validation() {
+    let tmp = create_repo_with_files(&[("a.py", "def foo():\n    pass\n")]);
+    let svc = new_service(tmp.path().to_path_buf()).await;
+    let wp = svc.search_external("foo", small_opts()).await.unwrap();
+    let proof_id = wp.proof.id.clone().unwrap();
+    let conn = proof::open_proof_db(tmp.path()).unwrap();
+    let rec = proof::load_proof(&conn, &proof_id).unwrap().unwrap();
+    // Simulate fence: set verified false before mutation
+    let sconn = store::open_db(tmp.path()).unwrap();
+    store::set_source_state_verified(&sconn, false).unwrap();
+    let st_mid = proof::validate_proof(tmp.path(), &rec);
+    assert_eq!(
+        st_mid,
+        proof::Validity::Unverifiable,
+        "mid-reconcile must be unverifiable"
+    );
+    // Now perform actual file change and reconcile
+    std::fs::write(tmp.path().join("a.py"), "def foo():\n    x=1\n").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let _ = svc.search_external("foo", small_opts()).await.unwrap();
+    let st_post = proof::validate_proof(tmp.path(), &rec);
+    assert_eq!(st_post, proof::Validity::Stale);
+}
+
+// 33. SEARCH PARITY - pure search vs proof search same ContextResult
+#[tokio::test]
+async fn test33_search_parity() {
+    let tmp = create_repo_with_files(&[
+        ("a.py", "def foo():\n    pass\n"),
+        ("b.py", "def bar():\n    foo()\n"),
+    ]);
+    let svc = new_service(tmp.path().to_path_buf()).await;
+    // Ensure generation stable: do one search to establish snapshot
+    let _ = svc.search("foo", small_opts()).await.unwrap();
+    let before = proof::count_proofs(&proof::open_proof_db(tmp.path()).unwrap()).unwrap();
+    let res_pure = svc.search("foo", small_opts()).await.unwrap();
+    let after_pure = proof::count_proofs(&proof::open_proof_db(tmp.path()).unwrap()).unwrap();
+    assert_eq!(before, after_pure, "pure search must not create proof");
+    let wp = svc.search_external("foo", small_opts()).await.unwrap();
+    assert_eq!(res_pure.query, wp.result.query);
+    assert_eq!(res_pure.query_type, wp.result.query_type);
+    assert_eq!(res_pure.evidence, wp.result.evidence);
+    assert_eq!(res_pure.packed.files, wp.result.packed.files);
+    assert_eq!(
+        res_pure.packed.token_estimate,
+        wp.result.packed.token_estimate
+    );
+    assert_eq!(
+        res_pure.packed.included_evidence.len(),
+        wp.result.packed.included_evidence.len()
+    );
+    for (a, b) in res_pure
+        .packed
+        .included_evidence
+        .iter()
+        .zip(wp.result.packed.included_evidence.iter())
+    {
+        assert_eq!(a.file, b.file);
+        assert_eq!(a.delivered_content_hash, b.delivered_content_hash);
+    }
+}
+
+// 34. CREATED_AT is unix_ms integer, not fake ISO
+#[tokio::test]
+async fn test34_created_at_unix_ms() {
+    let tmp = create_repo_with_files(&[("a.py", "def foo():\n    pass\n")]);
+    let svc = new_service(tmp.path().to_path_buf()).await;
+    let wp = svc.search_external("foo", small_opts()).await.unwrap();
+    let proof_id = wp.proof.id.unwrap();
+    let conn = proof::open_proof_db(tmp.path()).unwrap();
+    let rec = proof::load_proof(&conn, &proof_id).unwrap().unwrap();
+    // created_at should be recent unix_ms (within last minute)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(rec.created_at > 0);
+    assert!(
+        (now - rec.created_at).abs() < 60_000,
+        "created_at should be recent unix_ms"
+    );
+    // Check DB column type is INTEGER (not TEXT with dash)
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='proofs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        sql.contains("created_at INTEGER"),
+        "created_at should be INTEGER, got: {}",
+        sql
+    );
+}
+
+// 35. PACKED CONTEXT HASH - blake3 of markdown, not snippet, not persisted markdown
+#[tokio::test]
+async fn test35_packed_context_hash() {
+    let tmp = create_repo_with_files(&[
+        ("a.py", "def foo():\n    pass\n"),
+        ("b.py", "def bar():\n    foo()\n"),
+    ]);
+    let svc = new_service(tmp.path().to_path_buf()).await;
+    let wp = svc.search_external("foo", small_opts()).await.unwrap();
+    let proof_id = wp.proof.id.clone().unwrap();
+    let expected = blake3::hash(wp.result.packed.markdown.as_bytes())
+        .to_hex()
+        .to_string();
+    let conn = proof::open_proof_db(tmp.path()).unwrap();
+    let rec = proof::load_proof(&conn, &proof_id).unwrap().unwrap();
+    assert_eq!(rec.packed_context_hash, expected);
+    // Changing only rendered metadata (e.g., file header) would change packed hash, but we test that per-evidence hash is still snippet
+    for pe in &wp.result.packed.included_evidence {
+        let snippet_hash = blake3::hash(pe.delivered_snippet.as_bytes())
+            .to_hex()
+            .to_string();
+        assert_eq!(pe.delivered_content_hash, snippet_hash);
+        assert_ne!(
+            pe.delivered_content_hash, expected,
+            "per-evidence hash must not be whole markdown hash"
+        );
+    }
+    // DB must contain packed_context_hash column but not markdown
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='proofs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(sql.contains("packed_context_hash TEXT"));
+    assert!(!sql.to_lowercase().contains("packed_markdown"));
+    // Also ensure proof_evidence does not contain text
+    let ev_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='proof_evidence'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!ev_sql.to_lowercase().contains("evidence_text"));
 }

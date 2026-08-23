@@ -79,9 +79,9 @@ pub fn ensure_source_state_hash(conn: &Connection) -> Result<String> {
     }
     let computed = compute_source_state_hash(conn)?;
     set_source_state_hash(conn, &computed)?;
-    // If verified flag missing, default to true if we just computed from current files; caller may override to false on parse failure
+    // Legacy backfill must NOT default verified to true; a legacy DB may contain preserved last-good rows from prior parse failure
     if get_source_state_verified(conn)?.is_none() {
-        set_source_state_verified(conn, true)?;
+        set_source_state_verified(conn, false)?;
     }
     Ok(computed)
 }
