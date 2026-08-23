@@ -380,20 +380,14 @@ impl ContextService {
             .ok()
             .and_then(|c| structural_store::get_generation(&c).ok())
             .unwrap_or(0);
-        let (source_state_hash, source_state_verified) = structural_store::open_db(root.path())
-            .ok()
-            .map(|c| {
-                let h = structural_store::get_source_state_hash(&c)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| blake3::hash(b"").to_hex().to_string());
-                let v = structural_store::get_source_state_verified(&c)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(false);
-                (h, v)
-            })
-            .unwrap_or((blake3::hash(b"").to_hex().to_string(), false));
+        let conn2 = structural_store::open_db(root.path())
+            .map_err(|e| ContextError::Internal(format!("open_db hash read failed: {e}")))?;
+        let source_state_hash = structural_store::get_source_state_hash(&conn2)
+            .map_err(|e| ContextError::Internal(format!("hash read failed: {e}")))?
+            .ok_or_else(|| ContextError::Internal("hash missing after build".into()))?;
+        let source_state_verified = structural_store::get_source_state_verified(&conn2)
+            .map_err(|e| ContextError::Internal(format!("verified read failed: {e}")))?
+            .unwrap_or(false);
         let elapsed = t0.elapsed().as_millis();
         let stats = ReconcileStats {
             discovered: idx.stats.discovered,
@@ -773,19 +767,17 @@ impl ContextService {
             .and_then(|c| structural_store::get_generation(&c).ok())
             .unwrap_or(0);
         if content_changed && !structural_changed {
-            if let Ok(mut conn) = structural_store::open_db(root.path()) {
-                let next = generation.saturating_add(1);
-                let hash = structural_store::compute_source_state_hash(&conn)
-                    .unwrap_or_else(|_| blake3::hash(b"").to_hex().to_string());
-                let verified = structural_store::get_source_state_verified(&conn)
-                    .unwrap_or(Some(false))
-                    .unwrap_or(false);
-                if structural_store::set_generation_and_state(&mut conn, next, &hash, verified)
-                    .is_ok()
-                {
-                    generation = next;
-                }
-            }
+            let mut conn = structural_store::open_db(root.path())
+                .map_err(|e| ContextError::Internal(format!("open_db failed: {e}")))?;
+            let next = generation.saturating_add(1);
+            let hash = structural_store::compute_source_state_hash(&conn)
+                .map_err(|e| ContextError::Internal(format!("hash failed: {e}")))?;
+            let verified = structural_store::get_source_state_verified(&conn)
+                .map_err(|e| ContextError::Internal(format!("verified read failed: {e}")))?
+                .unwrap_or(false);
+            structural_store::set_generation_and_state(&mut conn, next, &hash, verified)
+                .map_err(|e| ContextError::Internal(format!("publish failed: {e}")))?;
+            generation = next;
         }
 
         let elapsed = t0.elapsed().as_millis();
@@ -799,20 +791,14 @@ impl ContextService {
             embedding_calls,
         };
         let project_arc = Arc::new(delta.project);
-        let (source_state_hash, source_state_verified) = structural_store::open_db(root.path())
-            .ok()
-            .map(|c| {
-                let h = structural_store::get_source_state_hash(&c)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| blake3::hash(b"").to_hex().to_string());
-                let v = structural_store::get_source_state_verified(&c)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(false);
-                (h, v)
-            })
-            .unwrap_or((blake3::hash(b"").to_hex().to_string(), false));
+        let conn2 = structural_store::open_db(root.path())
+            .map_err(|e| ContextError::Internal(format!("open_db hash read failed: {e}")))?;
+        let source_state_hash = structural_store::get_source_state_hash(&conn2)
+            .map_err(|e| ContextError::Internal(format!("hash read failed: {e}")))?
+            .ok_or_else(|| ContextError::Internal("hash missing after reconcile".into()))?;
+        let source_state_verified = structural_store::get_source_state_verified(&conn2)
+            .map_err(|e| ContextError::Internal(format!("verified read failed: {e}")))?
+            .unwrap_or(false);
         self.runtime.publish(
             project_arc.clone(),
             generation,

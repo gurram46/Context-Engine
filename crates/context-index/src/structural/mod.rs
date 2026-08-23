@@ -203,9 +203,9 @@ impl StructuralIndex {
                 affected_names.insert(n.clone());
             }
             // Also if old symbols existed and new empty -> affected includes old
-            // Verification fence before first mutation
+            // Verification fence before first mutation - must succeed
             if !fence_set {
-                let _ = store::set_source_state_verified(&conn, false);
+                store::set_source_state_verified(&conn, false)?;
                 fence_set = true;
             }
             // Upsert
@@ -241,7 +241,7 @@ impl StructuralIndex {
 
         // Remaining in existing_map are stale (deleted files)
         if !fence_set && !existing_map.is_empty() {
-            let _ = store::set_source_state_verified(&conn, false);
+            store::set_source_state_verified(&conn, false)?;
             fence_set = true;
         }
         for (stale_path, _) in existing_map {
@@ -250,7 +250,7 @@ impl StructuralIndex {
                 affected_names.insert(s.name.clone());
                 affected_names.insert(s.qualified_name.clone());
             }
-            let _ = store::delete_file(&conn, &stale_path);
+            store::delete_file(&conn, &stale_path)?;
             let _ = crate::bm25::delete_bm25_for_file(&conn, &stale_path);
             stats.files_deleted += 1;
             stale_files.push(stale_path);
@@ -290,15 +290,14 @@ impl StructuralIndex {
         } else {
             stats.structural_generation = gen;
         }
-        // Compute deterministic source_state_hash and persist coherently with generation
-        let source_hash = store::compute_source_state_hash(&conn)
-            .unwrap_or_else(|_| blake3::hash(b"").to_hex().to_string());
-        let _ = store::set_generation_and_state(
+        // Compute deterministic source_state_hash and persist coherently with generation - must succeed
+        let source_hash = store::compute_source_state_hash(&conn)?;
+        store::set_generation_and_state(
             &mut conn,
             stats.structural_generation,
             &source_hash,
             source_verified_initial,
-        );
+        )?;
 
         // Store extraction version after successful build — only if every old file was upgraded
         if needs_extraction_upgrade {
@@ -336,8 +335,8 @@ impl StructuralIndex {
         let t0 = Instant::now();
 
         if !exists {
-            // Delete - verification fence
-            let _ = store::set_source_state_verified(&conn, false);
+            // Delete - verification fence must succeed
+            store::set_source_state_verified(&conn, false)?;
             let old_syms = store::load_symbols_for_file(&conn, relative_path).unwrap_or_default();
             let mut affected: std::collections::HashSet<String> = std::collections::HashSet::new();
             for s in &old_syms {
@@ -364,9 +363,8 @@ impl StructuralIndex {
                 stats.edges_deleted = del;
             }
             let gen = store::get_generation(&conn).unwrap_or(0) + 1;
-            let hash = store::compute_source_state_hash(&conn)
-                .unwrap_or_else(|_| blake3::hash(b"").to_hex().to_string());
-            let _ = store::set_generation_and_state(&mut conn, gen, &hash, true);
+            let hash = store::compute_source_state_hash(&conn)?;
+            store::set_generation_and_state(&mut conn, gen, &hash, true)?;
             stats.structural_generation = gen;
             stats.elapsed_ms = t0.elapsed().as_millis();
             return Ok(stats);
@@ -398,7 +396,7 @@ impl StructuralIndex {
             affected.insert(n.clone());
         }
         let size = content.len() as u64;
-        let _ = store::set_source_state_verified(&conn, false);
+        store::set_source_state_verified(&conn, false)?;
         store::upsert_parsed_file(&mut conn, &pf, size)?;
         let _ = crate::bm25::upsert_bm25_for_file(&mut conn, relative_path, &pf.chunks, &content);
         stats.files_parsed = 1;
@@ -411,9 +409,8 @@ impl StructuralIndex {
         stats.edges_inserted = ins;
         stats.references_reresolved = reresolved;
         let gen = store::get_generation(&conn).unwrap_or(0) + 1;
-        let hash2 = store::compute_source_state_hash(&conn)
-            .unwrap_or_else(|_| blake3::hash(b"").to_hex().to_string());
-        let _ = store::set_generation_and_state(&mut conn, gen, &hash2, verified);
+        let hash2 = store::compute_source_state_hash(&conn)?;
+        store::set_generation_and_state(&mut conn, gen, &hash2, verified)?;
         stats.structural_generation = gen;
         stats.elapsed_ms = t0.elapsed().as_millis();
         Ok(stats)
