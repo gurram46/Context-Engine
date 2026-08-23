@@ -216,6 +216,26 @@ async fn handle_client(mut stream: TcpStream, service: Arc<ContextService>) -> R
                     Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
                 }
             }
+            "context_delta" => {
+                let proof_id = params
+                    .get("proof_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let root = service.root_path();
+                let proof_id_owned = proof_id.to_string();
+                let delta_res = tokio::task::spawn_blocking(move || {
+                    crate::delta::delta_for_proof(&root, &proof_id_owned)
+                })
+                .await;
+                match delta_res {
+                    Ok(Ok(delta)) => {
+                        let v = serde_json::to_value(&delta).unwrap_or(serde_json::json!({}));
+                        serde_json::json!({"id": id, "result": v})
+                    }
+                    Ok(Err(e)) => serde_json::json!({"id": id, "error": e.to_string()}),
+                    Err(e) => serde_json::json!({"id": id, "error": format!("join failed: {e}")}),
+                }
+            }
             "context_status" => {
                 match service.status().await {
                     Ok(st) => {
@@ -911,6 +931,26 @@ async fn handle_global_client(
                         serde_json::json!({"id": id, "result": {"query": r.query, "type": r.query_type.as_str(), "context": r.packed.markdown, "evidence": r.evidence, "stats": r.stats}})
                     }
                     Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
+                }
+            }
+            "context_delta" => {
+                let proof_id = params
+                    .get("proof_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let root_clone = canon.clone();
+                let pid = proof_id.to_string();
+                let delta_res = tokio::task::spawn_blocking(move || {
+                    crate::delta::delta_for_proof(&root_clone, &pid)
+                })
+                .await;
+                match delta_res {
+                    Ok(Ok(delta)) => {
+                        let v = serde_json::to_value(&delta).unwrap_or(serde_json::json!({}));
+                        serde_json::json!({"id": id, "result": v})
+                    }
+                    Ok(Err(e)) => serde_json::json!({"id": id, "error": e.to_string()}),
+                    Err(e) => serde_json::json!({"id": id, "error": format!("join failed: {e}")}),
                 }
             }
             "context_status" => {

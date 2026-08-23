@@ -11,6 +11,8 @@ use rmcp::{
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::service::{ContextService, Direction, SearchOptions};
@@ -226,6 +228,12 @@ impl Drop for McpAdapter {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct DeltaParams {
+    #[schemars(description = "Proof ID from context_search")]
+    pub proof_id: String,
+}
+
 #[tool_router]
 impl McpAdapter {
     #[tool(
@@ -405,6 +413,40 @@ impl McpAdapter {
                 .status()
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        };
+        Ok(CallToolResult::success(vec![
+            rmcp::model::ContentBlock::text(
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()),
+            ),
+        ]))
+    }
+
+    #[tool(description = "Delta between historical proof and current repository state.")]
+    async fn context_delta(
+        &self,
+        Parameters(params): Parameters<DeltaParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.proof_id.trim().is_empty() {
+            return Err(McpError::invalid_params("proof_id is required", None));
+        }
+        let v = match &self.service {
+            ServiceKind::Local(svc) => {
+                let root = svc.root_path();
+                let delta = tokio::task::spawn_blocking(move || {
+                    crate::delta::delta_for_proof(&root, &params.proof_id)
+                })
+                .await
+                .map_err(|e| McpError::internal_error(format!("delta join failed: {e}"), None))?
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                serde_json::to_value(&delta).unwrap_or(serde_json::json!({}))
+            }
+            ServiceKind::Remote(client) => {
+                let p = serde_json::json!({"proof_id": params.proof_id});
+                client
+                    .call("context_delta", p)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            }
         };
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(

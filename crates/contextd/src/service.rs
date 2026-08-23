@@ -195,6 +195,10 @@ pub struct ContextService {
 }
 
 impl ContextService {
+    pub fn root_path(&self) -> PathBuf {
+        Self::canon(&self.root)
+    }
+
     fn canon(p: &std::path::Path) -> PathBuf {
         let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         let s = c.to_string_lossy();

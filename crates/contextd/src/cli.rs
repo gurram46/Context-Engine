@@ -65,6 +65,11 @@ pub enum Command {
     },
     /// Run global daemon (internal, spawned detached)
     Daemon,
+    /// Delta between historical proof and current state
+    Delta {
+        /// Proof ID from context_search
+        proof_id: String,
+    },
 }
 
 fn opts(cli: &Cli) -> SearchOptions {
@@ -287,6 +292,50 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
         }
         Some(Command::Daemon) => {
             crate::daemon::run_global_daemon().await?;
+        }
+        Some(Command::Delta { proof_id }) => {
+            let root = cli
+                .root
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
+            let delta = tokio::task::spawn_blocking({
+                let root = root.clone();
+                let pid = proof_id.clone();
+                move || crate::delta::delta_for_proof(&root, &pid)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("delta join failed: {e}"))??;
+            if is_json {
+                println!("{}", serde_json::to_string_pretty(&delta)?);
+            } else {
+                println!(
+                    "Delta {} -> {}",
+                    delta.from_source_state_hash,
+                    delta
+                        .to_source_state_hash
+                        .clone()
+                        .unwrap_or_else(|| "unknown".into())
+                );
+                println!("Status: {} ({})", delta.status.as_str(), delta.reason);
+                println!(
+                    "Summary: unchanged={} changed={} removed={} moved={} unverifiable={}",
+                    delta.summary.unchanged,
+                    delta.summary.changed,
+                    delta.summary.removed,
+                    delta.summary.moved,
+                    delta.summary.unverifiable
+                );
+                for ev in &delta.evidence {
+                    println!(
+                        "{}: {} -> {} [{}] {}",
+                        ev.ordinal,
+                        ev.old_path,
+                        ev.current_path.clone().unwrap_or_else(|| "-".into()),
+                        ev.classification.as_str(),
+                        ev.reason
+                    );
+                }
+            }
         }
         Some(Command::Index { semantic }) => {
             let svc = ContextService::new_for_index(root)?;
