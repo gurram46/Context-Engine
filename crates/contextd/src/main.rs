@@ -9,6 +9,7 @@ mod hot;
 mod mcp;
 mod pipeline;
 mod project;
+mod proof;
 mod registry;
 mod resource;
 mod runtime;

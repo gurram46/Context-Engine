@@ -146,10 +146,13 @@ async fn handle_client(mut stream: TcpStream, service: Arc<ContextService>) -> R
                     max_results: maxr,
                     debug: false,
                 };
-                match service.search(q, opts).await {
-                    Ok(r) => {
-                        let stats = serde_json::to_value(&r.stats).unwrap_or(serde_json::json!({}));
-                        serde_json::json!({"id": id, "result": {"query": r.query, "type": r.query_type.as_str(), "context": r.packed.markdown, "evidence": r.evidence, "stats": stats}})
+                match service.search_external(q, opts).await {
+                    Ok(wp) => {
+                        let stats =
+                            serde_json::to_value(&wp.result.stats).unwrap_or(serde_json::json!({}));
+                        let proof =
+                            serde_json::to_value(&wp.proof).unwrap_or(serde_json::json!({}));
+                        serde_json::json!({"id": id, "result": {"query": wp.result.query, "type": wp.result.query_type.as_str(), "context": wp.result.packed.markdown, "evidence": wp.result.evidence, "stats": stats, "proof": proof}})
                     }
                     Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
                 }
@@ -350,6 +353,7 @@ impl RemoteClient {
             markdown: context_md,
             token_estimate: stats.packed_tokens,
             files: vec![],
+            included_evidence: vec![],
         };
         Ok(crate::pipeline::ContextResult {
             query: query_out,
@@ -388,6 +392,7 @@ impl RemoteClient {
                         .to_string(),
                     token_estimate: 0,
                     files: vec![],
+                    included_evidence: vec![],
                 },
                 stats: crate::pipeline::PipelineStats {
                     candidate_count: 0,
@@ -502,6 +507,7 @@ impl RemoteClient {
                     .to_string(),
                 token_estimate: 0,
                 files: vec![],
+                included_evidence: vec![],
             },
             stats,
         })
@@ -572,6 +578,7 @@ impl RemoteClient {
                     .to_string(),
                 token_estimate: 0,
                 files: vec![],
+                included_evidence: vec![],
             },
             stats,
         })
@@ -834,12 +841,15 @@ async fn handle_global_client(
                     }
                 }
                 registry.inc_active_query(&canon).await;
-                let res = svc.search(q, opts).await;
+                let res = svc.search_external(q, opts).await;
                 registry.dec_active_query(&canon).await;
                 match res {
-                    Ok(r) => {
-                        let stats = serde_json::to_value(&r.stats).unwrap_or(serde_json::json!({}));
-                        serde_json::json!({"id": id, "result": {"query": r.query, "type": r.query_type.as_str(), "context": r.packed.markdown, "evidence": r.evidence, "stats": stats, "root": canon.display().to_string()}})
+                    Ok(wp) => {
+                        let stats =
+                            serde_json::to_value(&wp.result.stats).unwrap_or(serde_json::json!({}));
+                        let proof =
+                            serde_json::to_value(&wp.proof).unwrap_or(serde_json::json!({}));
+                        serde_json::json!({"id": id, "result": {"query": wp.result.query, "type": wp.result.query_type.as_str(), "context": wp.result.packed.markdown, "evidence": wp.result.evidence, "stats": stats, "proof": proof, "root": canon.display().to_string()}})
                     }
                     Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
                 }

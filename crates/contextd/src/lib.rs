@@ -7,6 +7,7 @@ pub mod daemon;
 pub mod hot;
 pub mod pipeline;
 pub mod project;
+pub mod proof;
 pub mod registry;
 pub mod resource;
 pub mod runtime;

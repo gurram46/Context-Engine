@@ -77,6 +77,17 @@ pub fn resolve_project_root(explicit: Option<&Path>) -> Result<ProjectRoot, Cont
     ProjectRoot::resolve(explicit)
 }
 
+/// Compute repository instance id: BLAKE3(canonical root string)
+pub fn repo_instance_id(root: &Path) -> String {
+    // Use canonicalized representation if possible, else raw path
+    let s = root.to_string_lossy().to_string();
+    blake3::hash(s.as_bytes()).to_hex().to_string()
+}
+
+pub fn repo_instance_id_for_project_root(pr: &ProjectRoot) -> String {
+    repo_instance_id(pr.path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

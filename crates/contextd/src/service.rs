@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::proof as proof_store;
 use context_core::ContextError;
 use context_index::embed::Embedder;
 use context_index::structural::store as structural_store;
@@ -76,6 +77,8 @@ pub struct ReconcileStats {
 pub(crate) struct RuntimeAccess {
     pub project: Arc<ProjectIndex>,
     pub generation: u64,
+    pub source_state_hash: String,
+    pub source_state_verified: bool,
     pub reconcile_skipped: bool,
     pub discovery_calls: u32,
     pub reconcile_calls: u32,
@@ -92,6 +95,8 @@ struct FullReconcile {
     discovery_ms: u128,
     fingerprint: context_index::embed::ModelFingerprint,
     generation: u64,
+    source_state_hash: String,
+    source_state_verified: bool,
     epoch: u64,
 }
 
@@ -157,6 +162,26 @@ pub struct StatusReport {
     pub estimated_hot_memory_bytes: Option<usize>,
     #[serde(default)]
     pub repository_estimated_hot_memory_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProofMeta {
+    pub status: String,
+    pub id: Option<String>,
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: Option<i32>,
+    #[serde(rename = "sourceGeneration")]
+    pub source_generation: Option<u64>,
+    #[serde(rename = "sourceStateHash")]
+    pub source_state_hash: Option<String>,
+    #[serde(rename = "packedContextHash")]
+    pub packed_context_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchWithProof {
+    pub result: crate::pipeline::ContextResult,
+    pub proof: ProofMeta,
 }
 
 /// Native service — single core for CLI and MCP.
@@ -355,6 +380,14 @@ impl ContextService {
             .ok()
             .and_then(|c| structural_store::get_generation(&c).ok())
             .unwrap_or(0);
+        let conn2 = structural_store::open_db(root.path())
+            .map_err(|e| ContextError::Internal(format!("open_db hash read failed: {e}")))?;
+        let source_state_hash = structural_store::get_source_state_hash(&conn2)
+            .map_err(|e| ContextError::Internal(format!("hash read failed: {e}")))?
+            .ok_or_else(|| ContextError::Internal("hash missing after build".into()))?;
+        let source_state_verified = structural_store::get_source_state_verified(&conn2)
+            .map_err(|e| ContextError::Internal(format!("verified read failed: {e}")))?
+            .unwrap_or(false);
         let elapsed = t0.elapsed().as_millis();
         let stats = ReconcileStats {
             discovered: idx.stats.discovered,
@@ -371,6 +404,8 @@ impl ContextService {
             discovery_ms,
             fingerprint,
             generation,
+            source_state_hash,
+            source_state_verified,
             epoch,
         })
     }
@@ -385,6 +420,8 @@ impl ContextService {
         self.runtime.publish(
             full.project.clone(),
             full.generation,
+            full.source_state_hash.clone(),
+            full.source_state_verified,
             full.fingerprint.clone(),
             Instant::now(),
             true,
@@ -456,6 +493,8 @@ impl ContextService {
         self.runtime.publish(
             full.project.clone(),
             full.generation,
+            full.source_state_hash.clone(),
+            full.source_state_verified,
             full.fingerprint.clone(),
             Instant::now(),
             true,
@@ -495,6 +534,8 @@ impl ContextService {
             return Ok(RuntimeAccess {
                 project: snapshot.project,
                 generation: snapshot.generation,
+                source_state_hash: snapshot.source_state_hash.clone(),
+                source_state_verified: snapshot.source_state_verified,
                 reconcile_skipped: true,
                 discovery_calls: 0,
                 reconcile_calls: 0,
@@ -518,14 +559,21 @@ impl ContextService {
                     let (stats, project) = self
                         .reconcile_dirty_paths_locked(override_embedder, &paths, access.epoch)
                         .await?;
-                    let generation = self
-                        .runtime
-                        .current_snapshot()
-                        .map(|s| s.generation)
-                        .unwrap_or(0);
+                    let snap = self.runtime.current_snapshot();
+                    let generation = snap.as_ref().map(|s| s.generation).unwrap_or(0);
+                    let source_state_hash = snap
+                        .as_ref()
+                        .map(|s| s.source_state_hash.clone())
+                        .unwrap_or_else(|| blake3::hash(b"").to_hex().to_string());
+                    let source_state_verified = snap
+                        .as_ref()
+                        .map(|s| s.source_state_verified)
+                        .unwrap_or(false);
                     return Ok(RuntimeAccess {
                         project,
                         generation,
+                        source_state_hash,
+                        source_state_verified,
                         reconcile_skipped: false,
                         discovery_calls: 0,
                         reconcile_calls: 1,
@@ -542,14 +590,21 @@ impl ContextService {
         // one full discovery/reconcile.
         let (stats, project, discovery_ms) =
             self.reconcile_and_publish_locked(override_embedder).await?;
-        let generation = self
-            .runtime
-            .current_snapshot()
-            .map(|s| s.generation)
-            .unwrap_or(0);
+        let snap = self.runtime.current_snapshot();
+        let generation = snap.as_ref().map(|s| s.generation).unwrap_or(0);
+        let source_state_hash = snap
+            .as_ref()
+            .map(|s| s.source_state_hash.clone())
+            .unwrap_or_else(|| blake3::hash(b"").to_hex().to_string());
+        let source_state_verified = snap
+            .as_ref()
+            .map(|s| s.source_state_verified)
+            .unwrap_or(false);
         Ok(RuntimeAccess {
             project,
             generation,
+            source_state_hash,
+            source_state_verified,
             reconcile_skipped: false,
             discovery_calls: 1,
             reconcile_calls: 1,
@@ -712,12 +767,17 @@ impl ContextService {
             .and_then(|c| structural_store::get_generation(&c).ok())
             .unwrap_or(0);
         if content_changed && !structural_changed {
-            if let Ok(conn) = structural_store::open_db(root.path()) {
-                let next = generation.saturating_add(1);
-                if structural_store::set_generation(&conn, next).is_ok() {
-                    generation = next;
-                }
-            }
+            let mut conn = structural_store::open_db(root.path())
+                .map_err(|e| ContextError::Internal(format!("open_db failed: {e}")))?;
+            let next = generation.saturating_add(1);
+            let hash = structural_store::compute_source_state_hash(&conn)
+                .map_err(|e| ContextError::Internal(format!("hash failed: {e}")))?;
+            let verified = structural_store::get_source_state_verified(&conn)
+                .map_err(|e| ContextError::Internal(format!("verified read failed: {e}")))?
+                .unwrap_or(false);
+            structural_store::set_generation_and_state(&mut conn, next, &hash, verified)
+                .map_err(|e| ContextError::Internal(format!("publish failed: {e}")))?;
+            generation = next;
         }
 
         let elapsed = t0.elapsed().as_millis();
@@ -731,9 +791,19 @@ impl ContextService {
             embedding_calls,
         };
         let project_arc = Arc::new(delta.project);
+        let conn2 = structural_store::open_db(root.path())
+            .map_err(|e| ContextError::Internal(format!("open_db hash read failed: {e}")))?;
+        let source_state_hash = structural_store::get_source_state_hash(&conn2)
+            .map_err(|e| ContextError::Internal(format!("hash read failed: {e}")))?
+            .ok_or_else(|| ContextError::Internal("hash missing after reconcile".into()))?;
+        let source_state_verified = structural_store::get_source_state_verified(&conn2)
+            .map_err(|e| ContextError::Internal(format!("verified read failed: {e}")))?
+            .unwrap_or(false);
         self.runtime.publish(
             project_arc.clone(),
             generation,
+            source_state_hash,
+            source_state_verified,
             fingerprint,
             Instant::now(),
             false,
@@ -778,12 +848,130 @@ impl ContextService {
         self.search_with_override(query, opts, None).await
     }
 
-    async fn search_with_override(
+    pub async fn search_external(
+        &self,
+        query: &str,
+        opts: SearchOptions,
+    ) -> Result<SearchWithProof, ContextError> {
+        let (res, access) = self.do_search(query, opts, None).await?;
+        let proof = self.build_proof(query, &access, &res).await;
+        Ok(SearchWithProof { result: res, proof })
+    }
+
+    async fn build_proof(
+        &self,
+        query: &str,
+        access: &RuntimeAccess,
+        res: &ContextResult,
+    ) -> ProofMeta {
+        let canon = Self::canon(&self.root);
+        let canon_str = canon.display().to_string();
+        let repo_id = context_index::project_root::repo_instance_id(&canon);
+        let git = proof_store::git_snapshot(&canon);
+        let query_type_str = res.query_type.as_str().to_string();
+        let packed_token = res.packed.token_estimate;
+        let packed_hash = blake3::hash(res.packed.markdown.as_bytes())
+            .to_hex()
+            .to_string();
+        // Build proof record
+        let proof_rec = proof_store::build_proof_record(
+            &canon,
+            &canon_str,
+            &repo_id,
+            access.generation,
+            &access.source_state_hash,
+            access.source_state_verified,
+            git.clone(),
+            query,
+            &query_type_str,
+            packed_token,
+            &packed_hash,
+        );
+        let proof_id_clone = proof_rec.id.clone();
+        // Build evidence from included_evidence (exact delivered)
+        let mut evidences: Vec<proof_store::ProofEvidence> = Vec::new();
+        for (idx, pe) in res.packed.included_evidence.iter().enumerate() {
+            evidences.push(proof_store::ProofEvidence {
+                proof_id: proof_id_clone.clone(),
+                ordinal: idx,
+                relative_path: pe.file.clone(),
+                start_line: pe.start_line,
+                end_line: pe.end_line,
+                start_byte: None,
+                end_byte: None,
+                delivered_content_hash: pe.delivered_content_hash.clone(),
+                chunk_id: None,
+                chunk_content_hash: None,
+                representation_hash: None,
+                symbol_id: None,
+                symbol_name: pe.symbol.clone(),
+                qualified_name: None,
+                symbol_kind: pe.symbol_kind.clone(),
+                provenance: pe.provenance.clone(),
+                relation: pe.relation.map(|r| r.as_str().to_string()),
+                final_score: pe.final_score,
+            });
+        }
+        // Try to persist with short transaction
+        let proof_root = canon.clone();
+        let insert_res = tokio::task::spawn_blocking(move || {
+            let mut conn = match proof_store::open_proof_db(&proof_root) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error=%e, "open proof db failed");
+                    return Err(e);
+                }
+            };
+            proof_store::insert_proof(&mut conn, &proof_rec, &evidences)
+        })
+        .await;
+        match insert_res {
+            Ok(Ok(_)) => {
+                let status = if access.source_state_verified {
+                    "current"
+                } else {
+                    "unverifiable"
+                };
+                ProofMeta {
+                    status: status.to_string(),
+                    id: Some(proof_id_clone),
+                    schema_version: Some(proof_store::PROOF_SCHEMA_VERSION),
+                    source_generation: Some(access.generation),
+                    source_state_hash: Some(access.source_state_hash.clone()),
+                    packed_context_hash: Some(packed_hash),
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error=%e, "proof insert failed");
+                ProofMeta {
+                    status: "unavailable".to_string(),
+                    id: None,
+                    schema_version: None,
+                    source_generation: None,
+                    source_state_hash: None,
+                    packed_context_hash: None,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error=%e, "proof task join failed");
+                ProofMeta {
+                    status: "unavailable".to_string(),
+                    id: None,
+                    schema_version: None,
+                    source_generation: None,
+                    source_state_hash: None,
+                    packed_context_hash: None,
+                }
+            }
+        }
+    }
+
+    async fn do_search(
         &self,
         query: &str,
         opts: SearchOptions,
         override_embedder: Option<Arc<dyn Embedder>>,
-    ) -> Result<ContextResult, ContextError> {
+    ) -> Result<(ContextResult, RuntimeAccess), ContextError> {
         let t_search = std::time::Instant::now();
         let is_override = override_embedder.is_some();
         let t_access = std::time::Instant::now();
@@ -911,6 +1099,16 @@ impl ContextService {
         if res.stats.authority_ms.is_none() {
             res.stats.authority_ms = Some(res.stats.rank_ms);
         }
+        Ok((res, access))
+    }
+
+    async fn search_with_override(
+        &self,
+        query: &str,
+        opts: SearchOptions,
+        override_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Result<ContextResult, ContextError> {
+        let (res, _) = self.do_search(query, opts, override_embedder).await?;
         Ok(res)
     }
 
