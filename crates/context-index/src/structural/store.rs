@@ -6,7 +6,9 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 3;
+pub const SOURCE_STATE_HASH_KEY: &str = "source_state_hash";
+pub const SOURCE_STATE_VERIFIED_KEY: &str = "source_state_verified";
 
 /// Index location — worktree-safe.
 /// Chooses `<repo>/.context/index/structural.db`
@@ -30,6 +32,60 @@ pub fn ensure_index_dir(project_root: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Compute deterministic source state hash: BLAKE3 over ordered (path NUL hash NUL)
+pub fn compute_source_state_hash(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare("SELECT path, hash FROM files ORDER BY path ASC")?;
+    let mut hasher = blake3::Hasher::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for r in rows {
+        let (path, hash) = r?;
+        hasher.update(path.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(hash.as_bytes());
+        hasher.update(&[0]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+pub fn get_source_state_hash(conn: &Connection) -> Result<Option<String>> {
+    get_meta(conn, SOURCE_STATE_HASH_KEY)
+}
+
+pub fn set_source_state_hash(conn: &Connection, hash: &str) -> Result<()> {
+    set_meta(conn, SOURCE_STATE_HASH_KEY, hash)
+}
+
+pub fn get_source_state_verified(conn: &Connection) -> Result<Option<bool>> {
+    let opt = get_meta(conn, SOURCE_STATE_VERIFIED_KEY)?;
+    Ok(opt.map(|v| v == "1" || v.to_lowercase() == "true"))
+}
+
+pub fn set_source_state_verified(conn: &Connection, verified: bool) -> Result<()> {
+    set_meta(
+        conn,
+        SOURCE_STATE_VERIFIED_KEY,
+        if verified { "1" } else { "0" },
+    )
+}
+
+/// Ensure source_state_hash exists for existing DB; backfill if missing but files exist
+pub fn ensure_source_state_hash(conn: &Connection) -> Result<String> {
+    if let Some(existing) = get_source_state_hash(conn)? {
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+    let computed = compute_source_state_hash(conn)?;
+    set_source_state_hash(conn, &computed)?;
+    // If verified flag missing, default to true if we just computed from current files; caller may override to false on parse failure
+    if get_source_state_verified(conn)?.is_none() {
+        set_source_state_verified(conn, true)?;
+    }
+    Ok(computed)
+}
+
 /// Open or create DB, ensure schema.
 /// Returns connection.
 pub fn open_db(project_root: &Path) -> Result<Connection> {
@@ -37,6 +93,10 @@ pub fn open_db(project_root: &Path) -> Result<Connection> {
     let db_path = index_db_path(project_root);
     let conn = Connection::open(&db_path)?;
     init_schema(&conn)?;
+    // Backfill source_state_hash for existing DBs if missing
+    if get_source_state_hash(&conn).unwrap_or(None).is_none() {
+        let _ = ensure_source_state_hash(&conn);
+    }
     Ok(conn)
 }
 
@@ -1005,6 +1065,30 @@ pub fn set_generation(conn: &Connection, gen: u64) -> Result<()> {
         "INSERT OR REPLACE INTO structural_meta (key, value) VALUES ('generation', ?1)",
         params![gen.to_string()],
     )?;
+    Ok(())
+}
+
+/// Atomically set generation + source_state_hash + verified in one transaction
+pub fn set_generation_and_state(
+    conn: &mut Connection,
+    gen: u64,
+    hash: &str,
+    verified: bool,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT OR REPLACE INTO structural_meta (key, value) VALUES ('generation', ?1)",
+        params![gen.to_string()],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO structural_meta (key, value) VALUES (?1, ?2)",
+        params![SOURCE_STATE_HASH_KEY, hash],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO structural_meta (key, value) VALUES (?1, ?2)",
+        params![SOURCE_STATE_VERIFIED_KEY, if verified { "1" } else { "0" }],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

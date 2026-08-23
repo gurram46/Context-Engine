@@ -53,6 +53,8 @@ pub(crate) enum RuntimeState {
 pub(crate) struct RuntimeData {
     project: Option<Arc<ProjectIndex>>,
     generation: u64,
+    source_state_hash: String,
+    source_state_verified: bool,
     semantic_fingerprint: ModelFingerprint,
     last_full_verified: Option<Instant>,
     discovery_total: u64,
@@ -80,6 +82,8 @@ pub struct RepositoryRuntime {
 pub(crate) struct RuntimeSnapshot {
     pub project: Arc<ProjectIndex>,
     pub generation: u64,
+    pub source_state_hash: String,
+    pub source_state_verified: bool,
     #[allow(dead_code)]
     pub last_full_verified: Option<Instant>,
 }
@@ -106,6 +110,8 @@ impl RepositoryRuntime {
             data: std::sync::Mutex::new(RuntimeData {
                 project: None,
                 generation: 0,
+                source_state_hash: blake3::hash(b"").to_hex().to_string(),
+                source_state_verified: true,
                 semantic_fingerprint: context_index::embed::configured_fingerprint(),
                 last_full_verified: None,
                 discovery_total: 0,
@@ -167,8 +173,16 @@ impl RepositoryRuntime {
         Some(RuntimeSnapshot {
             project,
             generation: guard.generation,
+            source_state_hash: guard.source_state_hash.clone(),
+            source_state_verified: guard.source_state_verified,
             last_full_verified: guard.last_full_verified,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn source_state(&self) -> (String, bool) {
+        let guard = self.data.lock().expect("runtime data mutex poisoned");
+        (guard.source_state_hash.clone(), guard.source_state_verified)
     }
 
     pub(crate) fn is_verification_expired(&self, now: Instant) -> bool {
@@ -194,10 +208,13 @@ impl RepositoryRuntime {
     /// must preserve the existing `last_full_verified` deadline, otherwise a
     /// stream of single-file edits would postpone periodic full verification
     /// indefinitely.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish(
         &self,
         project: Arc<ProjectIndex>,
         generation: u64,
+        source_state_hash: String,
+        source_state_verified: bool,
         fingerprint: ModelFingerprint,
         now: Instant,
         full_verification: bool,
@@ -207,6 +224,8 @@ impl RepositoryRuntime {
         let mut guard = self.data.lock().expect("runtime data mutex poisoned");
         guard.project = Some(project);
         guard.generation = generation;
+        guard.source_state_hash = source_state_hash;
+        guard.source_state_verified = source_state_verified;
         guard.semantic_fingerprint = fingerprint.clone();
         if full_verification {
             guard.last_full_verified = Some(now);
@@ -469,6 +488,8 @@ mod tests {
         rt.publish(
             Arc::new(idx),
             1,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
             ModelFingerprint {
                 model_id: "m".into(),
                 version: "v".into(),
@@ -493,6 +514,8 @@ mod tests {
         rt.publish(
             Arc::new(idx),
             1,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
             ModelFingerprint {
                 model_id: "m".into(),
                 version: "v".into(),
@@ -541,7 +564,15 @@ mod tests {
         // Publish G=1 and build hot for G=1
         let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
         let idx = context_index::ProjectIndex::discover(&root).unwrap();
-        rt.publish(Arc::new(idx.clone()), 1, fp.clone(), Instant::now(), true);
+        rt.publish(
+            Arc::new(idx.clone()),
+            1,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         rt.tracker.acknowledge(rt.tracker.snapshot().epoch);
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
@@ -550,7 +581,15 @@ mod tests {
         let hot_g1 = rt.get_or_load_hot(1, fp.clone()).await.expect("hot g1");
         assert_eq!(hot_g1.generation, 1);
         // Publish G=2 (clears hot)
-        rt.publish(Arc::new(idx), 2, fp.clone(), Instant::now(), true);
+        rt.publish(
+            Arc::new(idx),
+            2,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 2).unwrap();
@@ -596,7 +635,15 @@ mod tests {
         };
         let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
         let idx = context_index::ProjectIndex::discover(&root).unwrap();
-        rt.publish(Arc::new(idx), 5, fp.clone(), Instant::now(), true);
+        rt.publish(
+            Arc::new(idx),
+            5,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 5).unwrap();
@@ -636,7 +683,15 @@ mod tests {
         };
         let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
         let idx = context_index::ProjectIndex::discover(&root).unwrap();
-        rt.publish(Arc::new(idx.clone()), 1, fp.clone(), Instant::now(), true);
+        rt.publish(
+            Arc::new(idx.clone()),
+            1,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 1).unwrap();
@@ -657,7 +712,15 @@ mod tests {
         // Now loader is paused between recheck and atomic publication, holding build lock
         // Publish G+1 while loader is paused (publish does not need build lock, so it can proceed)
         let idx2 = context_index::ProjectIndex::discover(&root).unwrap();
-        rt.publish(Arc::new(idx2), 2, fp.clone(), Instant::now(), true);
+        rt.publish(
+            Arc::new(idx2),
+            2,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 2).unwrap();
@@ -705,7 +768,15 @@ mod tests {
         };
         let root1 = context_index::ProjectRoot::resolve(Some(tmp1.path())).unwrap();
         let idx1 = context_index::ProjectIndex::discover(&root1).unwrap();
-        rt1.publish(Arc::new(idx1), 10, fp.clone(), Instant::now(), true);
+        rt1.publish(
+            Arc::new(idx1),
+            10,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root1.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 10).unwrap();
@@ -716,7 +787,15 @@ mod tests {
         assert!(rt2.peek_hot(10, &fp).await.is_none());
         let root2 = context_index::ProjectRoot::resolve(Some(tmp2.path())).unwrap();
         let idx2 = context_index::ProjectIndex::discover(&root2).unwrap();
-        rt2.publish(Arc::new(idx2), 10, fp.clone(), Instant::now(), true);
+        rt2.publish(
+            Arc::new(idx2),
+            10,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root2.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 10).unwrap();
@@ -739,7 +818,15 @@ mod tests {
         };
         let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
         let idx = context_index::ProjectIndex::discover(&root).unwrap();
-        rt.publish(Arc::new(idx.clone()), 1, fp.clone(), Instant::now(), true);
+        rt.publish(
+            Arc::new(idx.clone()),
+            1,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 1).unwrap();
@@ -758,7 +845,15 @@ mod tests {
         start_notify.notified().await;
         // Now mutate to G+1 while loader is paused
         let idx2 = context_index::ProjectIndex::discover(&root).unwrap();
-        rt.publish(Arc::new(idx2), 2, fp.clone(), Instant::now(), true);
+        rt.publish(
+            Arc::new(idx2),
+            2,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 2).unwrap();
@@ -804,7 +899,15 @@ mod tests {
         };
         let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
         let idx = context_index::ProjectIndex::discover(&root).unwrap();
-        rt.publish(Arc::new(idx), 7, fp.clone(), Instant::now(), true);
+        rt.publish(
+            Arc::new(idx),
+            7,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 7).unwrap();
@@ -847,7 +950,15 @@ mod tests {
         };
         let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
         let idx = context_index::ProjectIndex::discover(&root).unwrap();
-        rt.publish(Arc::new(idx.clone()), 10, fp.clone(), Instant::now(), true);
+        rt.publish(
+            Arc::new(idx.clone()),
+            10,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 10).unwrap();
@@ -860,7 +971,15 @@ mod tests {
         let h10_handle = tokio::spawn(async move { rt_c.get_or_load_hot(10, fp_c).await });
         start.notified().await;
         let idx2 = context_index::ProjectIndex::discover(&root).unwrap();
-        rt.publish(Arc::new(idx2), 11, fp.clone(), Instant::now(), true);
+        rt.publish(
+            Arc::new(idx2),
+            11,
+            blake3::hash(b"test").to_hex().to_string(),
+            true,
+            fp.clone(),
+            Instant::now(),
+            true,
+        );
         {
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 11).unwrap();
@@ -912,7 +1031,15 @@ mod tests {
         for (rt, tmp) in [(rt1.clone(), &tmp1), (rt2.clone(), &tmp2)] {
             let root = context_index::ProjectRoot::resolve(Some(tmp.path())).unwrap();
             let idx = context_index::ProjectIndex::discover(&root).unwrap();
-            rt.publish(Arc::new(idx), 20, fp.clone(), Instant::now(), true);
+            rt.publish(
+                Arc::new(idx),
+                20,
+                blake3::hash(b"test").to_hex().to_string(),
+                true,
+                fp.clone(),
+                Instant::now(),
+                true,
+            );
             let conn = context_index::structural::store::open_db(root.path()).unwrap();
             context_index::structural::store::set_generation(&conn, 20).unwrap();
         }

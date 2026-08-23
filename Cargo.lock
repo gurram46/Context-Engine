@@ -334,6 +334,7 @@ name = "context-rank"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "context-core",
  "context-index",
  "regex",
@@ -369,6 +370,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

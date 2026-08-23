@@ -28,10 +28,33 @@ impl Default for PackOptions {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct PackedEvidence {
+    pub file: String,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+    pub symbol: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub provenance: Option<String>,
+    pub relation: Option<crate::types::EvidenceRelation>,
+    pub final_score: Option<f64>,
+    pub delivered_content_hash: String,
+    pub delivered_snippet: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PackedResult {
     pub markdown: String,
     pub token_estimate: usize,
     pub files: Vec<String>,
+    pub included_evidence: Vec<PackedEvidence>,
+}
+
+pub fn delivered_snippet(text: Option<&str>) -> String {
+    text.unwrap_or("").chars().take(120).collect()
+}
+
+pub fn delivered_hash(snippet: &str) -> String {
+    blake3::hash(snippet.as_bytes()).to_hex().to_string()
 }
 
 pub fn pack_evidence(
@@ -55,6 +78,7 @@ pub fn pack_evidence(
 
     let mut total_tokens = count_tokens(&lines.join("\n"));
     let mut files = Vec::new();
+    let mut included_evidence: Vec<PackedEvidence> = Vec::new();
 
     // Deterministic order: sort files by first evidence final_score
     let mut file_order: Vec<(String, Vec<Evidence>)> = by_file.into_iter().collect();
@@ -113,6 +137,27 @@ pub fn pack_evidence(
             ranges
         );
         let mut body_lines = vec![header];
+        // Precompute delivered hashes for this file's items (single source of truth)
+        let mut file_packed: Vec<PackedEvidence> = Vec::new();
+        for e in &items {
+            let snippet = delivered_snippet(e.text.as_deref());
+            let hash = delivered_hash(&snippet);
+            file_packed.push(PackedEvidence {
+                file: e.file.clone(),
+                start_line: e.start_line,
+                end_line: e.end_line,
+                symbol: e.symbol.clone(),
+                symbol_kind: e.symbol_kind.clone(),
+                provenance: e
+                    .provenance
+                    .clone()
+                    .or_else(|| Some(e.source.as_str().to_string())),
+                relation: e.relation,
+                final_score: e.final_score,
+                delivered_content_hash: hash,
+                delivered_snippet: snippet,
+            });
+        }
         for e in &items {
             let loc = if let Some(s) = e.start_line {
                 format!("{}:{}-{}", e.file, s, e.end_line.unwrap_or(s))
@@ -125,11 +170,12 @@ pub fn pack_evidence(
                 e.authority_score.unwrap_or(0),
                 e.final_score.unwrap_or(0.0)
             );
-            let text = e
-                .text
-                .as_deref()
-                .map(|t| format!(" — {}", t.chars().take(120).collect::<String>()))
-                .unwrap_or_default();
+            let snippet = delivered_snippet(e.text.as_deref());
+            let text = if snippet.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", snippet)
+            };
             body_lines.push(format!(
                 "- {} {} {} ({}){} [{}]",
                 loc,
@@ -151,6 +197,7 @@ pub fn pack_evidence(
         lines.push(chunk);
         total_tokens += chunk_tokens;
         files.push(file);
+        included_evidence.extend(file_packed);
     }
 
     let markdown = lines.join("\n");
@@ -158,6 +205,7 @@ pub fn pack_evidence(
         markdown,
         token_estimate: total_tokens,
         files,
+        included_evidence,
     }
 }
 

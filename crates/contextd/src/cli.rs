@@ -99,9 +99,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
         }
         Some(Command::Search { query }) => {
             let svc = ContextService::new(root).await?;
-            let res = svc.search(&query, search_opts).await?;
+            let wp = svc.search_external(&query, search_opts).await?;
+            let res = wp.result;
+            let proof = wp.proof;
             if is_json {
                 let stats_json = serde_json::to_value(&res.stats).unwrap_or(serde_json::json!({}));
+                let proof_json = serde_json::to_value(&proof).unwrap_or(serde_json::json!({}));
                 let mut out = serde_json::json!({
                     "query": res.query,
                     "type": res.query_type.as_str(),
@@ -116,7 +119,8 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         "finalScore": e.final_score,
                     })).collect::<Vec<_>>(),
                     "context": res.packed.markdown,
-                    "stats": stats_json
+                    "stats": stats_json,
+                    "proof": proof_json
                 });
                 // Debug observability only when --debug is set, not in normal JSON output
                 if cli.debug {

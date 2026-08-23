@@ -121,6 +121,7 @@ impl StructuralIndex {
         let mut stale_files: Vec<String> = Vec::new();
         let mut affected_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        let mut source_verified = true;
         // For affected detection we need old symbols per file
         let mut old_symbols_map: std::collections::HashMap<String, Vec<Symbol>> =
             std::collections::HashMap::new();
@@ -153,6 +154,7 @@ impl StructuralIndex {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(file=%rel, error=%e, "skip unreadable file, preserve last-good");
+                    source_verified = false;
                     if needs_extraction_upgrade && previously_indexed.contains(rel) {
                         extraction_upgrade_complete = false;
                         tracing::warn!(
@@ -166,6 +168,9 @@ impl StructuralIndex {
             };
             let actual_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
             let pf = parse_file(rel, &content, &actual_hash);
+            if pf.parse_error.is_some() && previously_indexed.contains(rel) {
+                source_verified = false;
+            }
             if needs_extraction_upgrade
                 && previously_indexed.contains(rel)
                 && pf.parse_error.is_some()
@@ -214,6 +219,7 @@ impl StructuralIndex {
                 }
                 Err(e) => {
                     tracing::warn!(file=%rel, error=%e, "upsert failed, preserve");
+                    source_verified = false;
                     if needs_extraction_upgrade && previously_indexed.contains(rel) {
                         extraction_upgrade_complete = false;
                         tracing::warn!(
@@ -264,15 +270,24 @@ impl StructuralIndex {
             }
         }
 
-        // Generation tracking for watcher status
+        // Generation tracking for watcher status + source_state_hash coherence
+        let mut gen = store::get_generation(&conn).unwrap_or(0);
+        let source_verified_initial = source_verified;
         if !changed_files.is_empty() || !stale_files.is_empty() {
-            // Bump generation: read current, increment
-            let gen = store::get_generation(&conn).unwrap_or(0) + 1;
-            let _ = store::set_generation(&conn, gen);
+            gen += 1;
             stats.structural_generation = gen;
         } else {
-            stats.structural_generation = store::get_generation(&conn).unwrap_or(0);
+            stats.structural_generation = gen;
         }
+        // Compute deterministic source_state_hash and persist coherently with generation
+        let source_hash = store::compute_source_state_hash(&conn)
+            .unwrap_or_else(|_| blake3::hash(b"").to_hex().to_string());
+        let _ = store::set_generation_and_state(
+            &mut conn,
+            stats.structural_generation,
+            &source_hash,
+            source_verified_initial,
+        );
 
         // Store extraction version after successful build — only if every old file was upgraded
         if needs_extraction_upgrade {
@@ -337,7 +352,9 @@ impl StructuralIndex {
                 stats.edges_deleted = del;
             }
             let gen = store::get_generation(&conn).unwrap_or(0) + 1;
-            let _ = store::set_generation(&conn, gen);
+            let hash = store::compute_source_state_hash(&conn)
+                .unwrap_or_else(|_| blake3::hash(b"").to_hex().to_string());
+            let _ = store::set_generation_and_state(&mut conn, gen, &hash, true);
             stats.structural_generation = gen;
             stats.elapsed_ms = t0.elapsed().as_millis();
             return Ok(stats);
@@ -353,7 +370,11 @@ impl StructuralIndex {
             return Ok(stats);
         }
         let old_syms = store::load_symbols_for_file(&conn, relative_path).unwrap_or_default();
+        let existed_before = store::get_file_hash(&conn, relative_path)
+            .unwrap_or(None)
+            .is_some();
         let pf = parse_file(relative_path, &content, &hash);
+        let verified = !(pf.parse_error.is_some() && existed_before);
         let new_names: std::collections::HashSet<String> = pf
             .symbols
             .iter()
@@ -380,7 +401,9 @@ impl StructuralIndex {
         stats.edges_inserted = ins;
         stats.references_reresolved = reresolved;
         let gen = store::get_generation(&conn).unwrap_or(0) + 1;
-        let _ = store::set_generation(&conn, gen);
+        let hash2 = store::compute_source_state_hash(&conn)
+            .unwrap_or_else(|_| blake3::hash(b"").to_hex().to_string());
+        let _ = store::set_generation_and_state(&mut conn, gen, &hash2, verified);
         stats.structural_generation = gen;
         stats.elapsed_ms = t0.elapsed().as_millis();
         Ok(stats)

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::proof as proof_store;
 use context_core::ContextError;
 use context_index::embed::Embedder;
 use context_index::structural::store as structural_store;
@@ -76,6 +77,8 @@ pub struct ReconcileStats {
 pub(crate) struct RuntimeAccess {
     pub project: Arc<ProjectIndex>,
     pub generation: u64,
+    pub source_state_hash: String,
+    pub source_state_verified: bool,
     pub reconcile_skipped: bool,
     pub discovery_calls: u32,
     pub reconcile_calls: u32,
@@ -92,6 +95,8 @@ struct FullReconcile {
     discovery_ms: u128,
     fingerprint: context_index::embed::ModelFingerprint,
     generation: u64,
+    source_state_hash: String,
+    source_state_verified: bool,
     epoch: u64,
 }
 
@@ -157,6 +162,24 @@ pub struct StatusReport {
     pub estimated_hot_memory_bytes: Option<usize>,
     #[serde(default)]
     pub repository_estimated_hot_memory_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProofMeta {
+    pub status: String,
+    pub id: Option<String>,
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: Option<i32>,
+    #[serde(rename = "sourceGeneration")]
+    pub source_generation: Option<u64>,
+    #[serde(rename = "sourceStateHash")]
+    pub source_state_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchWithProof {
+    pub result: crate::pipeline::ContextResult,
+    pub proof: ProofMeta,
 }
 
 /// Native service — single core for CLI and MCP.
@@ -355,6 +378,20 @@ impl ContextService {
             .ok()
             .and_then(|c| structural_store::get_generation(&c).ok())
             .unwrap_or(0);
+        let (source_state_hash, source_state_verified) = structural_store::open_db(root.path())
+            .ok()
+            .map(|c| {
+                let h = structural_store::get_source_state_hash(&c)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| blake3::hash(b"").to_hex().to_string());
+                let v = structural_store::get_source_state_verified(&c)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(true);
+                (h, v)
+            })
+            .unwrap_or((blake3::hash(b"").to_hex().to_string(), true));
         let elapsed = t0.elapsed().as_millis();
         let stats = ReconcileStats {
             discovered: idx.stats.discovered,
@@ -371,6 +408,8 @@ impl ContextService {
             discovery_ms,
             fingerprint,
             generation,
+            source_state_hash,
+            source_state_verified,
             epoch,
         })
     }
@@ -385,6 +424,8 @@ impl ContextService {
         self.runtime.publish(
             full.project.clone(),
             full.generation,
+            full.source_state_hash.clone(),
+            full.source_state_verified,
             full.fingerprint.clone(),
             Instant::now(),
             true,
@@ -456,6 +497,8 @@ impl ContextService {
         self.runtime.publish(
             full.project.clone(),
             full.generation,
+            full.source_state_hash.clone(),
+            full.source_state_verified,
             full.fingerprint.clone(),
             Instant::now(),
             true,
@@ -495,6 +538,8 @@ impl ContextService {
             return Ok(RuntimeAccess {
                 project: snapshot.project,
                 generation: snapshot.generation,
+                source_state_hash: snapshot.source_state_hash.clone(),
+                source_state_verified: snapshot.source_state_verified,
                 reconcile_skipped: true,
                 discovery_calls: 0,
                 reconcile_calls: 0,
@@ -518,14 +563,21 @@ impl ContextService {
                     let (stats, project) = self
                         .reconcile_dirty_paths_locked(override_embedder, &paths, access.epoch)
                         .await?;
-                    let generation = self
-                        .runtime
-                        .current_snapshot()
-                        .map(|s| s.generation)
-                        .unwrap_or(0);
+                    let snap = self.runtime.current_snapshot();
+                    let generation = snap.as_ref().map(|s| s.generation).unwrap_or(0);
+                    let source_state_hash = snap
+                        .as_ref()
+                        .map(|s| s.source_state_hash.clone())
+                        .unwrap_or_else(|| blake3::hash(b"").to_hex().to_string());
+                    let source_state_verified = snap
+                        .as_ref()
+                        .map(|s| s.source_state_verified)
+                        .unwrap_or(true);
                     return Ok(RuntimeAccess {
                         project,
                         generation,
+                        source_state_hash,
+                        source_state_verified,
                         reconcile_skipped: false,
                         discovery_calls: 0,
                         reconcile_calls: 1,
@@ -542,14 +594,21 @@ impl ContextService {
         // one full discovery/reconcile.
         let (stats, project, discovery_ms) =
             self.reconcile_and_publish_locked(override_embedder).await?;
-        let generation = self
-            .runtime
-            .current_snapshot()
-            .map(|s| s.generation)
-            .unwrap_or(0);
+        let snap = self.runtime.current_snapshot();
+        let generation = snap.as_ref().map(|s| s.generation).unwrap_or(0);
+        let source_state_hash = snap
+            .as_ref()
+            .map(|s| s.source_state_hash.clone())
+            .unwrap_or_else(|| blake3::hash(b"").to_hex().to_string());
+        let source_state_verified = snap
+            .as_ref()
+            .map(|s| s.source_state_verified)
+            .unwrap_or(true);
         Ok(RuntimeAccess {
             project,
             generation,
+            source_state_hash,
+            source_state_verified,
             reconcile_skipped: false,
             discovery_calls: 1,
             reconcile_calls: 1,
@@ -712,9 +771,16 @@ impl ContextService {
             .and_then(|c| structural_store::get_generation(&c).ok())
             .unwrap_or(0);
         if content_changed && !structural_changed {
-            if let Ok(conn) = structural_store::open_db(root.path()) {
+            if let Ok(mut conn) = structural_store::open_db(root.path()) {
                 let next = generation.saturating_add(1);
-                if structural_store::set_generation(&conn, next).is_ok() {
+                let hash = structural_store::compute_source_state_hash(&conn)
+                    .unwrap_or_else(|_| blake3::hash(b"").to_hex().to_string());
+                let verified = structural_store::get_source_state_verified(&conn)
+                    .unwrap_or(Some(true))
+                    .unwrap_or(true);
+                if structural_store::set_generation_and_state(&mut conn, next, &hash, verified)
+                    .is_ok()
+                {
                     generation = next;
                 }
             }
@@ -731,9 +797,25 @@ impl ContextService {
             embedding_calls,
         };
         let project_arc = Arc::new(delta.project);
+        let (source_state_hash, source_state_verified) = structural_store::open_db(root.path())
+            .ok()
+            .map(|c| {
+                let h = structural_store::get_source_state_hash(&c)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| blake3::hash(b"").to_hex().to_string());
+                let v = structural_store::get_source_state_verified(&c)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(true);
+                (h, v)
+            })
+            .unwrap_or((blake3::hash(b"").to_hex().to_string(), true));
         self.runtime.publish(
             project_arc.clone(),
             generation,
+            source_state_hash,
+            source_state_verified,
             fingerprint,
             Instant::now(),
             false,
@@ -776,6 +858,234 @@ impl ContextService {
         opts: SearchOptions,
     ) -> Result<ContextResult, ContextError> {
         self.search_with_override(query, opts, None).await
+    }
+
+    pub async fn search_external(
+        &self,
+        query: &str,
+        opts: SearchOptions,
+    ) -> Result<SearchWithProof, ContextError> {
+        // External context_search with proof creation (strict snapshot)
+        let t_search = std::time::Instant::now();
+        let t_access = std::time::Instant::now();
+        let access = self
+            .access_runtime(None)
+            .await
+            .map_err(|e| ContextError::Internal(format!("reconcile failed: {e}")))?;
+        let runtime_access_ms = t_access.elapsed().as_millis();
+        let mut _pin_vectors: Option<crate::resource::PinGuard> = None;
+        let mut _pin_bm25: Option<crate::resource::PinGuard> = None;
+        let hot = {
+            let fp = self.runtime.semantic_fingerprint();
+            let semantic_disabled = std::env::var("CONTEXTD_SEMANTIC_ENABLED")
+                .map(|v| v == "0" || v.to_lowercase() == "false")
+                .unwrap_or(false);
+            let mut need_vectors = if semantic_disabled {
+                false
+            } else {
+                let qt = context_rank::classify_query(query).query_type;
+                matches!(
+                    qt,
+                    context_rank::types::QueryType::Conceptual
+                        | context_rank::types::QueryType::Mixed
+                )
+            };
+            if need_vectors {
+                if let Some(rm) = self.resource_manager.clone() {
+                    let est = {
+                        let root = self.root.clone();
+                        let fp_clone = fp.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let conn = context_index::structural::store::open_db(&root).ok();
+                            conn.and_then(|c| {
+                                context_index::vector::count_vectors(&c, &fp_clone)
+                                    .ok()
+                                    .map(|cnt| (cnt as usize) * fp_clone.dimension * 4)
+                            })
+                            .unwrap_or(0)
+                        })
+                        .await
+                        .unwrap_or(0)
+                    };
+                    if est > 0 && est > rm.budget_bytes() {
+                        need_vectors = false;
+                    } else if est > 0 {
+                        let ok = rm.ensure_budget(est, |_r, _k| {}).await;
+                        if !ok {
+                            need_vectors = false;
+                        }
+                    }
+                }
+            }
+            let hot_opt = self
+                .runtime
+                .get_or_load_hot_with_vectors(access.generation, fp.clone(), need_vectors)
+                .await;
+            if let Some(hot_ref) = hot_opt.clone() {
+                if let Some(rm) = self.resource_manager.clone() {
+                    let vec_bytes = hot_ref
+                        .vectors
+                        .as_ref()
+                        .map(|v| v.estimated_bytes())
+                        .unwrap_or(0);
+                    if vec_bytes > 0 {
+                        rm.register(&self.root, ComponentKind::Vectors, vec_bytes)
+                            .await;
+                    }
+                    if hot_ref.bm25.doc_count() > 0 {
+                        let bm25_est = hot_ref.bm25.doc_count() * 256;
+                        rm.register(&self.root, ComponentKind::Bm25, bm25_est).await;
+                    }
+                    if hot_ref.vectors.is_some() {
+                        _pin_vectors = Some(
+                            crate::resource::PinGuard::new(
+                                rm.clone(),
+                                self.root.clone(),
+                                ComponentKind::Vectors,
+                            )
+                            .await,
+                        );
+                    }
+                    _pin_bm25 = Some(
+                        crate::resource::PinGuard::new(rm, self.root.clone(), ComponentKind::Bm25)
+                            .await,
+                    );
+                }
+            }
+            hot_opt
+        };
+        let providers = Providers {};
+        let mut res = retrieve_context(
+            query,
+            &access.project,
+            &providers,
+            opts.budget_tokens,
+            opts.max_results,
+            hot,
+        )
+        .await
+        .map_err(|e| ContextError::Internal(e.to_string()))?;
+        let total_ms = t_search.elapsed().as_millis();
+        res.stats.total_ms = Some(total_ms);
+        res.stats.total_internal_ms = Some(res.stats.elapsed_ms);
+        res.stats.wall_ms = Some(total_ms);
+        res.stats.runtime_access_ms = Some(runtime_access_ms);
+        res.stats.discovery_ms = Some(access.discovery_ms);
+        res.stats.reconcile_ms = Some(access.reconcile_ms);
+        res.stats.generation = Some(access.generation);
+        res.stats.dirty_file_count = access.dirty_file_count;
+        res.stats.reconcile_skipped = Some(access.reconcile_skipped);
+        res.stats.discovery_calls = Some(access.discovery_calls);
+        res.stats.reconcile_calls = Some(access.reconcile_calls);
+        res.stats.runtime_state = Some(access.runtime_state.to_string());
+        res.stats.result_cache_hit = None;
+        if res.stats.authority_ms.is_none() {
+            res.stats.authority_ms = Some(res.stats.rank_ms);
+        }
+        // Build proof after successful retrieval (short transaction only)
+        let proof = self.build_proof(query, &access, &res).await;
+        Ok(SearchWithProof { result: res, proof })
+    }
+
+    async fn build_proof(
+        &self,
+        query: &str,
+        access: &RuntimeAccess,
+        res: &ContextResult,
+    ) -> ProofMeta {
+        let canon = Self::canon(&self.root);
+        let canon_str = canon.display().to_string();
+        let repo_id = context_index::project_root::repo_instance_id(&canon);
+        let git = proof_store::git_snapshot(&canon);
+        let query_type_str = res.query_type.as_str().to_string();
+        let packed_token = res.packed.token_estimate;
+        // Build proof record
+        let proof_rec = proof_store::build_proof_record(
+            &canon,
+            &canon_str,
+            &repo_id,
+            access.generation,
+            &access.source_state_hash,
+            access.source_state_verified,
+            git.clone(),
+            query,
+            &query_type_str,
+            packed_token,
+        );
+        let proof_id_clone = proof_rec.id.clone();
+        // Build evidence from included_evidence (exact delivered)
+        let mut evidences: Vec<proof_store::ProofEvidence> = Vec::new();
+        for (idx, pe) in res.packed.included_evidence.iter().enumerate() {
+            evidences.push(proof_store::ProofEvidence {
+                proof_id: proof_id_clone.clone(),
+                ordinal: idx,
+                relative_path: pe.file.clone(),
+                start_line: pe.start_line,
+                end_line: pe.end_line,
+                start_byte: None,
+                end_byte: None,
+                delivered_content_hash: pe.delivered_content_hash.clone(),
+                chunk_id: None,
+                chunk_content_hash: None,
+                representation_hash: None,
+                symbol_id: None,
+                symbol_name: pe.symbol.clone(),
+                qualified_name: None,
+                symbol_kind: pe.symbol_kind.clone(),
+                provenance: pe.provenance.clone(),
+                relation: pe.relation.map(|r| r.as_str().to_string()),
+                final_score: pe.final_score,
+            });
+        }
+        // Try to persist with short transaction
+        let proof_root = canon.clone();
+        let insert_res = tokio::task::spawn_blocking(move || {
+            let mut conn = match proof_store::open_proof_db(&proof_root) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error=%e, "open proof db failed");
+                    return Err(e);
+                }
+            };
+            proof_store::insert_proof(&mut conn, &proof_rec, &evidences)
+        })
+        .await;
+        match insert_res {
+            Ok(Ok(_)) => {
+                let status = if access.source_state_verified {
+                    "current"
+                } else {
+                    "unverifiable"
+                };
+                ProofMeta {
+                    status: status.to_string(),
+                    id: Some(proof_id_clone),
+                    schema_version: Some(proof_store::PROOF_SCHEMA_VERSION),
+                    source_generation: Some(access.generation),
+                    source_state_hash: Some(access.source_state_hash.clone()),
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error=%e, "proof insert failed");
+                ProofMeta {
+                    status: "unavailable".to_string(),
+                    id: None,
+                    schema_version: None,
+                    source_generation: None,
+                    source_state_hash: None,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error=%e, "proof task join failed");
+                ProofMeta {
+                    status: "unavailable".to_string(),
+                    id: None,
+                    schema_version: None,
+                    source_generation: None,
+                    source_state_hash: None,
+                }
+            }
+        }
     }
 
     async fn search_with_override(

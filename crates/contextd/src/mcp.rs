@@ -238,39 +238,47 @@ impl McpAdapter {
         if params.query.trim().is_empty() {
             return Err(McpError::invalid_params("query is required", None));
         }
-        let res = match &self.service {
-            ServiceKind::Local(svc) => svc
-                .search(
-                    &params.query,
-                    Self::opts(params.budgetTokens, params.maxResults),
-                )
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
-            ServiceKind::Remote(client) => client
-                .search(
-                    &params.query,
-                    Self::opts(params.budgetTokens, params.maxResults),
-                )
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        let out = match &self.service {
+            ServiceKind::Local(svc) => {
+                let wp = svc
+                    .search_external(
+                        &params.query,
+                        Self::opts(params.budgetTokens, params.maxResults),
+                    )
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let stats_json =
+                    serde_json::to_value(&wp.result.stats).unwrap_or(serde_json::json!({}));
+                let proof_json = serde_json::to_value(&wp.proof).unwrap_or(serde_json::json!({}));
+                serde_json::json!({
+                    "query": wp.result.query,
+                    "type": wp.result.query_type.as_str(),
+                    "context": wp.result.packed.markdown,
+                    "evidence": wp.result.evidence.iter().map(|e| serde_json::json!({
+                        "file": e.file,
+                        "lines": e.start_line.map(|s| format!("{}-{}", s, e.end_line.unwrap_or(s))).unwrap_or_default(),
+                        "symbol": e.symbol,
+                        "relation": e.relation.map(|r| r.as_str()),
+                        "source": e.source.as_str(),
+                        "score": e.score,
+                        "authorityScore": e.authority_score,
+                        "finalScore": e.final_score,
+                    })).collect::<Vec<_>>(),
+                    "stats": stats_json,
+                    "proof": proof_json
+                })
+            }
+            ServiceKind::Remote(client) => {
+                // Use raw call to preserve proof field from daemon
+                let params_json = serde_json::json!({"query": params.query, "budgetTokens": params.budgetTokens, "maxResults": params.maxResults});
+                let v = client
+                    .call("context_search", params_json)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                // v is already result object containing query/type/context/evidence/stats/proof
+                v
+            }
         };
-        let stats_json = serde_json::to_value(&res.stats).unwrap_or(serde_json::json!({}));
-        let out = serde_json::json!({
-            "query": res.query,
-            "type": res.query_type.as_str(),
-            "context": res.packed.markdown,
-            "evidence": res.evidence.iter().map(|e| serde_json::json!({
-                "file": e.file,
-                "lines": e.start_line.map(|s| format!("{}-{}", s, e.end_line.unwrap_or(s))).unwrap_or_default(),
-                "symbol": e.symbol,
-                "relation": e.relation.map(|r| r.as_str()),
-                "source": e.source.as_str(),
-                "score": e.score,
-                "authorityScore": e.authority_score,
-                "finalScore": e.final_score,
-            })).collect::<Vec<_>>(),
-            "stats": stats_json
-        });
         Ok(CallToolResult::success(vec![
             rmcp::model::ContentBlock::text(
                 serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()),
