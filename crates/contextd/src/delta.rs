@@ -7,6 +7,10 @@ use crate::proof::{self, ProofEvidence};
 use context_index::structural::store as structural_store;
 use context_rank::packer::{delivered_hash, delivered_snippet};
 
+// ============================================================================
+// DeltaStatus / EvidenceClassification
+// ============================================================================
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum DeltaStatus {
     Ready,
@@ -85,142 +89,184 @@ pub struct ContextDelta {
     pub reason: String,
 }
 
-fn current_file_exists_and_hash(root: &Path, rel: &str) -> Option<String> {
-    let conn = structural_store::open_db(root).ok()?;
-    structural_store::get_file_hash(&conn, rel).ok().flatten()
+// ============================================================================
+// Reconstruction contracts — inspected P1 pathways (pipeline.rs)
+// ============================================================================
+//
+// P1 Evidence.text derivation per provenance (pipeline.rs):
+// - rust:exact        : exact_search line text (single line, rg match, chars.take(400)) -> DIRECT
+// - rust:symbol       : load_symbol_snippet(start_byte..end_byte) (symbol definition slice, up to 400 chars, may be multi-line) -> SYMBOL
+// - rust:symbol:prefix: same as rust:symbol (prefix search) -> SYMBOL
+// - rust:graph:*      : caller/callee symbol snippet or fallback file line (depends on symbol resolution) -> UNSAFE (insufficient persisted identity)
+// - rust:test*, rust:test:file, rust:test:inline : symbol snippet or file snippet (test file heuristics) -> UNSAFE
+// - hot:bm25 / rust:bm25 : load_chunk_snippet(chunk slice) -> UNSAFE (no chunk_id persisted in proof, cannot uniquely identify chunk)
+// - hot:semantic / rust:semantic / fused bm25+semantic : vector chunk snippet -> UNSAFE
+// - synthetic/fixture/test packer provenance like "test" -> UNSAFE
+//
+// Deterministic reconstruction requires:
+// - For DIRECT: relative_path + start_line identify the line; snippet = delivered_snippet(line). Reproducible via reading same file's line.
+// - For SYMBOL: relative_path + symbol_name identify symbol definition in same file; snippet = delivered_snippet(definition slice). Reproducible via structural symbols in same file.
+// - All other provenances lack stable identity in proof (no chunk_id/symbol_id persisted) → UNVERIFIABLE.
+//
+// Spec requires preferring UNVERIFIABLE over guessed matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReconstructionContract {
+    Direct,
+    Symbol,
+    Unsafe,
 }
 
-fn reconstruct_current_snippet(root: &Path, evidence: &ProofEvidence) -> Option<String> {
-    // Try symbol first if available and provenance suggests symbol
-    if let Some(sym) = &evidence.symbol_name {
-        // Try to find symbol definition
-        if let Ok(conn) = structural_store::open_db(root) {
-            if let Ok(defs) = structural_store::find_definitions(&conn, sym) {
-                // Find best matching file (prefer old path)
-                for def in &defs {
-                    if def.file == evidence.relative_path {
-                        // Load symbol snippet
-                        let p = root.join(&def.file);
-                        if let Ok(content) = std::fs::read_to_string(&p) {
-                            let start = def.start_byte.min(content.len());
-                            let end = def.end_byte.min(content.len());
-                            if end > start {
-                                if let Some(slice) = content.get(start..end) {
-                                    let snippet = delivered_snippet(Some(slice));
-                                    if !snippet.is_empty() {
-                                        return Some(snippet);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Fallback to any definition of that symbol
-                if let Some(def) = defs.into_iter().next() {
-                    let p = root.join(&def.file);
-                    if let Ok(content) = std::fs::read_to_string(&p) {
-                        let start = def.start_byte.min(content.len());
-                        let end = def.end_byte.min(content.len());
-                        if end > start {
-                            if let Some(slice) = content.get(start..end) {
-                                let snippet = delivered_snippet(Some(slice));
-                                if !snippet.is_empty() {
-                                    return Some(snippet);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+fn contract_for(ev: &ProofEvidence) -> ReconstructionContract {
+    match ev.provenance.as_deref() {
+        Some("rust:exact") => ReconstructionContract::Direct,
+        Some("rust:symbol") | Some("rust:symbol:prefix") => ReconstructionContract::Symbol,
+        // All other provenances including graph, test, bm25, semantic, hot:*, fused, and None are unsafe for P2 v1
+        _ => ReconstructionContract::Unsafe,
     }
-    // Try file line based
-    let path = root.join(&evidence.relative_path);
-    if let Some(line) = evidence.start_line {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            let lines: Vec<&str> = content.lines().collect();
-            let idx = (line as usize).saturating_sub(1);
-            if idx < lines.len() {
-                // For start_line, take that line's content as snippet basis? But original Evidence.text for non-symbol is line content or chunk
-                // Use the line's content
-                let snippet = delivered_snippet(Some(lines[idx]));
-                if !snippet.is_empty() {
-                    return Some(snippet);
-                }
-            }
-            // Fallback to whole file first 120 chars?
-            let snippet = delivered_snippet(Some(&content));
-            if !snippet.is_empty() {
-                return Some(snippet);
-            }
-        }
-    } else {
-        // No line, try reading file
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            let snippet = delivered_snippet(Some(&content));
-            if !snippet.is_empty() {
-                return Some(snippet);
-            }
-        }
-    }
-    None
 }
 
-fn find_snippet_in_file(root: &Path, rel: &str, target_hash: &str) -> Option<(u32, String)> {
+// ============================================================================
+// Helpers — same-file exact match with cardinality
+// ============================================================================
+
+/// Result of same-file search for historical hash among valid P1 candidates for a contract.
+enum ExactMatchCardinality {
+    NoMatch,
+    Unique { start_line: u32, snippet: String },
+    Ambiguous { count: usize },
+}
+
+fn find_direct_matches(root: &Path, rel: &str, target_hash: &str) -> ExactMatchCardinality {
     let path = root.join(rel);
-    let content = std::fs::read_to_string(&path).ok()?;
-    // Try per-line matching: each line's snippet hash
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return ExactMatchCardinality::NoMatch,
+    };
+    let mut matches: Vec<(u32, String)> = Vec::new();
     for (idx, line) in content.lines().enumerate() {
         let snippet = delivered_snippet(Some(line));
+        if snippet.is_empty() {
+            continue;
+        }
         let h = delivered_hash(&snippet);
         if h == target_hash {
-            return Some(((idx as u32) + 1, snippet));
-        }
-    }
-    // Try per-chunk via structural chunks
-    if let Ok(conn) = structural_store::open_db(root) {
-        if let Ok(chunks) = load_chunks_for_file(&conn, rel) {
-            for ch in chunks {
-                let p = root.join(&ch.file);
-                if let Ok(file_content) = std::fs::read_to_string(&p) {
-                    let start = ch.start_byte.min(file_content.len());
-                    let end = ch.end_byte.min(file_content.len());
-                    if end > start {
-                        if let Some(slice) = file_content.get(start..end) {
-                            let snippet = delivered_snippet(Some(slice));
-                            let h = delivered_hash(&snippet);
-                            if h == target_hash {
-                                return Some((ch.start_line, snippet));
-                            }
-                        }
-                    }
-                }
+            matches.push(((idx as u32) + 1, snippet));
+            if matches.len() > 1 {
+                return ExactMatchCardinality::Ambiguous {
+                    count: matches.len(),
+                };
             }
         }
     }
-    None
+    match matches.len() {
+        0 => ExactMatchCardinality::NoMatch,
+        1 => {
+            let (line, snippet) = matches.into_iter().next().unwrap();
+            ExactMatchCardinality::Unique {
+                start_line: line,
+                snippet,
+            }
+        }
+        _ => ExactMatchCardinality::Ambiguous {
+            count: matches.len(),
+        },
+    }
 }
 
-fn load_chunks_for_file(
+fn find_symbol_matches(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    rel: &str,
+    symbol_name: &Option<String>,
+    target_hash: &str,
+) -> ExactMatchCardinality {
+    let Some(name) = symbol_name else {
+        return ExactMatchCardinality::NoMatch;
+    };
+    // Only symbols in same file with same name/qualified_name
+    let symbols = match query_symbols_in_file(conn, rel, name) {
+        Ok(v) => v,
+        Err(_) => return ExactMatchCardinality::NoMatch,
+    };
+    if symbols.is_empty() {
+        return ExactMatchCardinality::NoMatch;
+    }
+    // Load file once
+    let path = root.join(rel);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return ExactMatchCardinality::NoMatch,
+    };
+    let bytes = content.as_bytes();
+    let mut matches: Vec<(u32, String)> = Vec::new();
+    for sym in &symbols {
+        let start = sym.start_byte.min(bytes.len());
+        let end = sym.end_byte.min(bytes.len());
+        if end <= start {
+            continue;
+        }
+        let slice = match std::str::from_utf8(&bytes[start..end]) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // P1 used load_symbol_snippet: slice chars take 400 trimmed; we replicate delivered_snippet which takes 120 chars of that slice
+        // For correctness we use delivered_snippet on the slice truncated to 400 chars as P1 does, but slice may be shorter than 400 already.
+        let truncated: String = slice
+            .chars()
+            .take(400)
+            .collect::<String>()
+            .trim()
+            .to_string();
+        let snippet = delivered_snippet(Some(&truncated));
+        if snippet.is_empty() {
+            continue;
+        }
+        let h = delivered_hash(&snippet);
+        if h == target_hash {
+            matches.push((sym.start_line, snippet));
+            if matches.len() > 1 {
+                return ExactMatchCardinality::Ambiguous {
+                    count: matches.len(),
+                };
+            }
+        }
+    }
+    match matches.len() {
+        0 => ExactMatchCardinality::NoMatch,
+        1 => {
+            let (line, snippet) = matches.into_iter().next().unwrap();
+            ExactMatchCardinality::Unique {
+                start_line: line,
+                snippet,
+            }
+        }
+        _ => ExactMatchCardinality::Ambiguous {
+            count: matches.len(),
+        },
+    }
+}
+
+struct SymbolInfo {
+    start_line: u32,
+    end_line: u32,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+fn query_symbols_in_file(
     conn: &rusqlite::Connection,
     file: &str,
-) -> Result<Vec<context_index::structural::types::Chunk>> {
-    let mut stmt = conn.prepare("SELECT id, file, language, start_line, end_line, start_byte, end_byte, parent_symbol, content_hash, text_size_bytes FROM chunks WHERE file=?1")?;
-    let rows = stmt.query_map(rusqlite::params![file], |row| {
-        Ok(context_index::structural::types::Chunk {
-            id: row.get(0)?,
-            file: row.get(1)?,
-            language: {
-                let s: String = row.get(2)?;
-                context_index::structural::language::Language::from_str(&s)
-            },
-            start_line: row.get(3)?,
-            end_line: row.get(4)?,
-            start_byte: row.get::<_, i64>(5)? as usize,
-            end_byte: row.get::<_, i64>(6)? as usize,
-            parent_symbol: row.get(7)?,
-            content_hash: row.get(8)?,
-            text_size_bytes: row.get::<_, i64>(9)? as usize,
+    name: &str,
+) -> Result<Vec<SymbolInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT start_line, end_line, start_byte, end_byte FROM symbols WHERE file=?1 AND (name=?2 OR qualified_name=?2)",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![file, name], |row| {
+        Ok(SymbolInfo {
+            start_line: row.get(0)?,
+            end_line: row.get(1)?,
+            start_byte: row.get::<_, i64>(2)? as usize,
+            end_byte: row.get::<_, i64>(3)? as usize,
         })
     })?;
     let mut out = Vec::new();
@@ -230,20 +276,60 @@ fn load_chunks_for_file(
     Ok(out)
 }
 
-fn is_synthetic(ev: &ProofEvidence) -> bool {
-    // Synthetic if provenance suggests graph/test and no reliable file/line
-    if let Some(prov) = &ev.provenance {
-        if prov.contains("graph") || prov.contains("test") {
-            // But graph evidence still has file/line, we consider it reconstructible via symbol
-            // For P2 v1, we treat synthetic as unverifiable if no file exists or symbol missing
-            // For now, only mark as synthetic if file has no valid path
-            if ev.relative_path.is_empty() {
-                return true;
-            }
-        }
+fn current_symbol_hash_and_line(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    rel: &str,
+    symbol_name: &str,
+) -> Option<(u32, String, String)> {
+    // Returns unique definition's line and hash/snippet if exactly one definition in same file
+    let symbols = query_symbols_in_file(conn, rel, symbol_name).ok()?;
+    if symbols.len() != 1 {
+        return None;
     }
-    false
+    let sym = &symbols[0];
+    let path = root.join(rel);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let bytes = content.as_bytes();
+    let start = sym.start_byte.min(bytes.len());
+    let end = sym.end_byte.min(bytes.len());
+    if end <= start {
+        return None;
+    }
+    let slice = std::str::from_utf8(&bytes[start..end]).ok()?;
+    let truncated: String = slice
+        .chars()
+        .take(400)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let snippet = delivered_snippet(Some(&truncated));
+    if snippet.is_empty() {
+        return None;
+    }
+    let h = delivered_hash(&snippet);
+    Some((sym.start_line, snippet, h))
 }
+
+fn current_line_hash(root: &Path, rel: &str, line_no: u32) -> Option<(String, String)> {
+    let path = root.join(rel);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let idx = (line_no as usize).saturating_sub(1);
+    if idx >= lines.len() {
+        return None;
+    }
+    let snippet = delivered_snippet(Some(lines[idx]));
+    if snippet.is_empty() {
+        return None;
+    }
+    let h = delivered_hash(&snippet);
+    Some((snippet, h))
+}
+
+// ============================================================================
+// Main delta
+// ============================================================================
 
 pub fn delta_for_proof(root: &Path, proof_id: &str) -> Result<ContextDelta> {
     // Load proof
@@ -434,7 +520,6 @@ pub fn delta_for_proof(root: &Path, proof_id: &str) -> Result<ContextDelta> {
     }
     // Fast path same snapshot
     if proof.source_state_hash == current_state.hash {
-        // No need to inspect evidence
         let evidences = proof::load_evidence(&proof_conn, proof_id)?;
         let mut delta_evidences = Vec::new();
         for ev in &evidences {
@@ -474,17 +559,62 @@ pub fn delta_for_proof(root: &Path, proof_id: &str) -> Result<ContextDelta> {
             reason: "same snapshot".into(),
         });
     }
-    // Changed snapshot path - evidence-level comparison
+    // Changed snapshot path - evidence-level comparison (deterministic, no cross-file scan)
     let evidences = proof::load_evidence(&proof_conn, proof_id)?;
+    // Open structural DB once
+    let structural_conn = match structural_store::open_db(root) {
+        Ok(c) => c,
+        Err(e) => {
+            // If structural DB unavailable, all evidence becomes unverifiable
+            let mut delta_evidences = Vec::new();
+            for ev in evidences.iter() {
+                delta_evidences.push(DeltaEvidence {
+                    ordinal: ev.ordinal,
+                    old_path: ev.relative_path.clone(),
+                    current_path: Some(ev.relative_path.clone()),
+                    old_start_line: ev.start_line,
+                    current_start_line: None,
+                    old_content_hash: ev.delivered_content_hash.clone(),
+                    current_content_hash: None,
+                    classification: EvidenceClassification::Unverifiable,
+                    symbol: ev.symbol_name.clone(),
+                    reason: format!("structural DB unavailable: {}", e),
+                    location_changed: false,
+                });
+            }
+            let summary = DeltaSummary {
+                unchanged: 0,
+                changed: 0,
+                removed: 0,
+                moved: 0,
+                unverifiable: delta_evidences.len(),
+            };
+            return Ok(ContextDelta {
+                proof_id: proof.id.clone(),
+                repo_instance_id: proof.repo_instance_id.clone(),
+                from_source_state_hash: proof.source_state_hash.clone(),
+                to_source_state_hash: Some(current_state.hash.clone()),
+                from_generation: proof.source_generation,
+                to_generation: Some(current_state.generation),
+                status: DeltaStatus::Ready,
+                summary,
+                evidence: delta_evidences,
+                query: proof.query.clone(),
+                packed_context_hash: proof.packed_context_hash.clone(),
+                reason: "changed snapshot".into(),
+            });
+        }
+    };
     let mut delta_evidences = Vec::new();
     let mut unchanged = 0;
     let mut changed = 0;
     let mut removed = 0;
-    let mut moved_cnt = 0;
+    let moved_cnt: usize = 0;
     let mut unverifiable = 0;
     for ev in evidences {
-        // Synthetic check
-        if is_synthetic(&ev) {
+        let contract = contract_for(&ev);
+        // Handle synthetic / empty path quickly: mark unverifiable deterministically
+        if ev.relative_path.is_empty() {
             delta_evidences.push(DeltaEvidence {
                 ordinal: ev.ordinal,
                 old_path: ev.relative_path.clone(),
@@ -495,75 +625,20 @@ pub fn delta_for_proof(root: &Path, proof_id: &str) -> Result<ContextDelta> {
                 current_content_hash: None,
                 classification: EvidenceClassification::Unverifiable,
                 symbol: ev.symbol_name.clone(),
-                reason: "synthetic evidence cannot be reconstructed".into(),
+                reason:
+                    "historical evidence representation cannot be reconstructed deterministically"
+                        .into(),
                 location_changed: false,
             });
             unverifiable += 1;
             continue;
         }
-        // File existence check via indexed state
-        let current_hash_opt = current_file_exists_and_hash(root, &ev.relative_path);
+        // File existence check via indexed state (single connection, no per-evidence open)
+        let current_hash_opt = structural_store::get_file_hash(&structural_conn, &ev.relative_path)
+            .ok()
+            .flatten();
         if current_hash_opt.is_none() {
-            // File no longer exists in index - try moved detection (cross-file unique)
-            // For P2 v1, defer cross-file moved to P2.1, so treat as REMOVED
-            // But we attempt bounded cross-file search for unique exact delivered hash
-            // Search all indexed files for matching delivered hash (expensive but bounded to 10 evidence)
-            let mut found = None;
-            let mut ambiguity = 0;
-            // Try to find unique file with same delivered hash via scanning indexed files
-            // List files via structural store
-            if let Ok(conn) = structural_store::open_db(root) {
-                if let Ok(files) = structural_store::list_files(&conn) {
-                    for (path, _hash) in files {
-                        if let Some((line, _snippet)) =
-                            find_snippet_in_file(root, &path, &ev.delivered_content_hash)
-                        {
-                            if found.is_none() {
-                                found = Some((path.clone(), line));
-                            } else {
-                                ambiguity += 1;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some((new_path, new_line)) = found {
-                if ambiguity == 0 {
-                    // Unique moved
-                    delta_evidences.push(DeltaEvidence {
-                        ordinal: ev.ordinal,
-                        old_path: ev.relative_path.clone(),
-                        current_path: Some(new_path.clone()),
-                        old_start_line: ev.start_line,
-                        current_start_line: Some(new_line),
-                        old_content_hash: ev.delivered_content_hash.clone(),
-                        current_content_hash: Some(ev.delivered_content_hash.clone()),
-                        classification: EvidenceClassification::Moved,
-                        symbol: ev.symbol_name.clone(),
-                        reason: "unique cross-file exact match".into(),
-                        location_changed: true,
-                    });
-                    moved_cnt += 1;
-                    continue;
-                } else {
-                    delta_evidences.push(DeltaEvidence {
-                        ordinal: ev.ordinal,
-                        old_path: ev.relative_path.clone(),
-                        current_path: None,
-                        old_start_line: ev.start_line,
-                        current_start_line: None,
-                        old_content_hash: ev.delivered_content_hash.clone(),
-                        current_content_hash: None,
-                        classification: EvidenceClassification::Unverifiable,
-                        symbol: ev.symbol_name.clone(),
-                        reason: "ambiguous multiple matches for moved".into(),
-                        location_changed: false,
-                    });
-                    unverifiable += 1;
-                    continue;
-                }
-            }
+            // Historical indexed file no longer exists -> REMOVED (P2 v1: no cross-file MOVED scan)
             delta_evidences.push(DeltaEvidence {
                 ordinal: ev.ordinal,
                 old_path: ev.relative_path.clone(),
@@ -580,29 +655,53 @@ pub fn delta_for_proof(root: &Path, proof_id: &str) -> Result<ContextDelta> {
             removed += 1;
             continue;
         }
-        // File exists - try same location reconstruction
-        if let Some(current_snippet) = reconstruct_current_snippet(root, &ev) {
-            let current_hash = delivered_hash(&current_snippet);
-            if current_hash == ev.delivered_content_hash {
-                // Check if location shifted within same file via find
-                let mut location_changed = false;
-                let mut current_line = ev.start_line;
-                if ev.start_line.is_some() {
-                    if let Some((found_line, _)) =
-                        find_snippet_in_file(root, &ev.relative_path, &ev.delivered_content_hash)
-                    {
-                        if Some(found_line) != ev.start_line {
-                            location_changed = true;
-                            current_line = Some(found_line);
-                        }
-                    }
-                }
+        // Contract check — unsafe provenances are always unverifiable
+        if contract == ReconstructionContract::Unsafe {
+            delta_evidences.push(DeltaEvidence {
+                ordinal: ev.ordinal,
+                old_path: ev.relative_path.clone(),
+                current_path: Some(ev.relative_path.clone()),
+                old_start_line: ev.start_line,
+                current_start_line: None,
+                old_content_hash: ev.delivered_content_hash.clone(),
+                current_content_hash: None,
+                classification: EvidenceClassification::Unverifiable,
+                symbol: ev.symbol_name.clone(),
+                reason:
+                    "historical evidence representation cannot be reconstructed deterministically"
+                        .into(),
+                location_changed: false,
+            });
+            unverifiable += 1;
+            continue;
+        }
+        // Deterministic contracts: same-file exact match with cardinality
+        let cardinality = match contract {
+            ReconstructionContract::Direct => {
+                find_direct_matches(root, &ev.relative_path, &ev.delivered_content_hash)
+            }
+            ReconstructionContract::Symbol => find_symbol_matches(
+                &structural_conn,
+                root,
+                &ev.relative_path,
+                &ev.symbol_name,
+                &ev.delivered_content_hash,
+            ),
+            ReconstructionContract::Unsafe => unreachable!(),
+        };
+        match cardinality {
+            ExactMatchCardinality::Unique {
+                start_line,
+                snippet: _,
+            } => {
+                let location_changed = Some(start_line) != ev.start_line;
+                let current_hash = ev.delivered_content_hash.clone(); // historical hash equals current unique match hash
                 delta_evidences.push(DeltaEvidence {
                     ordinal: ev.ordinal,
                     old_path: ev.relative_path.clone(),
                     current_path: Some(ev.relative_path.clone()),
                     old_start_line: ev.start_line,
-                    current_start_line: current_line,
+                    current_start_line: Some(start_line),
                     old_content_hash: ev.delivered_content_hash.clone(),
                     current_content_hash: Some(current_hash),
                     classification: EvidenceClassification::Unchanged,
@@ -617,80 +716,162 @@ pub fn delta_for_proof(root: &Path, proof_id: &str) -> Result<ContextDelta> {
                 });
                 unchanged += 1;
                 continue;
-            } else {
-                // Same location but content differs -> check if same snippet exists elsewhere in same file (location shift)
-                if let Some((found_line, _)) =
-                    find_snippet_in_file(root, &ev.relative_path, &ev.delivered_content_hash)
-                {
-                    delta_evidences.push(DeltaEvidence {
-                        ordinal: ev.ordinal,
-                        old_path: ev.relative_path.clone(),
-                        current_path: Some(ev.relative_path.clone()),
-                        old_start_line: ev.start_line,
-                        current_start_line: Some(found_line),
-                        old_content_hash: ev.delivered_content_hash.clone(),
-                        current_content_hash: Some(ev.delivered_content_hash.clone()),
-                        classification: EvidenceClassification::Unchanged,
-                        symbol: ev.symbol_name.clone(),
-                        reason: "exact match elsewhere in same file".into(),
-                        location_changed: true,
-                    });
-                    unchanged += 1;
-                    continue;
-                }
-                // Content changed at same location
+            }
+            ExactMatchCardinality::Ambiguous { count: _ } => {
                 delta_evidences.push(DeltaEvidence {
                     ordinal: ev.ordinal,
                     old_path: ev.relative_path.clone(),
                     current_path: Some(ev.relative_path.clone()),
                     old_start_line: ev.start_line,
-                    current_start_line: ev.start_line,
+                    current_start_line: None,
                     old_content_hash: ev.delivered_content_hash.clone(),
-                    current_content_hash: Some(current_hash),
-                    classification: EvidenceClassification::Changed,
+                    current_content_hash: None,
+                    classification: EvidenceClassification::Unverifiable,
                     symbol: ev.symbol_name.clone(),
-                    reason: "same location content differs".into(),
+                    reason: "ambiguous multiple matches for delivered hash in historical file"
+                        .into(),
                     location_changed: false,
                 });
-                changed += 1;
+                unverifiable += 1;
                 continue;
             }
-        } else {
-            // Could not reconstruct - try bounded same-file search for exact hash
-            if let Some((found_line, _)) =
-                find_snippet_in_file(root, &ev.relative_path, &ev.delivered_content_hash)
-            {
-                delta_evidences.push(DeltaEvidence {
-                    ordinal: ev.ordinal,
-                    old_path: ev.relative_path.clone(),
-                    current_path: Some(ev.relative_path.clone()),
-                    old_start_line: ev.start_line,
-                    current_start_line: Some(found_line),
-                    old_content_hash: ev.delivered_content_hash.clone(),
-                    current_content_hash: Some(ev.delivered_content_hash.clone()),
-                    classification: EvidenceClassification::Unchanged,
-                    symbol: ev.symbol_name.clone(),
-                    reason: "found exact snippet elsewhere same file".into(),
-                    location_changed: true,
-                });
-                unchanged += 1;
-                continue;
+            ExactMatchCardinality::NoMatch => {
+                // No exact match in same file — try to determine CHANGED vs UNVERIFIABLE
+                match contract {
+                    ReconstructionContract::Direct => {
+                        // For rust:exact, the representation is the line at historical start_line.
+                        // If that line still exists, we can compare its current hash to historical.
+                        if let Some(hist_line) = ev.start_line {
+                            if let Some((_snippet, cur_hash)) =
+                                current_line_hash(root, &ev.relative_path, hist_line)
+                            {
+                                // Found a current line at same historical location, but its hash differs (since NoMatch)
+                                // This is deterministic CHANGED for direct contract.
+                                delta_evidences.push(DeltaEvidence {
+                                    ordinal: ev.ordinal,
+                                    old_path: ev.relative_path.clone(),
+                                    current_path: Some(ev.relative_path.clone()),
+                                    old_start_line: ev.start_line,
+                                    current_start_line: Some(hist_line),
+                                    old_content_hash: ev.delivered_content_hash.clone(),
+                                    current_content_hash: Some(cur_hash),
+                                    classification: EvidenceClassification::Changed,
+                                    symbol: ev.symbol_name.clone(),
+                                    reason: "same location content differs".into(),
+                                    location_changed: false,
+                                });
+                                changed += 1;
+                                continue;
+                            }
+                        }
+                        delta_evidences.push(DeltaEvidence {
+                            ordinal: ev.ordinal,
+                            old_path: ev.relative_path.clone(),
+                            current_path: Some(ev.relative_path.clone()),
+                            old_start_line: ev.start_line,
+                            current_start_line: None,
+                            old_content_hash: ev.delivered_content_hash.clone(),
+                            current_content_hash: None,
+                            classification: EvidenceClassification::Unverifiable,
+                            symbol: ev.symbol_name.clone(),
+                            reason:
+                                "historical delivered hash not found uniquely in historical file"
+                                    .into(),
+                            location_changed: false,
+                        });
+                        unverifiable += 1;
+                        continue;
+                    }
+                    ReconstructionContract::Symbol => {
+                        // For rust:symbol, look for unique definition in same file
+                        let Some(name) = ev.symbol_name.clone() else {
+                            delta_evidences.push(DeltaEvidence {
+                                ordinal: ev.ordinal,
+                                old_path: ev.relative_path.clone(),
+                                current_path: Some(ev.relative_path.clone()),
+                                old_start_line: ev.start_line,
+                                current_start_line: None,
+                                old_content_hash: ev.delivered_content_hash.clone(),
+                                current_content_hash: None,
+                                classification: EvidenceClassification::Unverifiable,
+                                symbol: ev.symbol_name.clone(),
+                                reason: "historical evidence representation cannot be reconstructed deterministically".into(),
+                                location_changed: false,
+                            });
+                            unverifiable += 1;
+                            continue;
+                        };
+                        let defs =
+                            query_symbols_in_file(&structural_conn, &ev.relative_path, &name)
+                                .unwrap_or_default();
+                        if defs.len() == 1 {
+                            // Unique current definition exists but hash differs (since NoMatch) => CHANGED
+                            if let Some((cur_line, _snippet, cur_hash)) =
+                                current_symbol_hash_and_line(
+                                    &structural_conn,
+                                    root,
+                                    &ev.relative_path,
+                                    &name,
+                                )
+                            {
+                                delta_evidences.push(DeltaEvidence {
+                                    ordinal: ev.ordinal,
+                                    old_path: ev.relative_path.clone(),
+                                    current_path: Some(ev.relative_path.clone()),
+                                    old_start_line: ev.start_line,
+                                    current_start_line: Some(cur_line),
+                                    old_content_hash: ev.delivered_content_hash.clone(),
+                                    current_content_hash: Some(cur_hash),
+                                    classification: EvidenceClassification::Changed,
+                                    symbol: ev.symbol_name.clone(),
+                                    reason: "same location content differs".into(),
+                                    location_changed: false,
+                                });
+                                changed += 1;
+                                continue;
+                            }
+                        } else if defs.len() > 1 {
+                            delta_evidences.push(DeltaEvidence {
+                                ordinal: ev.ordinal,
+                                old_path: ev.relative_path.clone(),
+                                current_path: Some(ev.relative_path.clone()),
+                                old_start_line: ev.start_line,
+                                current_start_line: None,
+                                old_content_hash: ev.delivered_content_hash.clone(),
+                                current_content_hash: None,
+                                classification: EvidenceClassification::Unverifiable,
+                                symbol: ev.symbol_name.clone(),
+                                reason: "ambiguous symbol definitions in historical file".into(),
+                                location_changed: false,
+                            });
+                            unverifiable += 1;
+                            continue;
+                        }
+                        // 0 definitions or other ambiguous case
+                        delta_evidences.push(DeltaEvidence {
+                            ordinal: ev.ordinal,
+                            old_path: ev.relative_path.clone(),
+                            current_path: Some(ev.relative_path.clone()),
+                            old_start_line: ev.start_line,
+                            current_start_line: None,
+                            old_content_hash: ev.delivered_content_hash.clone(),
+                            current_content_hash: None,
+                            classification: EvidenceClassification::Unverifiable,
+                            symbol: ev.symbol_name.clone(),
+                            reason: if defs.is_empty() {
+                                "symbol no longer present in historical file".into()
+                            } else {
+                                "historical delivered hash not found uniquely in historical file"
+                                    .into()
+                            },
+                            location_changed: false,
+                        });
+                        unverifiable += 1;
+                        continue;
+                    }
+                    ReconstructionContract::Unsafe => unreachable!(),
+                }
             }
-            delta_evidences.push(DeltaEvidence {
-                ordinal: ev.ordinal,
-                old_path: ev.relative_path.clone(),
-                current_path: Some(ev.relative_path.clone()),
-                old_start_line: ev.start_line,
-                current_start_line: None,
-                old_content_hash: ev.delivered_content_hash.clone(),
-                current_content_hash: None,
-                classification: EvidenceClassification::Unverifiable,
-                symbol: ev.symbol_name.clone(),
-                reason: "cannot reconstruct current snippet".into(),
-                location_changed: false,
-            });
-            unverifiable += 1;
-            continue;
         }
     }
     let summary = DeltaSummary {
@@ -700,6 +881,15 @@ pub fn delta_for_proof(root: &Path, proof_id: &str) -> Result<ContextDelta> {
         moved: moved_cnt,
         unverifiable,
     };
+    // Ensure summary invariant
+    debug_assert_eq!(
+        summary.unchanged
+            + summary.changed
+            + summary.removed
+            + summary.moved
+            + summary.unverifiable,
+        delta_evidences.len()
+    );
     Ok(ContextDelta {
         proof_id: proof.id.clone(),
         repo_instance_id: proof.repo_instance_id.clone(),
