@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::service::{ContextService, Direction, SearchOptions};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonMetadata {
     pub pid: u32,
     pub port: u16,
@@ -214,6 +214,26 @@ async fn handle_client(mut stream: TcpStream, service: Arc<ContextService>) -> R
                         serde_json::json!({"id": id, "result": {"query": r.query, "type": r.query_type.as_str(), "context": r.packed.markdown, "evidence": r.evidence, "stats": r.stats}})
                     }
                     Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
+                }
+            }
+            "context_delta" => {
+                let proof_id = params
+                    .get("proof_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let root = service.root_path();
+                let proof_id_owned = proof_id.to_string();
+                let delta_res = tokio::task::spawn_blocking(move || {
+                    crate::delta::delta_for_proof(&root, &proof_id_owned)
+                })
+                .await;
+                match delta_res {
+                    Ok(Ok(delta)) => {
+                        let v = serde_json::to_value(&delta).unwrap_or(serde_json::json!({}));
+                        serde_json::json!({"id": id, "result": v})
+                    }
+                    Ok(Err(e)) => serde_json::json!({"id": id, "error": e.to_string()}),
+                    Err(e) => serde_json::json!({"id": id, "error": format!("join failed: {e}")}),
                 }
             }
             "context_status" => {
@@ -633,18 +653,104 @@ pub async fn try_attach_global() -> Option<RemoteClient> {
     }
 }
 
-pub async fn is_global_stale() -> bool {
-    if try_attach_global().await.is_some() {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlobalDaemonState {
+    Live(DaemonMetadata),
+    Starting { pid: u32 },
+    Stale,
+    Absent,
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
         return false;
     }
-    tokio::fs::try_exists(global_daemon_file())
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {pid}");
+        std::process::Command::new("tasklist")
+            .args(["/FI", &filter, "/NH"])
+            .output()
+            .map(|out| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout)
+                        .split_whitespace()
+                        .any(|field| field == pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
+async fn lock_pid() -> Option<u32> {
+    let text = tokio::fs::read_to_string(global_lock_file()).await.ok()?;
+    text.trim().parse().ok()
+}
+
+pub async fn inspect_global_daemon() -> GlobalDaemonState {
+    let metadata = tokio::fs::read_to_string(global_daemon_file())
         .await
-        .unwrap_or(false)
+        .ok()
+        .and_then(|text| serde_json::from_str::<DaemonMetadata>(&text).ok());
+    if let Some(meta) = metadata {
+        let addr = format!("127.0.0.1:{}", meta.port);
+        if tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(&addr))
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
+            return GlobalDaemonState::Live(meta);
+        }
+    }
+    if let Some(pid) = lock_pid().await {
+        if process_is_alive(pid) {
+            return GlobalDaemonState::Starting { pid };
+        }
+        return GlobalDaemonState::Stale;
+    }
+    let json_exists = tokio::fs::try_exists(global_daemon_file())
+        .await
+        .unwrap_or(false);
+    let lock_exists = tokio::fs::try_exists(global_lock_file())
+        .await
+        .unwrap_or(false);
+    if json_exists || lock_exists {
+        GlobalDaemonState::Stale
+    } else {
+        GlobalDaemonState::Absent
+    }
+}
+
+pub async fn is_global_stale() -> bool {
+    matches!(inspect_global_daemon().await, GlobalDaemonState::Stale)
 }
 
 pub async fn cleanup_global_stale() {
-    let _ = tokio::fs::remove_file(global_daemon_file()).await;
-    let _ = tokio::fs::remove_file(global_lock_file()).await;
+    if matches!(inspect_global_daemon().await, GlobalDaemonState::Stale) {
+        let _ = tokio::fs::remove_file(global_daemon_file()).await;
+        let _ = tokio::fs::remove_file(global_lock_file()).await;
+    }
+}
+
+pub async fn cleanup_global_daemon_artifacts_if_owned(pid: u32) {
+    let metadata_pid = tokio::fs::read_to_string(global_daemon_file())
+        .await
+        .ok()
+        .and_then(|text| serde_json::from_str::<DaemonMetadata>(&text).ok())
+        .map(|meta| meta.pid);
+    let lock_owner = lock_pid().await;
+    if metadata_pid == Some(pid) {
+        let _ = tokio::fs::remove_file(global_daemon_file()).await;
+    }
+    if lock_owner == Some(pid) {
+        let _ = tokio::fs::remove_file(global_lock_file()).await;
+    }
 }
 
 pub struct GlobalDaemon {
@@ -913,6 +1019,26 @@ async fn handle_global_client(
                     Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
                 }
             }
+            "context_delta" => {
+                let proof_id = params
+                    .get("proof_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let root_clone = canon.clone();
+                let pid = proof_id.to_string();
+                let delta_res = tokio::task::spawn_blocking(move || {
+                    crate::delta::delta_for_proof(&root_clone, &pid)
+                })
+                .await;
+                match delta_res {
+                    Ok(Ok(delta)) => {
+                        let v = serde_json::to_value(&delta).unwrap_or(serde_json::json!({}));
+                        serde_json::json!({"id": id, "result": v})
+                    }
+                    Ok(Err(e)) => serde_json::json!({"id": id, "error": e.to_string()}),
+                    Err(e) => serde_json::json!({"id": id, "error": format!("join failed: {e}")}),
+                }
+            }
             "context_status" => {
                 // Global status: aggregate
                 let st = svc.status().await.unwrap_or_else(|_| {
@@ -993,8 +1119,22 @@ pub async fn try_become_global_daemon() -> Result<(TcpListener, DaemonMetadata),
     match lock_res {
         Ok(mut f) => {
             let pid = std::process::id();
-            let _ = f.write_all(pid.to_string().as_bytes()).await;
-            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            if let Err(error) = f.write_all(pid.to_string().as_bytes()).await {
+                drop(f);
+                let _ = tokio::fs::remove_file(&lock_path).await;
+                return Err(error.into());
+            }
+            drop(f);
+            let cleanup_on_failure = || {
+                let _ = std::fs::remove_file(&lock_path);
+            };
+            let listener = match TcpListener::bind("127.0.0.1:0").await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    cleanup_on_failure();
+                    return Err(error.into());
+                }
+            };
             let port = listener.local_addr()?.port();
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1006,8 +1146,24 @@ pub async fn try_become_global_daemon() -> Result<(TcpListener, DaemonMetadata),
                 root: dir.display().to_string(),
                 started_at: now,
             };
-            let json = serde_json::to_string_pretty(&meta)?;
-            tokio::fs::write(global_daemon_file(), json).await?;
+            let json = match serde_json::to_string_pretty(&meta) {
+                Ok(json) => json,
+                Err(error) => {
+                    cleanup_on_failure();
+                    return Err(error.into());
+                }
+            };
+            let destination = global_daemon_file();
+            let temporary = dir.join(format!("daemon.json.tmp.{pid}"));
+            if let Err(error) = tokio::fs::write(&temporary, json).await {
+                cleanup_on_failure();
+                return Err(error.into());
+            }
+            if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                cleanup_on_failure();
+                return Err(error.into());
+            }
             Ok((listener, meta))
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1018,13 +1174,25 @@ pub async fn try_become_global_daemon() -> Result<(TcpListener, DaemonMetadata),
 }
 
 pub async fn run_global_daemon() -> Result<()> {
-    // If already running, exit
-    if try_attach_global().await.is_some() {
-        info!("global daemon already running");
-        return Ok(());
+    // Do not steal a lock from a process between lock acquisition and metadata publication.
+    for _ in 0..30 {
+        match inspect_global_daemon().await {
+            GlobalDaemonState::Live(_) => {
+                info!("global daemon already running");
+                return Ok(());
+            }
+            GlobalDaemonState::Starting { .. } => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            GlobalDaemonState::Stale => cleanup_global_stale().await,
+            GlobalDaemonState::Absent => break,
+        }
     }
-    if is_global_stale().await {
-        cleanup_global_stale().await;
+    if matches!(
+        inspect_global_daemon().await,
+        GlobalDaemonState::Starting { .. }
+    ) {
+        anyhow::bail!("GLOBAL_DAEMON_STARTUP_STUCK");
     }
     // Try to become daemon with retry
     let (listener, meta) = match try_become_global_daemon().await {

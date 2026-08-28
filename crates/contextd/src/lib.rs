@@ -4,6 +4,7 @@ pub mod bridge;
 pub mod candidate;
 pub mod config;
 pub mod daemon;
+pub mod delta;
 pub mod hot;
 pub mod pipeline;
 pub mod project;

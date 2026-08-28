@@ -5,6 +5,7 @@ mod candidate;
 mod cli;
 mod config;
 mod daemon;
+mod delta;
 mod hot;
 mod mcp;
 mod pipeline;
