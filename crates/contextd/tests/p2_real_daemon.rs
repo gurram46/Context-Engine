@@ -117,6 +117,12 @@ async fn p2_real_daemon_lifecycle_and_delta_flow() {
     .unwrap();
     contextd::daemon::cleanup_global_daemon_artifacts_if_owned(std::process::id() + 1).await;
     assert!(global.path().join("daemon.lock").exists());
+    std::fs::remove_file(global.path().join("daemon.lock")).unwrap();
+    // Force metadata publication failure after lock acquisition; the startup attempt must clean it.
+    std::fs::create_dir(global.path().join("daemon.json")).unwrap();
+    assert!(contextd::daemon::try_become_global_daemon().await.is_err());
+    assert!(!global.path().join("daemon.lock").exists());
+    std::fs::remove_dir(global.path().join("daemon.json")).unwrap();
 
     // Dead orphan lock, malformed metadata, and stale metadata are all recoverable.
     std::fs::write(global.path().join("daemon.lock"), "4294967294").unwrap();
