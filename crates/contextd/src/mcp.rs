@@ -147,6 +147,12 @@ impl McpAdapter {
         if crate::daemon::is_global_stale().await {
             crate::daemon::cleanup_global_stale().await;
         }
+        if matches!(
+            crate::daemon::inspect_global_daemon().await,
+            crate::daemon::GlobalDaemonState::Starting { .. }
+        ) {
+            anyhow::bail!("GLOBAL_DAEMON_STARTUP_STUCK");
+        }
         // Only fallback to local if daemon truly not available after bounded retry
         // This must be observable
         warn!("global daemon not available after bounded retry, falling back to local heavy (observable)");
