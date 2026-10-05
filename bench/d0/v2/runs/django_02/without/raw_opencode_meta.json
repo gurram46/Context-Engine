@@ -1,0 +1,9 @@
+{
+  "wall_ms": 1200335,
+  "returncode": -1,
+  "timeout": true,
+  "pid": 19364,
+  "model": "opencode/x-preview-f-free",
+  "arm": "without",
+  "task_id": "django_02"
+}

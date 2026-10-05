@@ -1,0 +1,15 @@
+diff --git a/crates/searcher/src/searcher/core.rs b/crates/searcher/src/searcher/core.rs
+--- a/crates/searcher/src/searcher/core.rs
++++ b/crates/searcher/src/searcher/core.rs
+@@ -673,10 +673,7 @@ impl<'s, M, S> Core<'s, M, S> {
+     fn is_line_by_line_fast(&self) -> bool {
+         debug_assert!(!self.searcher.multi_line_with_matcher(&self.matcher));
+ 
+-        if self.config.passthru {
+-            return false;
+-        }
+-        if self.config.stop_on_nonmatch && self.has_matched {
++        if self.config.passthru && self.config.stop_on_nonmatch && self.has_matched {
+             return false;
+         }
+         if let Some(line_term) = self.matcher.line_terminator() {

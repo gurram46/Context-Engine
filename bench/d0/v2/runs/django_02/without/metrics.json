@@ -1,0 +1,21 @@
+{
+  "wall_ms": 1200335,
+  "model": "opencode/x-preview-f-free",
+  "tool_counts": {
+    "read": 4,
+    "grep": 4,
+    "glob": 1,
+    "bash": 10,
+    "edit": 0,
+    "context_search": 0,
+    "symbol_lookup": 0,
+    "dependency_trace": 0,
+    "test_lookup": 0,
+    "context_status": 0
+  },
+  "native_lookup": 9,
+  "ce_calls": 0,
+  "input_tokens": 42114,
+  "output_tokens": 6712,
+  "tool_output_tokens_cl100k": 25213
+}

@@ -42,6 +42,9 @@ pub enum Command {
     Search {
         /// Natural language query
         query: String,
+        /// Continue from a historical context proof
+        #[arg(long = "from-proof")]
+        from_proof: Option<String>,
     },
     /// Lookup symbol definition
     Symbol { symbol: String },
@@ -102,9 +105,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             crate::mcp::run_mcp(root).await?;
             return Ok(());
         }
-        Some(Command::Search { query }) => {
+        Some(Command::Search { query, from_proof }) => {
             let svc = ContextService::new(root).await?;
-            let wp = svc.search_external(&query, search_opts).await?;
+            let wp = svc
+                .search_external_with_continuity(&query, search_opts, from_proof.as_deref())
+                .await?;
             let res = wp.result;
             let proof = wp.proof;
             if is_json {
@@ -125,7 +130,9 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     })).collect::<Vec<_>>(),
                     "context": res.packed.markdown,
                     "stats": stats_json,
-                    "proof": proof_json
+                    "proof": proof_json,
+                    "handoff": wp.handoff,
+                    "continuity": wp.continuity
                 });
                 // Debug observability only when --debug is set, not in normal JSON output
                 if cli.debug {
@@ -144,6 +151,24 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 }
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
+                if let Some(continuity) = &wp.continuity {
+                    println!("From proof: {}", continuity.from_proof_id);
+                    println!("New proof: {}", continuity.to_proof_id);
+                    println!("Delta: {}", continuity.delta.status.as_str());
+                    println!(
+                        "Delta counts: unchanged={} changed={} removed={} moved={} unverifiable={}",
+                        continuity.delta.summary.unchanged,
+                        continuity.delta.summary.changed,
+                        continuity.delta.summary.removed,
+                        continuity.delta.summary.moved,
+                        continuity.delta.summary.unverifiable
+                    );
+                    println!("Source changed: {}", continuity.source_state_changed);
+                    println!(
+                        "Packed context changed: {}",
+                        continuity.packed_context_changed
+                    );
+                }
                 // human readable
                 if res.evidence.is_empty() {
                     println!("No evidence found for: {}", res.query);
