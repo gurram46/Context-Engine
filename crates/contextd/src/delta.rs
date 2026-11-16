@@ -358,26 +358,8 @@ pub fn delta_for_proof(root: &Path, proof_id: &str) -> Result<ContextDelta> {
             reason: "proof schema unsupported".into(),
         });
     }
-    // Validate repo instance - handle both stripped and non-stripped canonical forms (Windows \\?\ prefix)
-    let current_repo_id = context_index::project_root::repo_instance_id(root);
-    let canon_current = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let current_id_via_canon = context_index::project_root::repo_instance_id(&canon_current);
-    // Also handle stripped versions (Self::canon logic)
-    let stripped_root = {
-        let s = root.to_string_lossy().to_string();
-        let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
-        blake3::hash(stripped.as_bytes()).to_hex().to_string()
-    };
-    let stripped_canon = {
-        let s = canon_current.to_string_lossy().to_string();
-        let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
-        blake3::hash(stripped.as_bytes()).to_hex().to_string()
-    };
-    if proof.repo_instance_id != current_repo_id
-        && proof.repo_instance_id != current_id_via_canon
-        && proof.repo_instance_id != stripped_root
-        && proof.repo_instance_id != stripped_canon
-    {
+    // Validate repo instance using the same compatibility rule as P1 proof validation.
+    if !proof::repo_instance_matches(root, &proof.repo_instance_id) {
         return Ok(ContextDelta {
             proof_id: proof.id.clone(),
             repo_instance_id: proof.repo_instance_id.clone(),
