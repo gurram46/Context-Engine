@@ -581,6 +581,12 @@ fn classify_event(root: &Path, event: &Event) -> EventAction {
     if event.need_rescan() {
         return EventAction::MarkUnknown;
     }
+    // Reads/open/close notifications do not change repository contents.
+    // Treating access events as dirty creates self-induced reconcile loops
+    // when Context Engine reads files during discovery or retrieval.
+    if matches!(event.kind, EventKind::Access(_)) {
+        return EventAction::Noop;
+    }
     let mut rels = Vec::new();
     for p in &event.paths {
         let rel = match normalize_rel(root, p) {
@@ -1183,6 +1189,23 @@ mod tests {
         let vanished_dir = root.join("src/subdir");
         let event2 = Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(vanished_dir);
         assert_eq!(classify_event(root, &event2), EventAction::MarkUnknown);
+    }
+
+    #[test]
+    fn dirty_watcher_ignores_access_events() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let root = tmp.path();
+        let path = root.join("src/main.rs");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, "fn main() {}\n")?;
+
+        let event = Event::new(EventKind::Access(notify::event::AccessKind::Any)).add_path(path);
+        assert_eq!(
+            classify_event(root, &event),
+            EventAction::Noop,
+            "read/access events must never dirty repository state"
+        );
+        Ok(())
     }
 
     #[test]
