@@ -72,8 +72,7 @@ fn blob_to_vec(blob: &[u8], dim: usize) -> Result<Vec<f32>> {
     }
     let mut out = Vec::with_capacity(dim);
     for chunk in blob.as_chunks::<4>().0 {
-        let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-        out.push(f32::from_le_bytes(arr));
+        out.push(f32::from_le_bytes(*chunk));
     }
     Ok(out)
 }
