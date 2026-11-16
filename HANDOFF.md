@@ -19,7 +19,7 @@ Core thesis:
 - **R1 Resource Hardening** — complete
 - **P1 Context Proof** — complete
 - **P2 Context Delta** — complete
-- **P3 Cross-Agent Handoff** — integrated in the consolidation PR; treat as complete only after its Rust gates pass on `main`
+- **P3 Cross-Agent Handoff** — complete
 
 The continuity model is:
 
