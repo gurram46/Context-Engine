@@ -51,10 +51,9 @@ async fn ten_clients_three_repos_one_daemon() {
     }
     assert_eq!(registry.runtime_count().await, 3);
     assert_eq!(registry.global_client_count().await, 10);
-    let counts = registry.client_counts().await;
-    assert_eq!(counts.get(&roots[0]).cloned().unwrap_or(0), 5);
-    assert_eq!(counts.get(&roots[1]).cloned().unwrap_or(0), 3);
-    assert_eq!(counts.get(&roots[2]).cloned().unwrap_or(0), 2);
+    assert_eq!(registry.repository_client_count(&roots[0]).await, 5);
+    assert_eq!(registry.repository_client_count(&roots[1]).await, 3);
+    assert_eq!(registry.repository_client_count(&roots[2]).await, 2);
     // No duplicated HotState per same repo: each root's service is same Arc
     let svc_a1 = registry.get_or_create(roots[0].clone()).await;
     let svc_a2 = registry.get_or_create(roots[0].clone()).await;
