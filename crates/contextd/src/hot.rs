@@ -240,9 +240,8 @@ impl HotVectors {
                     continue;
                 }
                 // decode directly into flat
-                for chunk in blob.chunks_exact(4) {
-                    let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-                    flat.push(f32::from_le_bytes(arr));
+                for chunk in blob.as_chunks::<4>().0 {
+                    flat.push(f32::from_le_bytes(*chunk));
                 }
                 hashes.push(hash);
             }
