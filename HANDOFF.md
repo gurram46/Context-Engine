@@ -94,6 +94,7 @@ Global daemon metadata defaults to the platform-specific user data/runtime direc
 ## Known/deferred work
 
 - Cross-file `MOVED` evidence classification is intentionally deferred; P2 v1 is conservative.
+- On current GitHub Ubuntu runners, a subset of `contextd --lib` watcher/dirty-state tests report `Unknown` instead of the expected `Dirty/Clean` state. This predates the clean P3 diff and is kept visible as a non-blocking CI diagnostic; do not silently delete or weaken those tests.
 - Real controlled agent A/B evaluation remains the next product-validation step after the canonical P3 integration.
 - Do not expand the architecture based on speculation; harden only issues demonstrated by tests or measured agent runs.
 
