@@ -34,7 +34,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Contextd library
-        run: cargo test -p contextd --lib
+        run: cargo test -p contextd --lib -- --test-threads=1
 
       - name: P3 cross-agent handoff
         run: cargo test --test p3_cross_agent_handoff -- --test-threads=1
