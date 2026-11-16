@@ -1,0 +1,61 @@
+name: Rust Core
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust-core:
+    name: Rust Core / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Contextd library
+        run: cargo test -p contextd --lib
+
+      - name: P3 cross-agent handoff
+        run: cargo test --test p3_cross_agent_handoff -- --test-threads=1
+
+      - name: P2 context delta
+        run: cargo test --test p2_context_delta -- --test-threads=1
+
+      - name: P2 real daemon
+        run: cargo test --test p2_real_daemon -- --test-threads=1
+
+      - name: P1 context proof
+        run: cargo test --test p1_context_proof -- --test-threads=1
+
+      - name: R1 resource
+        run: cargo test --test r1_resource -- --test-threads=1
+
+      - name: R1 global
+        run: cargo test --test r1_1_global -- --test-threads=1
+
+      - name: R1 closure
+        run: cargo test --test r1_2_closure -- --test-threads=1
+
+      - name: Release build
+        run: cargo build --release -p contextd

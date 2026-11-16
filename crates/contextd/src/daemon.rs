@@ -141,18 +141,22 @@ async fn handle_client(mut stream: TcpStream, service: Arc<ContextService>) -> R
                     .get("maxResults")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(10) as usize;
+                let from_proof_id = params.get("fromProofId").and_then(|v| v.as_str());
                 let opts = SearchOptions {
                     budget_tokens: budget,
                     max_results: maxr,
                     debug: false,
                 };
-                match service.search_external(q, opts).await {
+                match service
+                    .search_external_with_continuity(q, opts, from_proof_id)
+                    .await
+                {
                     Ok(wp) => {
                         let stats =
                             serde_json::to_value(&wp.result.stats).unwrap_or(serde_json::json!({}));
                         let proof =
                             serde_json::to_value(&wp.proof).unwrap_or(serde_json::json!({}));
-                        serde_json::json!({"id": id, "result": {"query": wp.result.query, "type": wp.result.query_type.as_str(), "context": wp.result.packed.markdown, "evidence": wp.result.evidence, "stats": stats, "proof": proof}})
+                        serde_json::json!({"id": id, "result": {"query": wp.result.query, "type": wp.result.query_type.as_str(), "context": wp.result.packed.markdown, "evidence": wp.result.evidence, "stats": stats, "proof": proof, "handoff": wp.handoff, "continuity": wp.continuity}})
                     }
                     Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
                 }
@@ -293,7 +297,16 @@ impl RemoteClient {
         query: &str,
         opts: SearchOptions,
     ) -> Result<crate::pipeline::ContextResult, anyhow::Error> {
-        let params = serde_json::json!({"query": query, "budgetTokens": opts.budget_tokens, "maxResults": opts.max_results});
+        self.search_with_continuity(query, opts, None).await
+    }
+
+    pub async fn search_with_continuity(
+        &self,
+        query: &str,
+        opts: SearchOptions,
+        from_proof_id: Option<&str>,
+    ) -> Result<crate::pipeline::ContextResult, anyhow::Error> {
+        let params = serde_json::json!({"query": query, "fromProofId": from_proof_id, "budgetTokens": opts.budget_tokens, "maxResults": opts.max_results});
         let v = self.call("context_search", params).await?;
         // Reconstruct ContextResult from daemon's JSON: it returns {query,type,context,evidence,stats}
         // We need to parse evidence as Vec<Evidence> and packed.markdown
