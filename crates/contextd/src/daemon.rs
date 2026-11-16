@@ -913,6 +913,7 @@ async fn handle_global_client(
                     .get("maxResults")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(10) as usize;
+                let from_proof_id = params.get("fromProofId").and_then(|v| v.as_str());
                 let opts = SearchOptions {
                     budget_tokens: budget,
                     max_results: maxr,
@@ -960,7 +961,9 @@ async fn handle_global_client(
                     }
                 }
                 registry.inc_active_query(&canon).await;
-                let res = svc.search_external(q, opts).await;
+                let res = svc
+                    .search_external_with_continuity(q, opts, from_proof_id)
+                    .await;
                 registry.dec_active_query(&canon).await;
                 match res {
                     Ok(wp) => {
@@ -968,7 +971,7 @@ async fn handle_global_client(
                             serde_json::to_value(&wp.result.stats).unwrap_or(serde_json::json!({}));
                         let proof =
                             serde_json::to_value(&wp.proof).unwrap_or(serde_json::json!({}));
-                        serde_json::json!({"id": id, "result": {"query": wp.result.query, "type": wp.result.query_type.as_str(), "context": wp.result.packed.markdown, "evidence": wp.result.evidence, "stats": stats, "proof": proof, "root": canon.display().to_string()}})
+                        serde_json::json!({"id": id, "result": {"query": wp.result.query, "type": wp.result.query_type.as_str(), "context": wp.result.packed.markdown, "evidence": wp.result.evidence, "stats": stats, "proof": proof, "handoff": wp.handoff, "continuity": wp.continuity, "root": canon.display().to_string()}})
                     }
                     Err(e) => serde_json::json!({"id": id, "error": e.to_string()}),
                 }
