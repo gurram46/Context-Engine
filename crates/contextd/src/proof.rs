@@ -5,6 +5,25 @@ use std::path::{Path, PathBuf};
 
 pub const PROOF_SCHEMA_VERSION: i32 = 1;
 
+pub(crate) fn repo_instance_matches(project_root: &Path, expected: &str) -> bool {
+    let direct = context_index::project_root::repo_instance_id(project_root);
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical_id = context_index::project_root::repo_instance_id(&canonical);
+
+    let stripped_id = |path: &Path| {
+        let rendered = path.to_string_lossy();
+        let stripped = rendered.strip_prefix(r"\\?\").unwrap_or(&rendered);
+        blake3::hash(stripped.as_bytes()).to_hex().to_string()
+    };
+
+    expected == direct
+        || expected == canonical_id
+        || expected == stripped_id(project_root)
+        || expected == stripped_id(&canonical)
+}
+
 pub fn proof_db_path(project_root: &Path) -> PathBuf {
     project_root
         .join(".context")
@@ -410,16 +429,9 @@ pub fn validate_proof(project_root: &Path, proof: &ProofRecord) -> Validity {
     if proof.schema_version != PROOF_SCHEMA_VERSION {
         return Validity::Unverifiable;
     }
-    // Repo instance check
-    let current_repo_id = context_index::project_root::repo_instance_id(project_root);
-    // Also compute via canonical if project_root is canonical; but we use direct path
-    // For comparison, we need canonical root's hash. Use provided canonical_root's hash as stored vs current.
-    // Recompute current via canonicalized path
-    let canon_current = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let current_id_via_canon = context_index::project_root::repo_instance_id(&canon_current);
-    if proof.repo_instance_id != current_repo_id && proof.repo_instance_id != current_id_via_canon {
+    // Repo instance check. Accept the same Windows canonical/stripped forms
+    // used by Context Delta so proof validation and delta agree on identity.
+    if !repo_instance_matches(project_root, &proof.repo_instance_id) {
         return Validity::Unverifiable;
     }
     // Load current source state

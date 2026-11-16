@@ -86,8 +86,8 @@ async fn test2_unrelated_change_p1_stale_p2_unchanged() {
     // Modify unrelated b.py
     std::fs::write(tmp.path().join("b.py"), "def bar():\n    x=1\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let _ = svc.search_external("bar", search_opts()).await.unwrap(); // trigger reconcile
-                                                                      // P1 should be STALE
+    // Force a verified post-edit snapshot before validating P1.
+    svc.reconcile().await.unwrap();
     let st = proof::validate_proof(tmp.path(), &rec);
     assert_eq!(st, proof::Validity::Stale);
     // P2 should be READY with UNCHANGED for a.py evidence
@@ -785,7 +785,8 @@ async fn test_critical_unrelated() {
     // Modify b.py only
     std::fs::write(tmp.path().join("b.py"), "def bar():\n    x=1\n    y=2\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let _ = svc.search_external("bar", search_opts()).await.unwrap(); // trigger reconcile
+    // Force a verified post-edit snapshot before validating P1.
+    svc.reconcile().await.unwrap();
     let st = proof::validate_proof(tmp.path(), &rec);
     assert_eq!(
         st,

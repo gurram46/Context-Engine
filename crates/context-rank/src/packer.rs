@@ -94,6 +94,7 @@ pub fn pack_evidence(
         b_score
             .partial_cmp(&a_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     });
 
     for (file, mut items) in file_order.into_iter().take(max_files) {
@@ -116,14 +117,18 @@ pub fn pack_evidence(
                     set.insert(s.clone());
                 }
             }
-            set.into_iter().collect::<Vec<_>>().join(", ")
+            let mut values = set.into_iter().collect::<Vec<_>>();
+            values.sort();
+            values.join(", ")
         };
         let sources: String = {
             let mut set: HashSet<String> = HashSet::new();
             for e in &items {
                 set.insert(e.source.as_str().to_string());
             }
-            set.into_iter().collect::<Vec<_>>().join("+")
+            let mut values = set.into_iter().collect::<Vec<_>>();
+            values.sort();
+            values.join("+")
         };
         let header = format!(
             "## {} {} [{}] lines {}",

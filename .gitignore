@@ -82,3 +82,24 @@ backend/setup.py
 backend/test_cli.py
 backend/tmp_*.py
 ui/backend/
+
+# Secrets — NEVER commit (tokens, keys, credentials)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+secrets/
+
+# Regenerable junk — never commit
+.next/
+target/
+
+# Benchmark fixture clones and harness run working copies (regenerable via harness)
+bench/repos/
+bench/d0/runs/
+bench/d0/v2/runs/
+bench/d0/v2/smoke/disposable/

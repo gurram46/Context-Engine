@@ -380,10 +380,7 @@ fn is_pascal_case(q: &str) -> bool {
     }
     static SINGLE_PASCAL_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^[A-Z][a-z][a-zA-Z0-9]*$").unwrap());
-    if SINGLE_PASCAL_RE.is_match(q) && q.len() >= 3 {
-        return true;
-    }
-    false
+    SINGLE_PASCAL_RE.is_match(q) && q.len() >= 3
 }
 fn is_screaming_snake(q: &str) -> bool {
     SCREAMING_SNAKE_RE.is_match(q)

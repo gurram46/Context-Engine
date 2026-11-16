@@ -179,9 +179,43 @@ pub struct ProofMeta {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffReference {
+    pub version: u8,
+    pub proof_id: String,
+    pub query: String,
+    pub repo_instance_id: String,
+    pub source_state_hash: String,
+    pub packed_context_hash: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuityMetadata {
+    pub version: u8,
+    pub from_proof_id: String,
+    pub to_proof_id: String,
+    pub status: String,
+    pub from_source_state_hash: String,
+    pub to_source_state_hash: String,
+    pub from_generation: u64,
+    pub to_generation: u64,
+    pub source_state_changed: bool,
+    pub historical_packed_context_hash: String,
+    pub current_packed_context_hash: String,
+    pub packed_context_changed: bool,
+    pub retrieval_build_changed: bool,
+    pub delta: crate::delta::ContextDelta,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchWithProof {
     pub result: crate::pipeline::ContextResult,
     pub proof: ProofMeta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandoffReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuity: Option<ContinuityMetadata>,
 }
 
 /// Native service — single core for CLI and MCP.
@@ -857,9 +891,136 @@ impl ContextService {
         query: &str,
         opts: SearchOptions,
     ) -> Result<SearchWithProof, ContextError> {
+        self.search_external_with_continuity(query, opts, None)
+            .await
+    }
+
+    pub async fn search_external_with_continuity(
+        &self,
+        query: &str,
+        opts: SearchOptions,
+        from_proof_id: Option<&str>,
+    ) -> Result<SearchWithProof, ContextError> {
+        let historical = if let Some(proof_id) = from_proof_id {
+            let conn = proof_store::open_proof_db(&self.root).map_err(|e| {
+                ContextError::Internal(format!(
+                    "HANDOFF_UNVERIFIABLE: proof store unavailable: {e}"
+                ))
+            })?;
+            let proof = proof_store::load_proof(&conn, proof_id)
+                .map_err(|e| {
+                    ContextError::Internal(format!("HANDOFF_UNVERIFIABLE: proof load failed: {e}"))
+                })?
+                .ok_or_else(|| {
+                    ContextError::Internal(format!("HANDOFF_PROOF_NOT_FOUND: {proof_id}"))
+                })?;
+            if query.trim() != proof.query.trim() {
+                return Err(ContextError::Internal(
+                    "HANDOFF_QUERY_MISMATCH: continuation query differs from historical proof"
+                        .into(),
+                ));
+            }
+            Some(proof)
+        } else {
+            None
+        };
+
+        let (continuity, target_state) = if let Some(historical) = historical.as_ref() {
+            // Access runtime first so Delta observes the same published state that
+            // the canonical search will reuse when the repository is clean.
+            let _ = self.access_runtime(None).await.map_err(|e| {
+                ContextError::Internal(format!("HANDOFF_UNVERIFIABLE: reconcile failed: {e}"))
+            })?;
+            let root = self.root.clone();
+            let proof_id = historical.id.clone();
+            let delta = tokio::task::spawn_blocking(move || {
+                crate::delta::delta_for_proof(&root, &proof_id)
+            })
+            .await
+            .map_err(|e| {
+                ContextError::Internal(format!("HANDOFF_UNVERIFIABLE: delta failed: {e}"))
+            })?
+            .map_err(|e| {
+                ContextError::Internal(format!("HANDOFF_UNVERIFIABLE: delta failed: {e}"))
+            })?;
+            if delta.status == crate::delta::DeltaStatus::Unverifiable {
+                return Err(ContextError::Internal(format!(
+                    "HANDOFF_UNVERIFIABLE: {}",
+                    delta.reason
+                )));
+            }
+            let target_hash = delta.to_source_state_hash.clone().ok_or_else(|| {
+                ContextError::Internal(
+                    "HANDOFF_UNVERIFIABLE: delta has no current source state".into(),
+                )
+            })?;
+            let target_generation = delta.to_generation.ok_or_else(|| {
+                ContextError::Internal(
+                    "HANDOFF_UNVERIFIABLE: delta has no current generation".into(),
+                )
+            })?;
+            (
+                Some((historical, delta)),
+                Some((target_hash, target_generation)),
+            )
+        } else {
+            (None, None)
+        };
+
         let (res, access) = self.do_search(query, opts, None).await?;
+        if let Some((target_hash, target_generation)) = target_state.as_ref() {
+            if &access.source_state_hash != target_hash || &access.generation != target_generation {
+                return Err(ContextError::Internal(
+                    "HANDOFF_UNVERIFIABLE: repository changed during handoff search".into(),
+                ));
+            }
+        }
         let proof = self.build_proof(query, &access, &res).await;
-        Ok(SearchWithProof { result: res, proof })
+        let handoff = proof.id.as_ref().and_then(|id| {
+            Some(HandoffReference {
+                version: 1,
+                proof_id: id.clone(),
+                query: query.to_string(),
+                repo_instance_id: context_index::project_root::repo_instance_id(&Self::canon(
+                    &self.root,
+                )),
+                source_state_hash: proof.source_state_hash.clone()?,
+                packed_context_hash: proof.packed_context_hash.clone()?,
+            })
+        });
+        let continuity = continuity.map(|(historical, delta)| {
+            let current_packed = proof.packed_context_hash.clone().unwrap_or_default();
+            ContinuityMetadata {
+                version: 1,
+                from_proof_id: historical.id.clone(),
+                to_proof_id: proof.id.clone().unwrap_or_default(),
+                status: if delta.status == crate::delta::DeltaStatus::NoChange
+                    && historical.source_state_hash
+                        == proof.source_state_hash.clone().unwrap_or_default()
+                {
+                    "no_change".into()
+                } else {
+                    "updated".into()
+                },
+                from_source_state_hash: historical.source_state_hash.clone(),
+                to_source_state_hash: proof.source_state_hash.clone().unwrap_or_default(),
+                from_generation: historical.source_generation,
+                to_generation: proof.source_generation.unwrap_or_default(),
+                source_state_changed: historical.source_state_hash
+                    != proof.source_state_hash.clone().unwrap_or_default(),
+                historical_packed_context_hash: historical.packed_context_hash.clone(),
+                packed_context_changed: historical.packed_context_hash != current_packed,
+                current_packed_context_hash: current_packed,
+                retrieval_build_changed: historical.engine_version != env!("CARGO_PKG_VERSION"),
+                delta,
+            }
+        });
+        Ok(SearchWithProof {
+            result: res,
+            proof,
+            handoff,
+            continuity,
+        })
     }
 
     async fn build_proof(

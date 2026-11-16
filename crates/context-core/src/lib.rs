@@ -20,6 +20,9 @@ pub struct ContextSearchParams {
     #[serde(default)]
     #[schemars(description = "Include debug metadata")]
     pub debug: Option<bool>,
+    #[serde(default)]
+    #[schemars(description = "Historical proof ID to continue from")]
+    pub fromProofId: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
