@@ -1100,31 +1100,21 @@ async fn test41_failure_recovery() {
     let rec = proof::load_proof(&proof::open_proof_db(tmp.path()).unwrap(), &proof_id)
         .unwrap()
         .unwrap();
-    // First, cause fence failure by making DB read-only, attempt update
-    let db_path = store::index_db_path(tmp.path());
-    let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(&db_path, perms).unwrap();
-    std::fs::write(tmp.path().join("a.py"), "def foo():\n    x=1\n").unwrap();
-    let si = context_index::structural::StructuralIndex::for_path(tmp.path().to_path_buf());
-    let _ = si.update_single_file("a.py"); // will fail
-                                           // Validation should be UNVERIFIABLE while fence failed (verified false persisted or old)
-                                           // Manually set verified false to simulate fence (since fence failed, DB still may have old verified true, but we set false to simulate)
-                                           // Actually after fence failure, verified remains false (from fence) or old? Let's ensure we set false to simulate
-                                           // For this test, we manually set verified false to check UNVERIFIABLE
+
+    // The preceding fault-injection tests cover actual write/fence failures.
+    // Recovery itself only requires the persisted fail-closed state, so model
+    // that state directly instead of relying on platform-specific file permissions.
     {
-        let mut perms2 = std::fs::metadata(&db_path).unwrap().permissions();
-        perms2.set_readonly(false);
-        std::fs::set_permissions(&db_path, perms2).unwrap();
         let conn = store::open_db(tmp.path()).unwrap();
         store::set_source_state_verified(&conn, false).unwrap();
     }
     let st = proof::validate_proof(tmp.path(), &rec);
     assert_eq!(st, proof::Validity::Unverifiable);
-    // Remove failure, clean reconcile
+
+    // A successful reconcile must publish a verified, newer source snapshot.
     std::fs::write(tmp.path().join("a.py"), "def foo():\n    y=2\n").unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let _ = svc.search_external("foo", small_opts()).await.unwrap();
+    svc.reconcile().await.unwrap();
+
     let conn2 = store::open_db(tmp.path()).unwrap();
     assert_eq!(
         store::get_source_state_verified(&conn2).unwrap(),
@@ -1132,7 +1122,8 @@ async fn test41_failure_recovery() {
     );
     let st2 = proof::validate_proof(tmp.path(), &rec);
     assert_eq!(st2, proof::Validity::Stale);
-    // New proof should be CURRENT
+
+    // A proof created after recovery must be CURRENT.
     let wp2 = svc.search_external("foo", small_opts()).await.unwrap();
     assert_eq!(wp2.proof.status, "current");
 }
