@@ -13,8 +13,13 @@ struct TestDaemon {
 
 impl TestDaemon {
     async fn start(dir: TempDir) -> Self {
-        let mut exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        exe.push("../../target/debug/contextd.exe");
+        let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug")
+            .join(if cfg!(windows) {
+                "contextd.exe"
+            } else {
+                "contextd"
+            });
         assert!(exe.exists(), "contextd binary not found: {exe:?}");
         let mut child = tokio::process::Command::new(&exe)
             .arg("daemon")
