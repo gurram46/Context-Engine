@@ -43,7 +43,6 @@ jobs:
         run: cargo test --test p2_real_daemon -- --test-threads=1
 
       - name: P1 context proof
-        continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
         run: cargo test --test p1_context_proof -- --test-threads=1
 
       - name: R1 resource
