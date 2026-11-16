@@ -211,7 +211,11 @@ struct DaemonProcess {
 async fn start_daemon(global: TempDir) -> DaemonProcess {
     let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/debug")
-        .join(if cfg!(windows) { "contextd.exe" } else { "contextd" });
+        .join(if cfg!(windows) {
+            "contextd.exe"
+        } else {
+            "contextd"
+        });
     assert!(exe.exists(), "contextd binary not found: {exe:?}");
     let child = tokio::process::Command::new(exe)
         .arg("daemon")
